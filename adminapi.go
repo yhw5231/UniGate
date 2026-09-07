@@ -20,6 +20,8 @@ func adminAPIHandler() http.Handler {
 	mux.HandleFunc("GET /admin/api/state", handleAdminState)
 	mux.HandleFunc("PUT /admin/api/channels", handleAdminPutChannel)
 	mux.HandleFunc("DELETE /admin/api/channels/{id}", handleAdminDeleteChannel)
+	mux.HandleFunc("PUT /admin/api/pools", handleAdminPutPool)
+	mux.HandleFunc("DELETE /admin/api/pools/{id}", handleAdminDeletePool)
 	mux.HandleFunc("PUT /admin/api/gwkeys", handleAdminPutGWKey)
 	mux.HandleFunc("DELETE /admin/api/gwkeys/{id}", handleAdminDeleteGWKey)
 	mux.HandleFunc("POST /admin/api/pool/test", handleAdminPoolTest)
@@ -99,6 +101,7 @@ func handleAdminState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"channels":     snap.Channels,
 		"gateway_keys": snap.GWKeys,
+		"proxy_pools":  snap.ProxyPools,
 		"leases":       leaseMgr.ListLeases(),
 		"channel_info": chans,
 	})
@@ -128,13 +131,61 @@ func reconcileLeases() {
 			if k.Proxy == nil || k.Proxy.Kind != "ipv6pool" {
 				continue
 			}
-			if live[k.Proxy.PoolURL] == nil {
-				live[k.Proxy.PoolURL] = map[string]livePoolKey{}
+			spec, err := poolSpecReady(k.Proxy)
+			if err != nil {
+				log.Printf("reconcile: skip key %q: %v", k.Name, err)
+				continue // 池不可解析（如已删除）→ 该 key 的分配会被当作孤儿回收
 			}
-			live[k.Proxy.PoolURL][k.ID] = livePoolKey{Group: proxyGroup(ch, k), Shared: k.Proxy.Share}
+			if live[spec.PoolURL] == nil {
+				live[spec.PoolURL] = map[string]livePoolKey{}
+			}
+			live[spec.PoolURL][k.ID] = livePoolKey{Group: proxyGroup(ch, k), Shared: spec.Share}
 		}
 	}
 	leaseMgr.Reconcile(live)
+}
+
+// handleAdminPutPool 新增/更新代理池（连接信息统一在此配置，渠道 key 只引用）。
+func handleAdminPutPool(w http.ResponseWriter, r *http.Request) {
+	var p ProxyPool
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid proxy pool json: "+err.Error(), "bad_request")
+		return
+	}
+	if err := store.PutProxyPool(&p); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
+		return
+	}
+	log.Printf("admin saved proxy pool %q (%s)", p.Name, p.PoolURL)
+	writeJSON(w, http.StatusOK, p)
+}
+
+// handleAdminDeletePool 删除代理池：仍被渠道 key 引用时拒绝；
+// 删除成功后释放该池在网关持有的全部租约。
+func handleAdminDeletePool(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	pool, deleted, usedBy := store.DeleteProxyPool(id)
+	if usedBy != "" {
+		writeJSONError(w, http.StatusBadRequest, "代理池仍被渠道使用（"+usedBy+"），请先解绑相关 key", "pool_in_use")
+		return
+	}
+	if !deleted {
+		writeJSONError(w, http.StatusNotFound, "proxy pool not found", "not_found")
+		return
+	}
+	// 释放该池遗留的租约（best effort，逐个失败仅记日志）
+	for _, l := range leaseMgr.ListLeases() {
+		if l.PoolURL != pool.PoolURL {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		if err := leaseMgr.ReleaseLease(ctx, l.PoolURL, l.LeaseID); err != nil {
+			log.Printf("admin delete pool %q: release lease %s: %v", pool.Name, l.LeaseID, err)
+		}
+		cancel()
+	}
+	log.Printf("admin deleted proxy pool %q (%s)", pool.Name, pool.PoolURL)
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
 }
 
 // handleAdminDeleteChannel 删除渠道并释放其池租约。
@@ -181,7 +232,9 @@ func handleAdminDeleteGWKey(w http.ResponseWriter, r *http.Request) {
 
 // poolActionBody Admin 池操作的请求体。
 // 指定 lease_id 时直接操作本地代理池中的该租约；否则按 channel_id+key_id 定位。
+// pool_id 用于按代理池实体操作（测试连通性）；pool_url/pool_token 为旧格式直连参数。
 type poolActionBody struct {
+	PoolID    string `json:"pool_id"`
 	PoolURL   string `json:"pool_url"`
 	PoolToken string `json:"pool_token"`
 	ChannelID string `json:"channel_id"`
@@ -189,16 +242,30 @@ type poolActionBody struct {
 	LeaseID   string `json:"lease_id"`
 }
 
-// handleAdminPoolTest 测试池子连通性（返回池状态）。
+// handleAdminPoolTest 测试池子连通性（返回池状态）。支持 pool_id（新格式，
+// 从代理池实体取连接信息）或旧格式 pool_url/pool_token 直连。
 func handleAdminPoolTest(w http.ResponseWriter, r *http.Request) {
 	var body poolActionBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
 		return
 	}
+	poolURL, poolToken := strings.TrimSpace(body.PoolURL), strings.TrimSpace(body.PoolToken)
+	if strings.TrimSpace(body.PoolID) != "" {
+		pool, ok := store.proxyPoolByID(strings.TrimSpace(body.PoolID))
+		if !ok {
+			writeJSONError(w, http.StatusNotFound, "proxy pool not found", "not_found")
+			return
+		}
+		poolURL, poolToken = pool.PoolURL, pool.PoolToken
+	}
+	if poolURL == "" {
+		writeJSONError(w, http.StatusBadRequest, "pool_id or pool_url required", "bad_request")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	st, err := newPoolClient(body.PoolURL, body.PoolToken).Status(ctx)
+	st, err := newPoolClient(poolURL, poolToken).Status(ctx)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "pool test failed: "+err.Error(), "pool_error")
 		return
@@ -245,7 +312,11 @@ func handleAdminPoolRotate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lease, err = leaseMgr.Rotate(ctx, spec, body.KeyID)
-		desc = keyName + " @ " + spec.PoolURL
+		if rspec, rerr := poolSpecReady(spec); rerr == nil {
+			desc = keyName + " @ " + rspec.PoolURL
+		} else {
+			desc = keyName
+		}
 	}
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "rotate failed: "+err.Error(), "pool_error")
@@ -278,6 +349,12 @@ func handleAdminPoolRelease(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "key is not bound to an ipv6pool proxy", "bad_request")
 			return
 		}
+		resolved, err := poolSpecReady(spec)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
+			return
+		}
+		spec = resolved
 		leaseID := leaseMgr.leaseIDForKey(spec, body.KeyID)
 		err = leaseMgr.ReleaseLease(ctx, spec.PoolURL, leaseID)
 		desc = keyName + " lease " + leaseID + " @ " + spec.PoolURL

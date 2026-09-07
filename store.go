@@ -6,12 +6,55 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ProxyPool 代理池：连接信息（管理端、Token、SOCKS5 地址）作为独立实体配置，
+// 渠道 key 通过 ProxySpec.PoolID 引用，不在渠道内重复填写连接信息。
+// ProxyPool 代理池：连接信息（管理端、Token、SOCKS5 地址）作为独立实体配置，
+// 渠道 key 通过 ProxySpec.PoolID 引用，不在渠道内重复填写连接信息。
+type ProxyPool struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	PoolURL   string `json:"pool_url"`            // 管理端基地址，如 http://1.2.3.4:8080
+	PoolToken string `json:"pool_token,omitempty"` // Bearer token（可空）
+	SocksHost string `json:"socks_host,omitempty"` // SOCKS5 服务地址（默认取池管理端 host）
+}
+
+// normalizeProxyPool 清理代理池配置并校验。
+func normalizeProxyPool(p *ProxyPool) error {
+	p.Name = strings.TrimSpace(p.Name)
+	p.PoolURL = strings.TrimSpace(p.PoolURL)
+	p.SocksHost = strings.TrimSpace(p.SocksHost)
+	if p.Name == "" {
+		return errors.New("proxy pool name required")
+	}
+	if p.PoolURL == "" {
+		return errors.New("proxy pool pool_url required")
+	}
+	if !strings.Contains(p.PoolURL, "://") {
+		p.PoolURL = "http://" + p.PoolURL
+	}
+	p.PoolURL = strings.TrimRight(p.PoolURL, "/")
+	return nil
+}
+
+// poolNameFromURL 从管理端 URL 提取默认池名称（host:port）。
+func poolNameFromURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return raw
+	}
+	if u.Port() != "" {
+		return u.Hostname() + ":" + u.Port()
+	}
+	return u.Hostname()
+}
 
 // ProxySpec 渠道 key 的代理配置。
 type ProxySpec struct {
@@ -20,11 +63,15 @@ type ProxySpec struct {
 	// static：固定代理 URL
 	URL string `json:"url,omitempty"` // http(s)://user:pass@host:port 或 socks5://...
 
-	// ipv6pool：对接 ipv6-proxy-pool 管理端
-	PoolURL   string `json:"pool_url,omitempty"`   // 管理端基地址，如 http://1.2.3.4:8080
-	PoolToken string `json:"pool_token,omitempty"` // Bearer token（可空）
+	// ipv6pool：引用已配置的代理池（连接信息在 ProxyPool 实体上）
+	PoolID string `json:"pool_id,omitempty"` // 代理池 ID
+
+	// 旧格式兼容字段（已迁移到 ProxyPool 实体，仅读取/迁移使用，保存时不再写入）
+	PoolURL   string `json:"pool_url,omitempty"`
+	PoolToken string `json:"pool_token,omitempty"`
+
 	LeaseID   string `json:"lease_id,omitempty"`   // 租约 ID；空则自动 "gw-<keyID>"
-	SocksHost string `json:"socks_host,omitempty"` // SOCKS5 服务地址（默认取池管理端 host）
+	SocksHost string `json:"socks_host,omitempty"` // SOCKS5 服务地址（默认取池管理端 host；新配置在代理池上）
 	Share     bool   `json:"share,omitempty"`      // 跨渠道复用：同「池+BaseURL」分组的 key 共用同一租约/IP
 
 	// 租约行为
@@ -57,10 +104,16 @@ func (p *ProxySpec) normalize() error {
 		return nil
 	case "ipv6pool", "pool":
 		p.Kind = "ipv6pool"
+		p.PoolID = strings.TrimSpace(p.PoolID)
 		p.PoolURL = strings.TrimSpace(p.PoolURL)
-		if p.PoolURL == "" {
-			return errors.New("ipv6pool proxy requires pool_url")
+		if p.PoolID == "" && p.PoolURL == "" {
+			return errors.New("ipv6pool proxy requires pool_id")
 		}
+		if p.PoolID != "" {
+			p.PoolToken = "" // 连接信息在代理池实体上，清理旧内联值
+			return nil
+		}
+		// 旧格式：内联连接信息（load 时自动迁移为代理池实体）
 		if !strings.Contains(p.PoolURL, "://") {
 			p.PoolURL = "http://" + p.PoolURL
 		}
@@ -241,8 +294,9 @@ type GWKey struct {
 
 // gatewayConfig gateway.json 的持久化格式。
 type gatewayConfig struct {
-	Channels []*Channel `json:"channels"`
-	GWKeys   []*GWKey   `json:"gateway_keys"`
+	Channels   []*Channel   `json:"channels"`
+	GWKeys     []*GWKey     `json:"gateway_keys"`
+	ProxyPools []*ProxyPool `json:"proxy_pools"`
 }
 
 // GatewayStore 配置存储（进程内单例，mutex 保护）。
@@ -284,13 +338,65 @@ func (s *GatewayStore) load() error {
 	if data.GWKeys == nil {
 		data.GWKeys = []*GWKey{}
 	}
+	if data.ProxyPools == nil {
+		data.ProxyPools = []*ProxyPool{}
+	}
 	for _, ch := range data.Channels {
 		if ch.Keys == nil {
 			ch.Keys = []*UpKey{}
 		}
 	}
 	s.data = data
+	if s.migrateInlinePoolsLocked() {
+		return s.saveLocked() // 迁移写回，保证之后保存的都是新的引用格式
+	}
 	return nil
+}
+
+// migrateInlinePoolsLocked 把旧格式的内联代理池连接信息（key 上的 pool_url/
+// pool_token/socks_host）迁移为独立的 ProxyPool 实体：按连接信息合并去重，
+// key 改为引用 PoolID 并清空内联字段（调用方持有写锁）。无变化时返回 false。
+func (s *GatewayStore) migrateInlinePoolsLocked() bool {
+	byKey := map[string]*ProxyPool{}
+	for _, p := range s.data.ProxyPools {
+		byKey[poolConnKey(p.PoolURL, p.PoolToken, p.SocksHost)] = p
+	}
+	changed := false
+	for _, ch := range s.data.Channels {
+		for _, k := range ch.Keys {
+			spec := k.Proxy
+			if spec == nil || spec.Kind != "ipv6pool" || strings.TrimSpace(spec.PoolID) != "" {
+				continue
+			}
+			if strings.TrimSpace(spec.PoolURL) == "" {
+				continue // 无连接信息也无法迁移，交给 normalize 报错
+			}
+			key := poolConnKey(spec.PoolURL, spec.PoolToken, spec.SocksHost)
+			pool := byKey[key]
+			if pool == nil {
+				pool = &ProxyPool{
+					ID:        randomHex(8),
+					Name:      poolNameFromURL(spec.PoolURL),
+					PoolURL:   spec.PoolURL,
+					PoolToken: spec.PoolToken,
+					SocksHost: spec.SocksHost,
+				}
+				s.data.ProxyPools = append(s.data.ProxyPools, pool)
+				byKey[key] = pool
+			}
+			spec.PoolID = pool.ID
+			spec.PoolURL = ""
+			spec.PoolToken = ""
+			spec.SocksHost = ""
+			changed = true
+		}
+	}
+	return changed
+}
+
+// poolConnKey 代理池连接信息的去重键。
+func poolConnKey(poolURL, token, socksHost string) string {
+	return strings.TrimRight(strings.TrimSpace(poolURL), "/") + "|" + token + "|" + socksHost
 }
 
 // saveLocked 原子落盘（调用方持有写锁）。
@@ -334,6 +440,12 @@ func (s *GatewayStore) PutChannel(ch *Channel) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 校验 ipv6pool key 引用的代理池存在（连接信息统一在池实体上配置）
+	for _, k := range ch.Keys {
+		if k.Proxy != nil && k.Proxy.Kind == "ipv6pool" && k.Proxy.PoolID != "" && s.proxyPoolByIDLocked(k.Proxy.PoolID) == nil {
+			return fmt.Errorf("ipv6pool key %q references unknown proxy pool %q (create it on the pool page first)", k.Name, k.Proxy.PoolID)
+		}
+	}
 	if ch.ID == "" {
 		ch.ID = randomHex(8)
 	}
@@ -423,6 +535,120 @@ func (s *GatewayStore) DeleteChannel(id string) (*Channel, bool) {
 		}
 	}
 	return nil, false
+}
+
+// PutProxyPool 新增或整体替换代理池。id 为空时生成。
+func (s *GatewayStore) PutProxyPool(p *ProxyPool) error {
+	if err := normalizeProxyPool(p); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.ID == "" {
+		p.ID = randomHex(8)
+	}
+	replaced := false
+	for i, cur := range s.data.ProxyPools {
+		if cur.ID == p.ID {
+			s.data.ProxyPools[i] = p
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		s.data.ProxyPools = append(s.data.ProxyPools, p)
+	}
+	return s.saveLocked()
+}
+
+// DeleteProxyPool 删除代理池。仍被渠道 key 引用时拒绝并返回引用渠道名。
+// 返回 (删除的池, 是否删除, 引用方描述)；引用方非空时删除失败。
+func (s *GatewayStore) DeleteProxyPool(id string) (*ProxyPool, bool, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pool := s.proxyPoolByIDLocked(id)
+	if pool == nil {
+		return nil, false, ""
+	}
+	// 引用检查：key 显式绑定的 PoolID，或尚未迁移的旧内联同 URL 配置
+	var usedBy []string
+	for _, ch := range s.data.Channels {
+		for _, k := range ch.Keys {
+			if k.Proxy == nil || k.Proxy.Kind != "ipv6pool" {
+				continue
+			}
+			if k.Proxy.PoolID == id ||
+				(k.Proxy.PoolID == "" && strings.TrimRight(strings.TrimSpace(k.Proxy.PoolURL), "/") == pool.PoolURL) {
+				usedBy = append(usedBy, ch.Name)
+				break // 同一渠道只记一次
+			}
+		}
+	}
+	if len(usedBy) > 0 {
+		return nil, false, strings.Join(usedBy, "、")
+	}
+	for i, cur := range s.data.ProxyPools {
+		if cur.ID == id {
+			removed := cur
+			s.data.ProxyPools = append(s.data.ProxyPools[:i], s.data.ProxyPools[i+1:]...)
+			_ = s.saveLocked()
+			return removed, true, ""
+		}
+	}
+	return nil, false, ""
+}
+
+// proxyPoolByIDLocked 按 ID 查找代理池（调用方持有读/写锁）。
+func (s *GatewayStore) proxyPoolByIDLocked(id string) *ProxyPool {
+	if id == "" {
+		return nil
+	}
+	for _, p := range s.data.ProxyPools {
+		if p.ID == id {
+			return p
+		}
+	}
+	return nil
+}
+
+// proxyPoolByID 按 ID 查找代理池（快照，供锁外调用）。
+func (s *GatewayStore) proxyPoolByID(id string) (*ProxyPool, bool) {
+	if s == nil || id == "" {
+		return nil, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p := s.proxyPoolByIDLocked(id); p != nil {
+		body, _ := json.Marshal(p)
+		var out ProxyPool
+		_ = json.Unmarshal(body, &out)
+		return &out, true
+	}
+	return nil, false
+}
+
+// poolSpecReady 把 ipv6pool key 上绑定的池引用解析为带连接信息的完整 spec（快照）。
+// 新格式（PoolID）从代理池实体取连接信息；旧格式（内联 PoolURL）原样使用，
+// 用于兼容存量配置与单元测试。非 ipv6pool 原样返回。
+func poolSpecReady(spec *ProxySpec) (*ProxySpec, error) {
+	if spec == nil || spec.Kind != "ipv6pool" {
+		return spec, nil
+	}
+	if strings.TrimSpace(spec.PoolID) != "" {
+		pool, ok := store.proxyPoolByID(spec.PoolID)
+		if !ok {
+			return nil, fmt.Errorf("proxy pool %q not found", spec.PoolID)
+		}
+		merged := *spec
+		merged.PoolURL = pool.PoolURL
+		merged.PoolToken = pool.PoolToken
+		merged.SocksHost = pool.SocksHost
+		return &merged, nil
+	}
+	if strings.TrimSpace(spec.PoolURL) == "" {
+		return nil, errors.New("ipv6pool proxy requires pool_id")
+	}
+	return spec, nil // 旧格式：连接信息内联
 }
 
 // PutGWKey 新增或更新下游 key。

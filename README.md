@@ -2,8 +2,9 @@
 
 一个 **OpenAI 兼容的多渠道 API 网关**：集中管理多个上游渠道的账号（key），每个 key
 可绑定独立代理（固定 HTTP/SOCKS5 代理，或对接 [ipv6-proxy-pool](../ipv6-proxy-pool)
-动态 IPv6 租约），对下游签发通用 key，按「渠道顺序 → key 顺序」做**故障转移**转发，
-内置请求日志、用量统计（SQLite）与 **WebUI**。
+动态 IPv6 租约，代理池连接信息独立配置、渠道 key 只引用池并设置租约策略），对下游
+签发通用 key，按「渠道顺序 → key 顺序」做**故障转移**转发，内置请求日志、用量统计
+（SQLite）与 **WebUI**。
 
 由 cline2api（Cline 反代）演进而来：保留了其登录鉴权、SSE `reasoning →
 reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用量库；移除了 Cline
@@ -25,7 +26,9 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
 - **每 key 独立代理**：
   - `直连`
   - `固定代理`：`http(s)://user:pass@host:port` 或 `socks5://...`
-  - `IPv6 代理池`：对接 ipv6-proxy-pool（详见下文），支持自动申请/绑定/释放/换 IP
+  - `IPv6 代理池`：连接信息（管理端 URL、Token、SOCKS5 地址）在「代理池」页**独立
+    配置**，渠道 key 只**选择池**并设置租约行为；支持自动申请/绑定/释放/换 IP
+    （详见下文）
 - **下游通用 key**：`sk-gw-...`，客户端用它调用本网关；启用/停用即生效。
 - **故障转移**：单请求内自动换下一个 key/渠道；按渠道冷却粒度（默认按 key，可选按
   (key, model)）跳过故障 key。
@@ -60,8 +63,9 @@ docker compose up -d
    Cline 渠道勾选「reasoning→reasoning_content 改写」。
 2. 渠道内「+ 添加 Key」填上游 key；需要代理的 key 选择代理类型：
    - 固定代理：填 URL；
-   - IPv6 代理池：填池管理端地址（如 `http://1.2.3.4:8080`）与 token（可空），
-     租约 ID 留空自动按 `gw-<keyID>` 申请。可用「测试」按钮验证连通性。
+   - IPv6 代理池：先在「代理池」页**新建池**（填管理端地址如 `http://1.2.3.4:8080`
+     与 token（可空）），回到 key 的代理设置里**选择该池**；租约 ID 留空自动按
+     `gw-<keyID>` 申请。池可用「测试」按钮验证连通性。
 3. 「通用密钥」→ 生成密钥，复制给下游。
 4. 下游以 OpenAI 兼容方式调用：
 
@@ -292,6 +296,11 @@ git pull && docker compose up -d --build       # 本地构建部署
 
 ## IPv6 代理池集成（ipv6-proxy-pool）
 
+代理池（连接信息：管理端 URL、Token、SOCKS5 地址）作为**独立实体**在 WebUI「代理池」
+页或 Admin API 统一配置；渠道 key 只保存池引用（`pool_id`）与租约行为（跨渠道复用、
+换 IP 策略、常驻等），不重复填写连接信息。旧版本内联在 key 上的连接信息（`pool_url`/
+`pool_token`/`socks_host`）在启动加载时自动迁移为代理池实体并按连接信息合并去重。
+
 每个绑定代理池的 key 对应池子里一个**租约**（lease = 一个出口 IPv6 + SOCKS5 端口）。
 
 **跨渠道复用**：key 代理配置开启 `share` 后，网关在本地维护一个共享代理池并自动做
@@ -314,8 +323,8 @@ git pull && docker compose up -d --build       # 本地构建部署
 | 换 IP | `POST /v1/leases/{id}/rotate`。自动触发：网络失败、上游返回指定状态码（如 403/429）、按时间间隔、按请求次数 |
 | 释放 | `DELETE /v1/leases/{id}`。手动（WebUI/Admin API）或删除/改绑 key 时自动释放不再使用的租约 |
 
-- `per_ipv6` 模式：每个租约独立 SOCKS5 端口，SOCKS 地址默认取池管理端同机（可用
-  `socks_host` 覆盖）。
+- `per_ipv6` 模式：每个租约独立 SOCKS5 端口，SOCKS 地址默认取池管理端同机（可在
+  代理池实体上用 `socks_host` 覆盖）。
 - `multiplex` 模式：共用池基础端口，网关自动以 `user:<租约ID>` 作为 SOCKS5 用户名。
 
 ## 故障转移与冷却策略
@@ -365,13 +374,15 @@ git pull && docker compose up -d --build       # 本地构建部署
 
 | 端点 | 说明 |
 | --- | --- |
-| `GET /admin/api/state` | 渠道、下游 key、代理池租约缓存总览 |
+| `GET /admin/api/state` | 渠道、下游 key、代理池列表、租约缓存总览 |
 | `PUT /admin/api/channels` | 新增/整体更新渠道（含内嵌 keys） |
 | `POST /admin/api/channels/{id}/fetch-models` | 用渠道 key 拉取上游模型列表，默认 dry-run 返回候选（`fetched`/`free_models`/`enabled`）供 WebUI 勾选启用，不写回渠道；`?replace=1` 全量替换写回（兼容旧脚本）；免费清单仅随响应展示，不持久化 |
 | `DELETE /admin/api/channels/{id}` | 删除渠道（自动释放其池租约） |
+| `PUT /admin/api/pools` | 新增/更新代理池（连接信息：`{name, pool_url, pool_token?, socks_host?}`；被渠道 key 引用的池不可删除） |
+| `DELETE /admin/api/pools/{id}` | 删除代理池（仍被引用时返回 400，成功后释放其遗留租约） |
 | `PUT /admin/api/gwkeys` | 新增/更新下游 key（key 留空自动生成） |
 | `DELETE /admin/api/gwkeys/{id}` | 删除下游 key |
-| `POST /admin/api/pool/test` | 测试池子连通性 `{pool_url, pool_token}` |
+| `POST /admin/api/pool/test` | 测试池子连通性 `{pool_id}` 或旧格式 `{pool_url, pool_token}` |
 | `POST /admin/api/pool/rotate` | 手动换 IP `{channel_id, key_id}` 或 `{pool_url, lease_id}`（直连本地代理池条目） |
 | `POST /admin/api/pool/release` | 手动释放租约 `{channel_id, key_id}` 或 `{pool_url, lease_id}` |
 | `GET /admin/api/pool/leases` | 网关持有的租约列表 |

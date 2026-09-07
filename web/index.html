@@ -115,10 +115,20 @@
       </table>
     </section>
 
-    <!-- 本地代理池 -->
+    <!-- 代理池 -->
     <section id="tab-leases" class="tabpane hidden">
       <div class="row">
-        <h2>本地代理池</h2>
+        <h2>代理池</h2>
+        <div class="spacer"></div>
+        <p class="muted" style="margin:0">代理池在本页单独配置连接信息；渠道 key 只选择代理池并设置租约行为。</p>
+        <button id="poolAddBtn" class="btn" style="margin-left:12px">新建代理池</button>
+      </div>
+      <table class="tbl" id="poolTable">
+        <thead><tr><th>名称</th><th>管理端</th><th>Token</th><th>SOCKS5 地址</th><th>被引用</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="row" style="margin-top:24px">
+        <h2>本地租约</h2>
         <div class="spacer"></div>
         <input id="leaseSearch" placeholder="搜索池 / 租约ID / IPv6 / 分组…" style="max-width:280px">
         <label class="inline"><input type="checkbox" id="leasesAuto"> 自动刷新</label>
@@ -126,7 +136,7 @@
       </div>
       <p class="muted">网关当前持有的 IPv6 池租约（申请后缓存在本地，重启后自动复用池端同 ID 租约）。开启「跨渠道复用」的租约会显示其占用的全部分组（BaseURL）——同一分组不会重复出现在同一租约上。</p>
       <table class="tbl" id="leaseTable">
-        <thead><tr><th>池</th><th>租约 ID</th><th>占用分组</th><th>出口 IPv6</th><th>SOCKS 端口</th><th>模式</th><th>请求计数</th><th>最近换IP</th><th></th></tr></thead>
+        <thead><tr><th>代理池</th><th>租约 ID</th><th>占用分组</th><th>出口 IPv6</th><th>SOCKS 端口</th><th>模式</th><th>请求计数</th><th>最近换IP</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
     </section>
@@ -230,6 +240,29 @@
       <div class="spacer"></div>
       <button class="btn" data-close="channelModal">取消</button>
       <button class="btn primary" id="channelSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 代理池编辑弹窗 -->
+<div id="poolModal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3 id="poolModalTitle">新建代理池</h3>
+      <button class="btn ghost" data-close="poolModal">×</button>
+    </div>
+    <div class="modal-body">
+      <label>名称 <input id="plName" placeholder="如 主池 / 备池"></label>
+      <label>管理端 URL <input id="plURL" placeholder="http://1.2.3.4:8080"></label>
+      <label>Token（可空） <input id="plToken" placeholder="Bearer token"></label>
+      <label>SOCKS5 地址（可空，默认池管理端同机） <input id="plSocks" placeholder="1.2.3.4"></label>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">代理池连接信息只在此配置；配置后到「渠道」中给 key 选择该代理池即可使用。</p>
+      <span id="poolErr" class="err"></span>
+    </div>
+    <div class="modal-foot">
+      <span class="spacer"></span>
+      <button class="btn" data-close="poolModal">取消</button>
+      <button class="btn primary" id="poolSaveBtn">保存</button>
     </div>
   </div>
 </div>

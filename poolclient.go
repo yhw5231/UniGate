@@ -463,6 +463,11 @@ func (m *LeaseManager) Ensure(ctx context.Context, spec *ProxySpec, keyID, group
 	if spec == nil || spec.Kind != "ipv6pool" {
 		return nil, errors.New("not an ipv6pool proxy spec")
 	}
+	resolved, err := poolSpecReady(spec)
+	if err != nil {
+		return nil, err
+	}
+	spec = resolved
 	client := newPoolClient(spec.PoolURL, spec.PoolToken)
 
 	m.mu.Lock()
@@ -585,6 +590,11 @@ func (m *LeaseManager) RecordUse(spec *ProxySpec, keyID string) {
 	if spec == nil || spec.Kind != "ipv6pool" {
 		return
 	}
+	resolved, err := poolSpecReady(spec)
+	if err != nil {
+		return // 池不可解析时无法计数，忽略
+	}
+	spec = resolved
 	leaseID := m.leaseIDForKey(spec, keyID)
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -598,6 +608,11 @@ func (m *LeaseManager) Rotate(ctx context.Context, spec *ProxySpec, keyID string
 	if spec == nil || spec.Kind != "ipv6pool" {
 		return nil, errors.New("not an ipv6pool proxy spec")
 	}
+	resolved, err := poolSpecReady(spec)
+	if err != nil {
+		return nil, err
+	}
+	spec = resolved
 	leaseID := m.leaseIDForKey(spec, keyID)
 	lease, err := newPoolClient(spec.PoolURL, spec.PoolToken).Rotate(ctx, leaseID)
 	if err != nil {

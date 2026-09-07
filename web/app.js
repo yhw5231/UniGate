@@ -98,7 +98,7 @@ $$(".tab").forEach((btn) => btn.addEventListener("click", () => {
   if (btn.dataset.tab === "logs") refreshLogs();
   if (btn.dataset.tab === "test") refreshTestTab();
   if (btn.dataset.tab === "usage") refreshUsage();
-  if (btn.dataset.tab === "leases") refreshLeases();
+  if (btn.dataset.tab === "leases") { renderPools(); refreshLeases(); }
 }));
 
 // ---- 状态加载 ----
@@ -106,6 +106,7 @@ async function loadState() {
   STATE = await api("GET", "/admin/api/state");
   renderChannels();
   renderGWKeys();
+  renderPools();
   if (!$("#tab-leases").classList.contains("hidden")) refreshLeases();
 }
 
@@ -192,10 +193,33 @@ function renderChannels() {
 $("#channelSearch").addEventListener("input", renderChannels);
 $("#channelGroupFilter").addEventListener("change", renderChannels);
 
+// 代理池查找：按 ID（新格式引用）或 URL（旧内联格式）→ 池实体
+function poolById(id) { return ((STATE && STATE.proxy_pools) || []).find((p) => p.id === id); }
+function poolByURL(url) {
+  const u = String(url || "").replace(/\/+$/, "");
+  return ((STATE && STATE.proxy_pools) || []).find((p) => String(p.pool_url || "").replace(/\/+$/, "") === u);
+}
+function poolLabel(p) { return p ? `${p.name}（${p.pool_url}）` : ""; }
+
+// 池下拉选项；当前绑定的池不在列表中时补一项（如池已被删除）
+function poolOptions(curId) {
+  const pools = (STATE && STATE.proxy_pools) || [];
+  let opts = pools.map((p) =>
+    `<option value="${esc(p.id)}" ${p.id === curId ? "selected" : ""}>${esc(poolLabel(p))}</option>`
+  ).join("");
+  if (curId && !pools.some((p) => p.id === curId)) {
+    opts += `<option value="${esc(curId)}" selected>（未知池 ${esc(curId)}，请在代理池页检查）</option>`;
+  }
+  return opts;
+}
+
 function proxyDesc(p) {
   if (p.kind === "static") return p.url || "static";
   if (p.kind === "ipv6pool") {
-    const parts = [`池 ${p.pool_url}`, `租约 ${p.lease_id || "(自动)"}`];
+    const pool = poolById(p.pool_id) || poolByURL(p.pool_url);
+    const parts = [pool ? `池 ${poolLabel(pool)}` : (p.pool_url ? `池 ${p.pool_url}` : `池 ${p.pool_id || "(未绑定)"}`)];
+    if (p.lease_id) parts.push(`租约 ${p.lease_id}`);
+    else parts.push("租约(自动)");
     if (p.share) parts.push("跨渠道复用(同渠道各用IP/跨渠道可共用)");
     if (p.rotate_on_net_err) parts.push("网络失败换IP");
     if (p.rotate_statuses && p.rotate_statuses.length) parts.push(`状态码${p.rotate_statuses.join("/")}换IP`);
@@ -274,6 +298,8 @@ function keyBlock(k) {
   const div = document.createElement("div");
   div.className = "keyblock";
   const kind = (k.proxy && k.proxy.kind) || "";
+  // 当前绑定的池：新格式按 pool_id，旧格式按 pool_url 匹配池实体（后端已自动迁移）
+  const curPoolId = (k.proxy && k.proxy.pool_id) || (k.proxy && (poolByURL(k.proxy.pool_url) || {}).id) || "";
   div.innerHTML = `
     <div class="head">
       <input class="kb-name" placeholder="名称" value="${esc(k.name || "")}">
@@ -296,24 +322,35 @@ function keyBlock(k) {
       </div>
       <div class="kb-pool ${kind === "ipv6pool" ? "" : "hidden"}">
         <div class="grid3">
-          <label>池管理端 URL <input class="kb-poolurl" placeholder="http://1.2.3.4:8080" value="${esc(k.proxy && k.proxy.pool_url || "")}"></label>
-          <label>池 Token（可空） <input class="kb-pooltoken" value="${esc(k.proxy && k.proxy.pool_token || "")}"></label>
+          <label>代理池
+            <select class="kb-poolid">
+              <option value="">（选择代理池…）</option>
+              ${poolOptions(curPoolId)}
+            </select>
+          </label>
           <label>租约 ID（空=自动 gw-keyID） <input class="kb-leaseid" value="${esc(k.proxy && k.proxy.lease_id || "")}"></label>
+          <label>换IP状态码（逗号分隔，如 403,429） <input class="kb-rotstatus" value="${esc((k.proxy && k.proxy.rotate_statuses || []).join(","))}"></label>
         </div>
         <div class="grid3">
-          <label>SOCKS5 地址（空=池管理端同机） <input class="kb-sockshost" placeholder="1.2.3.4" value="${esc(k.proxy && k.proxy.socks_host || "")}"></label>
-          <label>换IP状态码（逗号分隔，如 403,429） <input class="kb-rotstatus" value="${esc((k.proxy && k.proxy.rotate_statuses || []).join(","))}"></label>
           <label>每 N 次请求换IP（0=关闭） <input class="kb-rotreq" type="number" min="0" value="${(k.proxy && k.proxy.rotate_requests) || 0}"></label>
+          <label class="inline" style="align-self:end;margin-bottom:10px"><input type="checkbox" class="kb-persist" ${k.proxy && k.proxy.persistent ? "checked" : ""}> 常驻租约（免空闲回收）</label>
+          <label class="inline" style="align-self:end;margin-bottom:10px" title="同「池+BaseURL」分组的 key 共用同一租约/IP"><input type="checkbox" class="kb-share" ${k.proxy && k.proxy.share ? "checked" : ""}> 跨渠道复用</label>
         </div>
         <div class="row" style="margin:4px 0">
-          <label class="inline"><input type="checkbox" class="kb-persist" ${k.proxy && k.proxy.persistent ? "checked" : ""}> 常驻租约（免空闲回收）</label>
-          <label class="inline" title="同「池+BaseURL」分组的 key 共用同一租约/IP"><input type="checkbox" class="kb-share" ${k.proxy && k.proxy.share ? "checked" : ""}> 跨渠道复用</label>
           <label class="inline"><input type="checkbox" class="kb-rotnet" ${k.proxy && k.proxy.rotate_on_net_err ? "checked" : ""}> 网络失败自动换IP</label>
           <label class="inline">每 N 秒换IP（0=关闭）<input class="kb-rotsec" type="number" min="0" value="${(k.proxy && k.proxy.rotate_interval_sec) || 0}" style="width:90px"></label>
+          <span class="spacer"></span>
+          <span class="muted" style="font-size:12px">池的连接信息在「<a href="#" class="swap-tab" data-tab="leases">代理池</a>」页配置</span>
         </div>
       </div>
     </div>`;
   div.querySelector(".kb-del").addEventListener("click", () => div.remove());
+  // 池选择下拉的「管理代理池」跳转
+  div.querySelectorAll(".swap-tab").forEach((a) => a.addEventListener("click", (e) => {
+    e.preventDefault();
+    const btn = document.querySelector(`.tab[data-tab="${a.dataset.tab}"]`);
+    if (btn) btn.click();
+  }));
   const syncProxyKind = () => {
     const val = div.querySelector('input[name=pk]:checked').value;
     div.querySelector(".kb-static").classList.toggle("hidden", val !== "static");
@@ -468,10 +505,8 @@ $("#channelSaveBtn").addEventListener("click", async () => {
       const statuses = div.querySelector(".kb-rotstatus").value.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
       k.proxy = {
         kind: "ipv6pool",
-        pool_url: div.querySelector(".kb-poolurl").value.trim(),
-        pool_token: div.querySelector(".kb-pooltoken").value.trim(),
+        pool_id: div.querySelector(".kb-poolid").value,
         lease_id: div.querySelector(".kb-leaseid").value.trim(),
-        socks_host: div.querySelector(".kb-sockshost").value.trim(),
         persistent: div.querySelector(".kb-persist").checked,
         share: div.querySelector(".kb-share").checked,
         rotate_on_net_err: div.querySelector(".kb-rotnet").checked,
@@ -753,9 +788,10 @@ async function refreshLeases() {
     const q = ($("#leaseSearch").value || "").trim().toLowerCase();
     let leases = data.leases || [];
     const total = leases.length;
+    const pname = (l) => { const p = poolByURL(l.pool_url); return p ? p.name : l.pool_url; };
     if (q) {
       leases = leases.filter((l) =>
-        [l.pool_url, l.lease_id, l.ipv6, (l.groups || []).join(" ")]
+        [pname(l), l.pool_url, l.lease_id, l.ipv6, (l.groups || []).join(" ")]
           .join(" ").toLowerCase().includes(q));
     }
     const tbody = $("#leaseTable tbody");
@@ -764,7 +800,7 @@ async function refreshLeases() {
       return;
     }
     tbody.innerHTML = leases.map((l) => `<tr data-pool="${esc(l.pool_url)}" data-lease="${esc(l.lease_id)}">
-      <td class="muted">${esc(l.pool_url)}</td>
+      <td class="muted">${esc(pname(l))}</td>
       <td><code>${esc(l.lease_id)}</code>${l.shared ? ' <span class="badge info">共享</span>' : ""}</td>
       <td class="muted">${esc((l.groups || []).join("、"))}</td>
       <td>${esc(l.ipv6)}</td>
@@ -802,6 +838,84 @@ let leasesTimer = null;
 $("#leasesAuto").addEventListener("change", (e) => {
   if (leasesTimer) clearInterval(leasesTimer);
   if (e.target.checked) leasesTimer = setInterval(refreshLeases, 5000);
+});
+
+// ---- 代理池管理 ----
+let editPool = null; // 正在编辑的代理池（深拷贝）
+
+function poolUsedByCount(poolId) {
+  return ((STATE && STATE.channels) || []).reduce((n, ch) =>
+    n + (ch.keys || []).filter((k) => k.proxy && k.proxy.kind === "ipv6pool" && k.proxy.pool_id === poolId).length, 0);
+}
+
+function renderPools() {
+  const tbody = $("#poolTable tbody");
+  const pools = (STATE && STATE.proxy_pools) || [];
+  if (!pools.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="muted">还没有代理池。点「新建代理池」配置连接信息（管理端、Token、SOCKS5 地址），再到渠道的 key 中选择使用。</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = pools.map((p) => `<tr data-id="${esc(p.id)}">
+    <td><b>${esc(p.name)}</b></td>
+    <td class="muted">${esc(p.pool_url)}</td>
+    <td class="muted">${p.pool_token ? "已设置" : "—"}</td>
+    <td class="muted">${esc(p.socks_host || "（默认池管理端）")}</td>
+    <td>${poolUsedByCount(p.id)} 个 key</td>
+    <td>
+      <button class="btn small" data-act="ptest">测试</button>
+      <button class="btn small" data-act="pedit">编辑</button>
+      <button class="btn small danger" data-act="pdel">删除</button>
+    </td>
+  </tr>`).join("");
+  tbody.querySelectorAll('[data-act="ptest"]').forEach((b) => b.addEventListener("click", async () => {
+    const p = pools.find((x) => x.id === b.closest("tr").dataset.id);
+    try {
+      const st = await api("POST", "/admin/api/pool/test", { pool_id: p.id });
+      toast(`测试成功：状态 ${st.status || "ok"}，租约 ${st.lease_count || 0}/${st.max_leases || "?"}`);
+    } catch (e) { toast("测试失败: " + e.message, true); }
+  }));
+  tbody.querySelectorAll('[data-act="pedit"]').forEach((b) => b.addEventListener("click", () => {
+    openPoolEditor(JSON.parse(JSON.stringify(pools.find((x) => x.id === b.closest("tr").dataset.id))));
+  }));
+  tbody.querySelectorAll('[data-act="pdel"]').forEach((b) => b.addEventListener("click", async () => {
+    const p = pools.find((x) => x.id === b.closest("tr").dataset.id);
+    const used = poolUsedByCount(p.id);
+    if (!confirm(`删除代理池「${p.name}」？${used ? `当前有 ${used} 个 key 引用它，删除会被拒绝。` : "其遗留租约将被释放。"}`)) return;
+    try {
+      await api("DELETE", "/admin/api/pools/" + encodeURIComponent(p.id));
+      toast("已删除");
+      await loadState();
+    } catch (e) { toast(e.message, true); }
+  }));
+}
+
+function openPoolEditor(p) {
+  editPool = p;
+  $("#poolModalTitle").textContent = p.id ? "编辑代理池：" + p.name : "新建代理池";
+  $("#plName").value = p.name || "";
+  $("#plURL").value = p.pool_url || "";
+  $("#plToken").value = p.pool_token || "";
+  $("#plSocks").value = p.socks_host || "";
+  $("#poolErr").textContent = "";
+  $("#poolModal").classList.remove("hidden");
+}
+
+$("#poolAddBtn").addEventListener("click", () => openPoolEditor({}));
+$$('[data-close="poolModal"]').forEach((b) => b.addEventListener("click", () => $("#poolModal").classList.add("hidden")));
+$("#poolSaveBtn").addEventListener("click", async () => {
+  const p = {
+    id: editPool.id || "",
+    name: $("#plName").value.trim(),
+    pool_url: $("#plURL").value.trim(),
+    pool_token: $("#plToken").value.trim(),
+    socks_host: $("#plSocks").value.trim(),
+  };
+  try {
+    await api("PUT", "/admin/api/pools", p);
+    toast("已保存代理池");
+    $("#poolModal").classList.add("hidden");
+    await loadState();
+  } catch (e) { $("#poolErr").textContent = e.message; }
 });
 
 // ---- 启动 ----

@@ -8,9 +8,11 @@ services:
     container_name: unigate
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "10080:10080"   # 网关（/v1/* OpenAI 兼容转发）
+      - "10070:10070"   # WebUI / Admin API（建议仅内网或本机访问）
     environment:
-      PORT: "8080"
+      PORT: "10080"
+      WEBUI_PORT: "10070"
       DATA_DIR: /data
       # 数据目录属主（启动时自动 chown /data 后以此身份运行；默认取镜像内 app
       # 用户的 uid/gid，通常 100:100——与宿主机目录属主无关，bind mount 任意属主均可）

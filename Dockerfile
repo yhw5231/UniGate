@@ -25,7 +25,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 # 防 Windows CRLF 混入：剔除 \r，否则 busybox sh 报 '\r' 未找到
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /data && chown app:app /data
 # 以 root 启动 entrypoint（chown /data 需 root），进程随后降权为 app
-ENV PORT=8080 DATA_DIR=/data
+ENV PORT=10080 WEBUI_PORT=10070 DATA_DIR=/data
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 10080 10070
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -16,7 +16,8 @@ import (
 
 // Config 进程级配置（环境变量）。
 type Config struct {
-	Port            string // API 监听端口
+	Port            string // 网关监听端口（/v1/* 转发）
+	WebUIPort       string // 管理监听端口（WebUI/Admin API；空 = 与网关同端口合并监听）
 	DataDir         string
 	GWPath          string // gateway.json 路径
 	AccountsPath    string
@@ -107,6 +108,7 @@ func loadConfig() Config {
 
 	return Config{
 		Port:            getenv("PORT", defaultPort),
+		WebUIPort:       getenv("WEBUI_PORT", defaultWebUIPort),
 		DataDir:         dataDir,
 		GWPath:          gwPath,
 		AccountsPath:    accountsPath,
@@ -145,7 +147,8 @@ func resetCfgForTest() {
 	initUsageDB()
 }
 
-const defaultPort = "8080"
+const defaultPort = "10080"
+const defaultWebUIPort = "10070"
 
 func parseBoolEnv(key string, def bool) (bool, error) {
 	v := os.Getenv(key)

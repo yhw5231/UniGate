@@ -50,7 +50,7 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
 
 ```bash
 go run .
-# 浏览器打开 http://localhost:8080 ，默认 admin/admin（务必修改）
+# 网关 http://localhost:10080/v1/*，WebUI http://localhost:10070 ，默认 admin/admin（务必修改）
 ```
 
 Docker（克隆仓库后在本地构建镜像并启动，无需宿主机安装 Go）：
@@ -74,7 +74,7 @@ docker compose up -d --build
 4. 下游以 OpenAI 兼容方式调用：
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:10080/v1/chat/completions \
   -H "Authorization: Bearer sk-gw-xxxx" \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
@@ -101,11 +101,11 @@ docker compose up -d --build
 
 # 3. 查看日志确认启动成功
 docker compose logs -f
-# 出现 "unigate listening on :8080" 即正常，Ctrl+C 退出跟踪
+# 出现 "gateway on :10080, webui on :10070" 即正常，Ctrl+C 退出跟踪
 ```
 
-启动后浏览器打开 `http://<主机IP>:8080`，默认账号 `admin` / `admin`，
-**生产环境务必通过环境变量修改管理员账号密码**（见下文安全清单）。
+启动后浏览器打开 WebUI `http://<主机IP>:10070`（网关 API 在 `:10080`），默认账号
+`admin` / `admin`，**生产环境务必通过环境变量修改管理员账号密码**（见下文安全清单）。
 本地构建未注入版本号时，后台版本标识显示 `dev`（见上文「版本标识」）。
 
 **更新版本**（拉取最新代码后重新构建、重建容器）：
@@ -138,7 +138,7 @@ mkdir -p ./data
 
 docker run -d --name unigate \
   --restart unless-stopped \
-  -p 8080:8080 \
+  -p 10080:10080 -p 10070:10070 \
   -v "$(pwd)/data:/data" \
   -e ADMIN_USERNAME=admin \
   -e ADMIN_PASSWORD=改成强密码 \
@@ -147,7 +147,7 @@ docker run -d --name unigate \
 # 数据目录属主想匹配宿主机某用户时，指定运行身份（可选）：
 docker run -d --name unigate \
   --restart unless-stopped \
-  -p 8080:8080 \
+  -p 10080:10080 -p 10070:10070 \
   -v "$(pwd)/data:/data" \
   -e PUID=1000 -e PGID=1000 \
   unigate:local
@@ -196,7 +196,8 @@ Wants=network-online.target
 User=unigate
 WorkingDirectory=/opt/unigate
 ExecStart=/opt/unigate/unigate
-Environment=PORT=8080
+Environment=PORT=10080
+Environment=WEBUI_PORT=10070
 Environment=DATA_DIR=/opt/unigate/data
 Restart=on-failure
 RestartSec=5
@@ -230,11 +231,11 @@ journalctl -u unigate -f             # 跟踪日志
 
 网关本身只提供 HTTP，生产环境建议套 Nginx / Caddy 提供 TLS。SSE 流式响应需关闭缓冲：
 
-Nginx：
+Nginx（网关转发，反代到 10080）：
 
 ```nginx
 location / {
-    proxy_pass http://127.0.0.1:8080;
+    proxy_pass http://127.0.0.1:10080;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
@@ -244,38 +245,40 @@ location / {
 }
 ```
 
-Caddy（自动 HTTPS）：
+Caddy（自动 HTTPS，反代到 10080）：
 
 ```
 gw.example.com {
-    reverse_proxy 127.0.0.1:8080 {
+    reverse_proxy 127.0.0.1:10080 {
         flush_interval -1       # SSE 流式必需
     }
 }
 ```
 
+WebUI/Admin（10070）不建议直接暴露公网；确需域名访问时同样按上面方式反代 10070。
+
 ### 验证与健康检查
 
 ```bash
-# 模型列表（GW_KEY_AUTH=true 时需带下游通用 key）
-curl http://127.0.0.1:8080/v1/models -H "Authorization: Bearer sk-gw-xxxx"
+# 模型列表（网关端口 10080；GW_KEY_AUTH=true 时需带下游通用 key）
+curl http://127.0.0.1:10080/v1/models -H "Authorization: Bearer sk-gw-xxxx"
 
-# 未配渠道时也可先登录验证服务可用（返回 token）
-curl -X POST http://127.0.0.1:8080/login \
+# 未配渠道时也可先登录验证服务可用（管理端口 10070，返回 token）
+curl -X POST http://127.0.0.1:10070/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"admin"}'
 
 # 对话转发冒烟测试
-curl http://127.0.0.1:8080/v1/chat/completions \
+curl http://127.0.0.1:10080/v1/chat/completions \
   -H "Authorization: Bearer sk-gw-xxxx" -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"ping"}]}'
 ```
 
-容器可加健康检查（compose）：
+容器可加健康检查（compose，探 WebUI 端口根路径）：
 
 ```yaml
 healthcheck:
-  test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
+  test: ["CMD", "wget", "-qO-", "http://127.0.0.1:10070/"]
   interval: 30s
   timeout: 5s
   retries: 3
@@ -285,7 +288,9 @@ healthcheck:
 
 - **修改默认管理员密码**：通过 `ADMIN_USERNAME`/`ADMIN_PASSWORD` 环境变量设置（或手动编辑 `data/accounts.json`）；
 - **保持 `GW_KEY_AUTH=true`**（默认）：否则 `/v1/*` 完全开放，任何能访问端口的人都能消耗你的上游额度；
-- **收紧网络暴露**：仅本机使用时把端口映射改为 `127.0.0.1:8080:8080`，公网部署务必套反代 + HTTPS + 防火墙白名单；
+- **收紧网络暴露**：网关（10080）与 WebUI（10070）已默认分离——公网部署只暴露
+  10080（务必套反代 + HTTPS + 防火墙白名单），10070 仅限内网/本机访问，compose
+  映射写成 `127.0.0.1:10070:10070`；仅本机使用时网关映射同理改 `127.0.0.1:10080:10080`；
 - **使用强下游 key**：WebUI 生成的 `sk-gw-...` 即为凭证，泄露后可停用再换发；
 - **`EXTRA_USERS` 仅用于预留多用户登录**：额外用户可登录换取 token，但 WebUI 数据均经
   Admin API 拉取（仅主管理员可见），额外用户目前登录后看不到内容；
@@ -371,7 +376,8 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PORT` | `8080` | 监听端口 |
+| `PORT` | `10080` | 网关监听端口（`/v1/*` 转发接口） |
+| `WEBUI_PORT` | `10070` | WebUI/Admin API 独立监听端口；显式置空 = 与 `PORT` 合并单端口 |
 | `DATA_DIR` | `data`（容器内 `/data`） | 数据目录，**容器部署必须挂载** |
 | `GATEWAY_CONFIG_PATH` | `${DATA_DIR}/gateway.json` | 渠道/密钥配置文件（WebUI 管理） |
 | `LEASE_ASSIGN_PATH` | `${DATA_DIR}/lease-assignments.json` | 代理池「key→租约」分配表（跨渠道复用，持久化保证 IP 稳定） |

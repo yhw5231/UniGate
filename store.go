@@ -21,7 +21,7 @@ import (
 type ProxyPool struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
-	PoolURL   string `json:"pool_url"`            // 管理端基地址，如 http://1.2.3.4:8080
+	PoolURL   string `json:"pool_url"`             // 管理端基地址，如 http://1.2.3.4:8080
 	PoolToken string `json:"pool_token,omitempty"` // Bearer token（可空）
 	SocksHost string `json:"socks_host,omitempty"` // SOCKS5 服务地址（默认取池管理端 host）
 }

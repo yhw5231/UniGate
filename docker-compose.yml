@@ -5,6 +5,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # 版本号默认自动从 .git 推导（tag 或短提交哈希）；需要固定时取消注释：
+      # args:
+      #   VERSION: v1.0.0
     container_name: unigate
     restart: unless-stopped
     ports:

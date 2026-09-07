@@ -3,15 +3,25 @@
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 ARG TARGETOS
 ARG TARGETARCH
+# git：构建阶段读取 .git 生成版本号（见下方 VERSION 逻辑）
+RUN apk add --no-cache git
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY third_party ./third_party
 ARG GOPROXY=https://goproxy.cn,direct
 RUN GOPROXY=${GOPROXY} go mod download
-COPY *.go ./
-COPY web ./web
-ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath \
+# .dockerignore 已排除 data/、backups/、*.exe，.git 保留用于版本推导
+COPY . .
+# 版本号：默认自动从 .git 推导（git describe --tags --always：
+# 有 tag 显示 tag，如 v1.2.3；无 tag 显示短提交哈希，如 6a53e28）；
+# 可用 --build-arg VERSION=xxx 强制覆盖（如 CI 固定版本）；无 .git 时回落 dev。
+# 不加 --dirty：Windows 换行符差异会让复制进容器的 .git 误报 dirty。
+ARG VERSION=""
+RUN git config --global --add safe.directory '*' && \
+	if [ -z "$VERSION" ]; then VERSION="$(git describe --tags --always 2>/dev/null || true)"; fi && \
+	: "${VERSION:=dev}" && \
+	echo "==> build version: $VERSION" && \
+	CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false \
 	-ldflags="-s -w -X main.version=${VERSION}" -o /out/unigate .
 
 FROM alpine:3.22

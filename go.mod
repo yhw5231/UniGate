@@ -1,4 +1,4 @@
-module cline2api
+module unigate
 
 go 1.26
 

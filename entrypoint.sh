@@ -11,7 +11,7 @@ PGID="${PGID:-$(id -g app 2>/dev/null || echo 100)}"
 
 # 非 root 启动（docker run --user=...）：无权 chown，直接运行，属主由调用方保证
 if [ "$(id -u)" != "0" ]; then
-    exec /usr/local/bin/cline2api "$@"
+    exec /usr/local/bin/unigate "$@"
 fi
 
 mkdir -p /data
@@ -22,4 +22,4 @@ if [ "$owner" != "$PUID:$PGID" ]; then
     chown -R "$PUID:$PGID" /data 2>/dev/null || echo "warning: chown /data to $PUID:$PGID failed (NFS root-squash?), continuing"
 fi
 
-exec su-exec "$PUID:$PGID" /usr/local/bin/cline2api "$@"
+exec su-exec "$PUID:$PGID" /usr/local/bin/unigate "$@"

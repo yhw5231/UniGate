@@ -20,7 +20,7 @@ func TestMain(m *testing.M) {
 	}
 	code := func() int {
 		if os.Getenv("DATA_DIR") == "" {
-			dir, err := os.MkdirTemp("", "cline2api-test-data")
+			dir, err := os.MkdirTemp("", "unigate-test-data")
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "create test data dir:", err)
 				os.Exit(1)

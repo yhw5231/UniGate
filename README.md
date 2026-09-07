@@ -56,8 +56,8 @@ go run .
 Docker（克隆仓库后在本地构建镜像并启动，无需宿主机安装 Go）：
 
 ```bash
-git clone https://github.com/yhw5231/localcline.git
-cd localcline
+git clone https://github.com/yhw5231/UniGate.git
+cd UniGate
 docker compose up -d --build
 ```
 
@@ -93,8 +93,8 @@ curl http://localhost:8080/v1/chat/completions \
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/yhw5231/localcline.git
-cd localcline
+git clone https://github.com/yhw5231/UniGate.git
+cd UniGate
 
 # 2. 构建镜像并启动
 docker compose up -d --build
@@ -130,8 +130,8 @@ docker compose logs -f --tail=100
 先在仓库根目录构建镜像，再用构建产物运行：
 
 ```bash
-git clone https://github.com/yhw5231/localcline.git
-cd localcline
+git clone https://github.com/yhw5231/UniGate.git
+cd UniGate
 docker build -t unigate:local .
 
 mkdir -p ./data

@@ -1,6 +1,6 @@
 # 二进制产物
+/unigate
 /cline2api
-/cline2api-go
 *.exe
 *.exe~
 

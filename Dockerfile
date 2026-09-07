@@ -12,7 +12,7 @@ COPY *.go ./
 COPY web ./web
 ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath \
-	-ldflags="-s -w -X main.version=${VERSION}" -o /out/cline2api .
+	-ldflags="-s -w -X main.version=${VERSION}" -o /out/unigate .
 
 FROM alpine:3.22
 # su-exec：entrypoint 修正 /data 属主后降权运行（避免 bind mount 属主不匹配导致启动失败）
@@ -20,7 +20,7 @@ FROM alpine:3.22
 # entrypoint 默认动态取 app 的实际 uid/gid
 RUN apk add --no-cache ca-certificates su-exec && addgroup -S app && adduser -S -G app app
 WORKDIR /app
-COPY --from=builder /out/cline2api /usr/local/bin/cline2api
+COPY --from=builder /out/unigate /usr/local/bin/unigate
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 # 防 Windows CRLF 混入：剔除 \r，否则 busybox sh 报 '\r' 未找到
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /data && chown app:app /data

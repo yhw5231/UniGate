@@ -584,3 +584,110 @@ func TestPoolRotateByLeaseID(t *testing.T) {
 		t.Fatalf("expected empty local pool after release, got %d", len(infos))
 	}
 }
+
+// TestAdminTestKeyInlineChannel：编辑器「测试」以页面填写内容为准——
+// 渠道未保存时也能直接用内联配置测试（请求体带 channel），且不落盘。
+func TestAdminTestKeyInlineChannel(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"pong"}}]}`)
+
+	// 不保存任何渠道，直接内联（新建渠道未保存场景）
+	inline := `{"channel":{"name":"草稿渠道","base_url":"` + up.URL + `","enabled":true,
+		"keys":[{"name":"k1","api_key":"sk-inline","enabled":true}]},"model":"m1"}`
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/testkey", inline, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		OK    bool   `json:"ok"`
+		Status int   `json:"status"`
+		Proxy string `json:"proxy"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if !out.OK || out.Status != 200 || out.Proxy != "direct" {
+		t.Fatalf("inline testkey result: %+v", out)
+	}
+	if up.count() != 1 || up.lastAuth() != "Bearer sk-inline" {
+		t.Fatalf("upstream not called with inline key: calls=%d auth=%q", up.count(), up.lastAuth())
+	}
+	// 内联测试不得写入渠道配置
+	if n := len(store.Snapshot().Channels); n != 0 {
+		t.Fatalf("inline test must not persist channels, got %d", n)
+	}
+}
+
+// TestAdminTestKeyInlineOverridesSaved：渠道已保存但页面改了内容未保存时，
+// 测试必须使用页面内容（API Key 以页面为准），而不是存储里的旧配置。
+func TestAdminTestKeyInlineOverridesSaved(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"pong"}}]}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-saved", Enabled: true}}})
+	snap := store.Snapshot()
+	kid, chid := snap.Channels[0].Keys[0].ID, snap.Channels[0].ID
+
+	// 页面把 API Key 改成 sk-page（未保存），带上原 key ID
+	inline := `{"channel":{"id":"` + chid + `","name":"c","base_url":"` + up.URL + `","enabled":true,
+		"keys":[{"id":"` + kid + `","name":"k1","api_key":"sk-page","enabled":true}]},"model":"m1"}`
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/testkey", inline, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if up.lastAuth() != "Bearer sk-page" {
+		t.Fatalf("test must use page content: auth=%q", up.lastAuth())
+	}
+	// 存储中的配置不受测试影响
+	if k := store.Snapshot().Channels[0].Keys[0].APIKey; k != "sk-saved" {
+		t.Fatalf("saved key mutated: %q", k)
+	}
+}
+
+// TestAdminTestKeyInlineIPv6Pool：内联渠道 key 绑定代理池（按 pool_id 引用）时，
+// 未保存的渠道也能通过页面内容测试：申请租约 gw-preview 并经 SOCKS5 访问上游。
+func TestAdminTestKeyInlineIPv6Pool(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"pong"}}]}`)
+	socksAddr := startFakeSocks5(t)
+	pool, poolSrv := startFakePool(t)
+	socksPort, _ := strconv.Atoi(socksAddr[strings.LastIndex(socksAddr, ":")+1:])
+	pool.portOverride = socksPort
+
+	p := &ProxyPool{Name: "p", PoolURL: poolSrv.URL, PoolToken: "tok",
+		SocksHost: socksAddr[:strings.LastIndex(socksAddr, ":")]}
+	if err := store.PutProxyPool(p); err != nil {
+		t.Fatalf("PutProxyPool: %v", err)
+	}
+
+	inline := `{"channel":{"name":"草稿渠道","base_url":"` + up.URL + `","enabled":true,
+		"keys":[{"name":"k1","api_key":"sk-inline","enabled":true,
+			"proxy":{"kind":"ipv6pool","pool_id":"` + p.ID + `"}}]},"model":"m1"}`
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/testkey", inline, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		OK    bool   `json:"ok"`
+		Proxy string `json:"proxy"`
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if !out.OK || !strings.HasPrefix(out.Proxy, "socks5://") {
+		t.Fatalf("inline pool test result: ok=%v proxy=%q err=%q", out.OK, out.Proxy, out.Error)
+	}
+	if up.count() != 1 {
+		t.Fatalf("upstream calls = %d", up.count())
+	}
+	// 未保存 key 使用固定临时 ID（gw-preview）申请租约，重复测试幂等复用
+	pool.mu.Lock()
+	_, ok := pool.leases["gw-preview"]
+	pool.mu.Unlock()
+	if !ok {
+		t.Fatalf("expected gw-preview lease on pool, leases: %v", pool.leases)
+	}
+}

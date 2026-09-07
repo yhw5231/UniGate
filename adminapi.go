@@ -536,22 +536,53 @@ func parseTestModels(s string) []string {
 	return out
 }
 
+// testKeyBody 单 key 测试请求。channel 非空时以内联定义（WebUI 页面当前
+// 填写内容，keys 只带被测的那个 key）为准；否则按 channel_id+key_id 从存储读取。
+type testKeyBody struct {
+	ChannelID string   `json:"channel_id"`
+	KeyID     string   `json:"key_id"`
+	Model     string   `json:"model"`
+	Message   string   `json:"message"`
+	Channel   *Channel `json:"channel"`
+}
+
 // handleAdminTestKey 用指定渠道 key 发一条测试请求，验证上游与代理连通性。
+// 请求体带 channel 时直接测试页面填写内容（支持未保存的渠道/修改，不落盘）；
+// 否则按 channel_id+key_id 查存储。
 func handleAdminTestKey(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		ChannelID string `json:"channel_id"`
-		KeyID     string `json:"key_id"`
-		Model     string `json:"model"`
-		Message   string `json:"message"`
-	}
+	var body testKeyBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
 		return
 	}
-	ch, k, ok := store.FindUpKey2(body.ChannelID, body.KeyID)
-	if !ok {
-		writeJSONError(w, http.StatusNotFound, "key not found", "not_found")
-		return
+	var ch *Channel
+	var k *UpKey
+	if body.Channel != nil {
+		ich := body.Channel
+		if len(ich.Keys) == 0 {
+			writeJSONError(w, http.StatusBadRequest, "channel has no key to test", "bad_request")
+			return
+		}
+		// 未保存的 key 赋固定临时 ID：池租约 ID（gw-<keyID>）幂等复用，
+		// 渠道保存时由 Reconcile 作为孤儿分配回收
+		if strings.TrimSpace(ich.Keys[0].ID) == "" {
+			ich.Keys[0].ID = "preview"
+		}
+		if strings.TrimSpace(ich.Name) == "" {
+			ich.Name = "（未保存）" // 测试不强制命名，日志展示用
+		}
+		if err := normalizeChannel(ich); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
+			return
+		}
+		ch, k = ich, ich.Keys[0]
+	} else {
+		var ok bool
+		ch, k, ok = store.FindUpKey2(body.ChannelID, body.KeyID)
+		if !ok {
+			writeJSONError(w, http.StatusNotFound, "key not found", "not_found")
+			return
+		}
 	}
 	model := strings.TrimSpace(body.Model)
 	if model == "" {

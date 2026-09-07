@@ -294,12 +294,18 @@ function renderKeyBlocks(keys) {
   keys.forEach((k) => wrap.appendChild(keyBlock(k)));
   if (!keys.length) wrap.appendChild(keyBlock({ name: "", api_key: "", enabled: true }));
 }
+// key 块序号：radio 组名必须块间唯一——同名 radio 在整个文档内互斥，
+// 多 key 渠道会互相取消选中导致保存/测试读不到代理类型
+let keyBlockSeq = 0;
+
 function keyBlock(k) {
   const div = document.createElement("div");
   div.className = "keyblock";
+  div.dataset.keyId = k.id || ""; // 已保存 key 的真实 ID：测试/换IP/释放租约依赖
   const kind = (k.proxy && k.proxy.kind) || "";
   // 当前绑定的池：新格式按 pool_id，旧格式按 pool_url 匹配池实体（后端已自动迁移）
   const curPoolId = (k.proxy && k.proxy.pool_id) || (k.proxy && (poolByURL(k.proxy.pool_url) || {}).id) || "";
+  const pkName = "pk-" + (++keyBlockSeq);
   div.innerHTML = `
     <div class="head">
       <input class="kb-name" placeholder="名称" value="${esc(k.name || "")}">
@@ -309,9 +315,9 @@ function keyBlock(k) {
     </div>
     <div class="proxybox">
       <div class="row" style="margin:4px 0">
-        <label class="inline"><input type="radio" name="pk" value="" ${!kind ? "checked" : ""}> 直连</label>
-        <label class="inline"><input type="radio" name="pk" value="static" ${kind === "static" ? "checked" : ""}> 固定代理</label>
-        <label class="inline"><input type="radio" name="pk" value="ipv6pool" ${kind === "ipv6pool" ? "checked" : ""}> IPv6 代理池</label>
+        <label class="inline"><input type="radio" class="pk" name="${pkName}" value="" ${!kind ? "checked" : ""}> 直连</label>
+        <label class="inline"><input type="radio" class="pk" name="${pkName}" value="static" ${kind === "static" ? "checked" : ""}> 固定代理</label>
+        <label class="inline"><input type="radio" class="pk" name="${pkName}" value="ipv6pool" ${kind === "ipv6pool" ? "checked" : ""}> IPv6 代理池</label>
         <span class="spacer"></span>
         <button class="btn small kb-test">测试</button>
         <button class="btn small kb-rotate">换IP</button>
@@ -352,25 +358,29 @@ function keyBlock(k) {
     if (btn) btn.click();
   }));
   const syncProxyKind = () => {
-    const val = div.querySelector('input[name=pk]:checked').value;
+    const val = (div.querySelector("input.pk:checked") || {}).value || "";
     div.querySelector(".kb-static").classList.toggle("hidden", val !== "static");
     div.querySelector(".kb-pool").classList.toggle("hidden", val !== "ipv6pool");
   };
-  div.querySelectorAll('input[name=pk]').forEach((r) => r.addEventListener("change", syncProxyKind));
+  div.querySelectorAll("input.pk").forEach((r) => r.addEventListener("change", syncProxyKind));
 
-  // 池操作
+  // 池操作（换IP/释放租约）：作用于已保存租约，须先保存
   const needSaved = () => {
     if (!editChannel.id) { toast("请先保存渠道，再执行池操作", true); return false; }
     const keyID = div.dataset.keyId || "";
     if (!keyID) { toast("请先保存渠道以生成 key ID", true); return false; }
     return true;
   };
+  // 测试：以页面当前填写内容为准（支持未保存的渠道与修改，无需先保存）。
+  // 只发送被点击 key 的配置（keys[0]），后端直接按内联定义发起请求。
   div.querySelector(".kb-test").addEventListener("click", async () => {
+    const ch = collectChannelForm();
+    const k = collectKeyForm(div);
+    if (!k.enabled) { toast("请先勾选「启用」再测试该 key", true); return; }
+    ch.keys = [k];
+    const model = $("#chModels").value.split("\n")[0].trim() || "";
     try {
-      const r = await api("POST", "/admin/api/testkey", {
-        channel_id: editChannel.id, key_id: div.dataset.keyId || "",
-        model: $("#chModels").value.split("\n")[0].trim() || "",
-      });
+      const r = await api("POST", "/admin/api/testkey", { channel: ch, model });
       if (r.ok) toast(`测试成功 ${r.status}（${r.latency_ms}ms，经 ${r.proxy}）`);
       else toast("测试失败: " + (r.error || r.snippet || r.status), true);
     } catch (e) { toast(e.message, true); }
@@ -480,8 +490,38 @@ $("#fetchApplyBtn").addEventListener("click", () => {
   toast(`已启用 ${chosen.length} 个模型，请点「保存」写入配置`);
 });
 
-// 保存渠道
-$("#channelSaveBtn").addEventListener("click", async () => {
+// collectKeyForm 从单个 key 块读取配置（不做校验）。
+function collectKeyForm(div) {
+  const kind = (div.querySelector("input.pk:checked") || {}).value || "";
+  const k = {
+    id: div.dataset.keyId || "",
+    name: div.querySelector(".kb-name").value.trim(),
+    api_key: div.querySelector(".kb-key").value.trim(),
+    enabled: div.querySelector(".kb-enabled").checked,
+    proxy: null,
+  };
+  if (kind === "static") {
+    k.proxy = { kind: "static", url: div.querySelector(".kb-url").value.trim() };
+  } else if (kind === "ipv6pool") {
+    const statuses = div.querySelector(".kb-rotstatus").value.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
+    k.proxy = {
+      kind: "ipv6pool",
+      pool_id: div.querySelector(".kb-poolid").value,
+      lease_id: div.querySelector(".kb-leaseid").value.trim(),
+      persistent: div.querySelector(".kb-persist").checked,
+      share: div.querySelector(".kb-share").checked,
+      rotate_on_net_err: div.querySelector(".kb-rotnet").checked,
+      rotate_statuses: statuses,
+      rotate_interval_sec: parseInt(div.querySelector(".kb-rotsec").value, 10) || 0,
+      rotate_requests: parseInt(div.querySelector(".kb-rotreq").value, 10) || 0,
+    };
+  }
+  return k;
+}
+
+// collectChannelForm 从编辑弹窗当前页面内容构建渠道对象（不做校验）。
+// 测试与保存共用：测试「以页面填写内容为准」，而非已保存配置。
+function collectChannelForm() {
   const headers = {};
   $$("#chHeaders .row").forEach((row) => {
     const inputs = row.querySelectorAll("input");
@@ -489,35 +529,8 @@ $("#channelSaveBtn").addEventListener("click", async () => {
     if (name) headers[name] = value;
   });
   const models = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  const keys = [];
-  $$("#chKeys .keyblock").forEach((div) => {
-    const kind = div.querySelector('input[name=pk]:checked').value;
-    const k = {
-      id: div.dataset.keyId || "",
-      name: div.querySelector(".kb-name").value.trim(),
-      api_key: div.querySelector(".kb-key").value.trim(),
-      enabled: div.querySelector(".kb-enabled").checked,
-      proxy: null,
-    };
-    if (kind === "static") {
-      k.proxy = { kind: "static", url: div.querySelector(".kb-url").value.trim() };
-    } else if (kind === "ipv6pool") {
-      const statuses = div.querySelector(".kb-rotstatus").value.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
-      k.proxy = {
-        kind: "ipv6pool",
-        pool_id: div.querySelector(".kb-poolid").value,
-        lease_id: div.querySelector(".kb-leaseid").value.trim(),
-        persistent: div.querySelector(".kb-persist").checked,
-        share: div.querySelector(".kb-share").checked,
-        rotate_on_net_err: div.querySelector(".kb-rotnet").checked,
-        rotate_statuses: statuses,
-        rotate_interval_sec: parseInt(div.querySelector(".kb-rotsec").value, 10) || 0,
-        rotate_requests: parseInt(div.querySelector(".kb-rotreq").value, 10) || 0,
-      };
-    }
-    keys.push(k);
-  });
-  const ch = {
+  const keys = $$("#chKeys .keyblock").map(collectKeyForm);
+  return {
     id: editChannel.id || "",
     name: $("#chName").value.trim(),
     group: $("#chGroup").value.trim(),
@@ -531,6 +544,11 @@ $("#channelSaveBtn").addEventListener("click", async () => {
     enabled: $("#chEnabled").checked,
     keys,
   };
+}
+
+// 保存渠道
+$("#channelSaveBtn").addEventListener("click", async () => {
+  const ch = collectChannelForm();
   try {
     const saved = await api("PUT", "/admin/api/channels", ch);
     editChannel = saved;

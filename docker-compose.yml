@@ -1,11 +1,10 @@
 services:
   unigate:
-    # 默认拉取官方镜像（ghcr.io），git pull 后 docker compose pull && up -d 即可在线更新；
-    # 想本地构建改用：注释 image、取消 build 注释
-    image: ghcr.io/yhw5231/localcline:latest
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
+    # 容器部署 = 本地重编译：克隆仓库后在仓库目录执行 docker compose up -d --build
+    # （更新版本：git pull 后再次执行 docker compose up -d --build）
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: unigate
     restart: unless-stopped
     ports:

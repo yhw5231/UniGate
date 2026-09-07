@@ -10,5 +10,7 @@
 
 # 用量数据库（SQLite，容器需挂载 data 目录持久化）
 /data/
+# upgrade.sh 升级前的数据目录备份
+/backups/
 *.db
 *.db.tmp

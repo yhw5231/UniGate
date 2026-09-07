@@ -36,11 +36,13 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
   流式/非流式都支持（Cline 渠道需要，供 sub2api 等下游识别 thinking）。
 - **请求日志**：仅记录**大模型网关接口**请求（`/v1/*`，如 chat/completions、models、
   responses；Admin/WebUI 等系统后台请求不记），环形缓冲保留最近 N 条，含接口/渠道/
-  key/模型/token 数/状态/耗时/错误。
+  key/模型/token 数/状态/耗时/错误。**渠道测试请求例外**：无论成败都会写入请求
+  记录留痕，`user` 为发起测试的管理员，`path` 为实际上游路径。
 - **用量统计**：SQLite 逐条记录输入/输出 token，支持 今日/24h/7d/30d/全部 窗口，
   按下游 key、渠道、模型、上游 key 聚合。
 - **WebUI**：渠道与 key 管理（支持关键字搜索 + 分组过滤）、通用密钥签发、日志、
-  用量、代理池租约搜索、连通性测试、手动换 IP / 释放租约、单 key 连通性测试。
+  用量、代理池租约搜索、连通性测试、手动换 IP / 释放租约、单 key 连通性测试，
+  以及**「渠道测试」独立页面**（按渠道/模型批量测试，逐项返回结果）。
 - **版本标识**：后台登录页与顶栏显示构建版本号（`GET /api/version`），CI 按 Git
   tag（`v*`）注入，本地构建显示 `dev`；启动日志与上游请求 User-Agent 同样携带版本。
 
@@ -51,10 +53,12 @@ go run .
 # 浏览器打开 http://localhost:8080 ，默认 admin/admin（务必修改）
 ```
 
-Docker（默认拉取 GHCR 预构建镜像，无需本地构建）：
+Docker（克隆仓库后在本地构建镜像并启动，无需宿主机安装 Go）：
 
 ```bash
-docker compose up -d
+git clone https://github.com/yhw5231/localcline.git
+cd localcline
+docker compose up -d --build
 ```
 
 ### WebUI 里配一个渠道的最小流程
@@ -81,17 +85,19 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 部署说明
 
-### 方式一：Docker Compose（推荐，在线更新）
+### 方式一：Docker Compose（推荐，本地构建部署）
 
-官方镜像发布在 GHCR：`ghcr.io/yhw5231/localcline`，支持 `linux/amd64` 与 `linux/arm64`。
+容器部署即**本地重编译**：克隆仓库后由 Dockerfile 在容器内编译 Go 源码并打包镜像
+（多阶段构建，构建阶段按目标架构自动交叉编译，支持 `linux/amd64` 与 `linux/arm64`，
+无需 qemu 模拟）。镜像不在公共仓库发布，必须从源码构建。
 
 ```bash
-# 1. 准备 compose 文件（可直接克隆仓库使用其中的 docker-compose.yml）
-mkdir unigate && cd unigate
-curl -o docker-compose.yml https://raw.githubusercontent.com/yhw5231/localcline/main/docker-compose.yml
+# 1. 克隆仓库
+git clone https://github.com/yhw5231/localcline.git
+cd localcline
 
-# 2. 拉取镜像并启动
-docker compose up -d
+# 2. 构建镜像并启动
+docker compose up -d --build
 
 # 3. 查看日志确认启动成功
 docker compose logs -f
@@ -100,12 +106,15 @@ docker compose logs -f
 
 启动后浏览器打开 `http://<主机IP>:8080`，默认账号 `admin` / `admin`，
 **生产环境务必通过环境变量修改管理员账号密码**（见下文安全清单）。
+本地构建未注入版本号时，后台版本标识显示 `dev`（见上文「版本标识」）。
 
-**在线更新**（无需克隆代码）：
+**更新版本**（拉取最新代码后重新构建、重建容器）：
 
 ```bash
-docker compose pull && docker compose up -d
-docker image prune -f    # 可选：清理旧镜像
+./upgrade.sh                                  # 一键升级：git pull → 重新构建 → 重建容器 → 备份 data/ → 跟踪日志
+# 或手动执行：
+git pull && docker compose up -d --build
+docker image prune -f    # 可选：清理悬空的旧镜像
 ```
 
 常用运维命令：
@@ -116,15 +125,15 @@ docker compose down             # 停止（data/ 目录保留）
 docker compose logs -f --tail=100
 ```
 
-> 想本地构建：克隆仓库后把 compose 里的 `image` 注释掉、取消 `build` 段注释，
-> 再 `docker compose up -d --build`。
-
-镜像版本标签：`latest`（main 分支最新）、`<短sha>`（如 `e1c5ecc`，可锁定版本回滚）、
-`v1.2.3`（正式发布打 tag 时）。
-
 ### 方式二：纯 Docker（不用 Compose）
 
+先在仓库根目录构建镜像，再用构建产物运行：
+
 ```bash
+git clone https://github.com/yhw5231/localcline.git
+cd localcline
+docker build -t unigate:local .
+
 mkdir -p ./data
 
 docker run -d --name unigate \
@@ -133,7 +142,7 @@ docker run -d --name unigate \
   -v "$(pwd)/data:/data" \
   -e ADMIN_USERNAME=admin \
   -e ADMIN_PASSWORD=改成强密码 \
-  ghcr.io/yhw5231/localcline:latest
+  unigate:local
 
 # 数据目录属主想匹配宿主机某用户时，指定运行身份（可选）：
 docker run -d --name unigate \
@@ -141,16 +150,16 @@ docker run -d --name unigate \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
   -e PUID=1000 -e PGID=1000 \
-  ghcr.io/yhw5231/localcline:latest
+  unigate:local
 ```
-
-本地构建（改代码后自用）：克隆仓库后 `docker build -t unigate:local .`，
-把上面命令中的镜像名换成 `unigate:local` 即可。
 
 > 说明：镜像基于 alpine。entrypoint 以 root 启动，会自动把 `/data` 属主修正为
 > `PUID:PGID`（默认取镜像内 app 用户的 uid/gid，通常 100:100），随后立即降权为该身份
 > 运行——因此**宿主机挂载目录属主任意均可直接部署**；进程实际不以 root 运行。
 > 显式 `--user=<uid>:<gid>` 启动时跳过 chown，属主由调用方保证。
+>
+> 后续升级可用仓库自带的 `./upgrade.sh`（未用 compose 时自动走 `docker build` +
+> `docker run` 路径），见下文「升级」。
 
 ### 常见问题（容器反复重启）
 
@@ -159,7 +168,7 @@ docker run -d --name unigate \
 
 - 挂载了 NFS/SMB 等网络存储导致 root 无权 chown（root-squash）：改用 `-e PUID=<宿主UID> -e PGID=<宿主GID>` 匹配存储属主，或手动在宿主机 `chown -R 100:100 ./data`；
 - 显式指定了 `--user`：改为以默认身份运行，或使 `--user` 与目录属主一致；
-- 旧版镜像（无 entrypoint 自动 chown）：在宿主机执行 `chown -R 100:100 ./data` 后拉取新镜像重建。
+- 旧版镜像（无 entrypoint 自动 chown）：在宿主机执行 `chown -R 100:100 ./data` 后重新构建镜像并重建容器。
 
 ### 方式三：源码编译部署
 
@@ -284,9 +293,23 @@ healthcheck:
 
 ### 升级
 
+容器部署与源码部署都一样：**更新代码后必须重新编译再重启**——容器是本地构建的，
+镜像里打包的是构建时的二进制，`git pull` 后不重建容器不会生效。
+
+Compose 部署直接用仓库自带的一键升级脚本 `upgrade.sh`（拉代码 → 备份 `data/` →
+重新构建镜像 → 重建容器 → 输出启动日志；非 compose 环境也能用，走 `docker build` +
+`docker run` 路径）：
+
 ```bash
-docker compose pull && docker compose up -d    # Compose（在线镜像）
-git pull && docker compose up -d --build       # 本地构建部署
+./upgrade.sh
+```
+
+或手动更新：
+
+```bash
+git pull && docker compose up -d --build       # Compose（本地构建）
+git pull && docker build -t unigate:local . && docker rm -f unigate
+# 然后按「方式二」的 docker run 命令用新镜像重建容器
 # 或源码部署：git pull 重新 go build 后重启服务
 ```
 
@@ -387,6 +410,7 @@ git pull && docker compose up -d --build       # 本地构建部署
 | `POST /admin/api/pool/release` | 手动释放租约 `{channel_id, key_id}` 或 `{pool_url, lease_id}` |
 | `GET /admin/api/pool/leases` | 网关持有的租约列表 |
 | `POST /admin/api/testkey` | 用指定 key 发一条测试请求 `{channel_id, key_id, model?}` |
+| `POST /admin/api/channels/{id}/test-model` | 渠道级批量测试 `{key_id?, first_only?, models?}`（models 每行/逗号分隔，空 = 渠道已启用模型）；逐 key × 逐模型执行，HTTP 层不报错，成败均通过结果项的 `ok` 表达，且每次测试（含失败）都写入请求记录 |
 | `GET /admin/api/requests?limit=` | 最近请求日志 |
 | `GET /admin/api/usage?window=today\|24h\|7d\|30d\|all` | 用量统计（支持 `?user=&channel=&model=&key=`） |
 

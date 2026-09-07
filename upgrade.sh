@@ -41,7 +41,7 @@ if [ "$use_compose" = true ]; then
     docker compose up -d --build
     echo "==> 3/4 清理悬空旧镜像"
     docker image prune -f >/dev/null 2>&1 || true
-    echo "==> 4/4 查看启动日志（确认出现 \"gateway on :10080, webui on :10070\"，Ctrl+C 退出）"
+    echo "==> 4/4 查看启动日志（确认出现 \"listening on :10010\"，Ctrl+C 退出）"
     docker compose logs -f --tail=50
 else
     echo "==> 2/4 构建镜像 $IMAGE（docker build）"
@@ -50,10 +50,10 @@ else
     echo "==> 3/4 重建容器"
     # 容器已存在则先删除（数据都在宿主机 ./data，删容器不丢数据）
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-    # 沿用 compose 的默认配置：10080 网关 / 10070 WebUI、./data 挂载、unless-stopped
+    # 沿用 compose 的默认配置：单端口 10010（网关+WebUI）、./data 挂载、unless-stopped
     docker run -d --name "$CONTAINER" \
         --restart unless-stopped \
-        -p 10080:10080 -p 10070:10070 \
+        -p 10010:10010 \
         -v "$(pwd)/data:/data" \
         "$IMAGE"
     echo "==> 4/4 启动日志"

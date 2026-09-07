@@ -108,7 +108,7 @@ func loadConfig() Config {
 
 	return Config{
 		Port:            getenv("PORT", defaultPort),
-		WebUIPort:       getenv("WEBUI_PORT", defaultWebUIPort),
+		WebUIPort:       strings.TrimSpace(os.Getenv("WEBUI_PORT")),
 		DataDir:         dataDir,
 		GWPath:          gwPath,
 		AccountsPath:    accountsPath,
@@ -147,8 +147,7 @@ func resetCfgForTest() {
 	initUsageDB()
 }
 
-const defaultPort = "10080"
-const defaultWebUIPort = "10070"
+const defaultPort = "10010"
 
 func parseBoolEnv(key string, def bool) (bool, error) {
 	v := os.Getenv(key)

@@ -1,7 +1,7 @@
 // unigate —— 通用 AI 网关：多渠道账号、每 key 独立代理（含 ipv6-proxy-pool
 // 动态租约）、OpenAI 兼容转发、故障转移、请求日志与 WebUI。
 //
-// 路由总览（默认双端口：网关 :10080，WebUI/Admin :10070；WEBUI_PORT 置空时合并单端口）：
+// 路由总览（默认单端口 :10010 同时服务网关与 WebUI/Admin；设 WEBUI_PORT 可拆分独立管理端口）：
 //
 //	网关端口（PORT）：
 //	POST /v1/chat/completions      下游 OpenAI 兼容转发（需通用 key，GW_KEY_AUTH=false 时免鉴权）
@@ -75,7 +75,7 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-// webUIMerged WEBUI_PORT 显式置空（或与网关端口相同）时，单端口同时服务网关与管理面。
+// webUIMerged WEBUI_PORT 未设置（默认）或与网关端口相同时，单端口同时服务网关与管理面。
 func webUIMerged() bool {
 	return cfg.WebUIPort == "" || cfg.WebUIPort == cfg.Port
 }
@@ -118,7 +118,7 @@ func managementHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// rootHandler 合并监听（WEBUI_PORT 置空或与网关同端口）时的顶层分发。
+// rootHandler 合并监听（WEBUI_PORT 未设或与网关同端口）时的顶层分发。
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	if strings.HasPrefix(path, "/v1/") || path == "/models" || path == "/models/" || path == "/chat/completions" {

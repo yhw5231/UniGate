@@ -8,12 +8,12 @@ services:
     container_name: unigate
     restart: unless-stopped
     ports:
-      - "10080:10080"   # 网关（/v1/* OpenAI 兼容转发）
-      - "10070:10070"   # WebUI / Admin API（建议仅内网或本机访问）
+      - "10010:10010"   # 网关（/v1/*）与 WebUI/Admin 同端口
     environment:
-      PORT: "10080"
-      WEBUI_PORT: "10070"
+      PORT: "10010"
       DATA_DIR: /data
+      # 如需把 WebUI/Admin 拆到独立端口（便于只暴露网关），取消注释：
+      # WEBUI_PORT: "10070"   # 同时在 ports 里加 - "10070:10070"
       # 数据目录属主（启动时自动 chown /data 后以此身份运行；默认取镜像内 app
       # 用户的 uid/gid，通常 100:100——与宿主机目录属主无关，bind mount 任意属主均可）
       # PUID: 1000

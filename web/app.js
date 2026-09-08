@@ -64,6 +64,7 @@ function logout() {
   localStorage.removeItem("unigate_token");
   TOKEN = "";
   if (logsTimer) clearInterval(logsTimer);
+  if (errorsTimer) clearInterval(errorsTimer);
   showLogin();
 }
 
@@ -96,6 +97,7 @@ $$(".tab").forEach((btn) => btn.addEventListener("click", () => {
   $$(".tabpane").forEach((p) => p.classList.add("hidden"));
   $("#tab-" + btn.dataset.tab).classList.remove("hidden");
   if (btn.dataset.tab === "logs") refreshLogs();
+  if (btn.dataset.tab === "errors") refreshErrors();
   if (btn.dataset.tab === "test") refreshTestTab();
   if (btn.dataset.tab === "usage") refreshUsage();
   if (btn.dataset.tab === "leases") { renderPools(); refreshLeases(); }
@@ -184,14 +186,19 @@ function renderChannels() {
   }
   wrap.innerHTML = chans.map((ch) => {
     const keys = ch.keys || [];
+    const coolingN = keys.filter((k) => cooling[k.id]).length;
     const keyLines = keys.map((k) => {
-      const p = k.proxy && k.proxy.kind ? proxyDesc(k.proxy) : "直连";
+      const p = keyProxyDesc(k, ch);
       const cd = coolingBadge(cooling, k.id);
+      const clearBtn = cooling[k.id]
+        ? `<button class="btn small" data-act="clearcool" data-key="${esc(k.id)}" title="手动解除该 key 的全部冷却（key 级与按模型冷却）">解除冷却</button>`
+        : "";
       return `<div class="key-line">
         <span class="badge ${k.enabled ? "on" : "off"}">${k.enabled ? "启用" : "停用"}</span>
         <span>${esc(k.name || "(未命名)")}</span>
         ${cd}
         <span class="pname">代理: ${esc(p)}</span>
+        ${clearBtn}
       </div>`;
     }).join("");
     const modelLine = (ch.models || []).length
@@ -206,6 +213,8 @@ function renderChannels() {
         ${ch.endpoint_type === "responses" ? '<span class="badge info">responses</span>' : ""}
         ${ch.rewrite_reasoning ? '<span class="badge info">reasoning改写</span>' : ""}
         ${ch.cooldown_scope === "key_model" ? '<span class="badge info">按(Key,模型)冷却</span>' : ""}
+        ${ch.proxy && ch.proxy.kind ? '<span class="badge info">渠道代理</span>' : ""}
+        ${coolingN ? `<span class="badge warn">${coolingN} 个 key 冷却中</span>` : ""}
         <span class="spacer"></span>
         <button class="btn small" data-act="edit">编辑</button>
         <button class="btn small danger" data-act="del">删除</button>
@@ -225,6 +234,14 @@ function renderChannels() {
     if (!confirm(`删除渠道「${ch.name}」？其绑定的代理池租约将被释放。`)) return;
     try { await api("DELETE", "/admin/api/channels/" + id); toast("已删除"); await loadState(); }
     catch (e) { toast(e.message, true); }
+  }));
+  wrap.querySelectorAll('[data-act="clearcool"]').forEach((b) => b.addEventListener("click", async () => {
+    const chID = b.closest(".channel-card").dataset.id;
+    try {
+      const r = await api("POST", "/admin/api/cooling/clear", { key_id: b.dataset.key, channel_id: chID });
+      toast(r.cleared > 0 ? `已解除 ${r.cleared} 条冷却` : "该 key 当前没有冷却");
+      await loadState();
+    } catch (e) { toast(e.message, true); }
   }));
 }
 $("#channelSearch").addEventListener("input", renderChannels);
@@ -247,7 +264,16 @@ function coolingBadge(cooling, keyID) {
   if (!c) return "";
   const left = c.left_ms > 0 ? Math.round(c.left_ms / 1000) : 0;
   const scope = c.model ? `（${esc(c.model)}）` : "";
-  return `<span class="badge warn" title="该 key 因上游故障处于冷却中，网关转发会跳过它；渠道测试成功会自动解除">冷却中${scope} · 剩 ${left}s</span>`;
+  return `<span class="badge warn" title="该 key 因上游故障处于冷却中，网关转发会跳过它；渠道测试成功或点「解除冷却」可立即恢复">冷却中${scope} · 剩 ${fmtLeft(left)}</span>`;
+}
+
+// fmtLeft 冷却剩余时间：秒 → 1h2m3s 样式（不足 1 小时只显示分秒）。
+function fmtLeft(sec) {
+  if (sec < 60) return sec + "s";
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return `${m}m${s ? s + "s" : ""}`;
+  const h = Math.floor(m / 60);
+  return `${h}h${m % 60}m`;
 }
 function poolByURL(url) {
   const u = String(url || "").replace(/\/+$/, "");
@@ -283,6 +309,14 @@ function proxyDesc(p) {
   return "直连";
 }
 
+// keyProxyDesc key 行的代理描述：key 自身配置 > 渠道级代理（继承）> 直连。
+function keyProxyDesc(k, ch) {
+  if (k.proxy && k.proxy.kind) return proxyDesc(k.proxy);
+  if (k.proxy) return "直连（key 覆盖）";
+  if (ch && ch.proxy && ch.proxy.kind) return "渠道代理: " + proxyDesc(ch.proxy);
+  return "直连";
+}
+
 // ---- 渠道编辑器 ----
 $("#addChannelBtn").addEventListener("click", () => openChannelEditor({
   id: "", name: "", group: "", base_url: "", models_url: "", endpoint_type: "chat", models: [], headers: {},
@@ -301,11 +335,108 @@ function openChannelEditor(ch) {
   $("#chEnabled").checked = !!ch.enabled;
   $("#chRewrite").checked = !!ch.rewrite_reasoning;
   $("#chCooldownScope").value = ch.cooldown_scope === "key_model" ? "key_model" : "key";
+  renderChannelProxy(ch.proxy || null);
   renderHeaderRows(ch.headers || {});
   renderKeyBlocks(ch.keys || []);
   renderModelChips();
+  renderCoolingKeys(ch);
   $("#channelErr").textContent = "";
   $("#channelModal").classList.remove("hidden");
+}
+
+// ---- 渠道级代理块（复用 key 代理选择 UI，无测试/换IP按钮） ----
+function renderChannelProxy(proxy) {
+  const wrap = $("#chChannelProxy");
+  wrap.innerHTML = "";
+  wrap.appendChild(proxyBlock(proxy));
+}
+
+// proxyBlock 渠道级代理配置块：无代理 + 固定代理 + IPv6 代理池。
+function proxyBlock(p) {
+  const div = document.createElement("div");
+  div.className = "keyblock";
+  const kind = (p && p.kind) || "";
+  const curPoolId = (p && p.pool_id) || (p && (poolByURL(p.pool_url) || {}).id) || "";
+  div.innerHTML = `
+    <div class="proxybox">
+      <div class="row" style="margin:4px 0">
+        <label class="inline"><input type="radio" class="cpk" name="cpk-ch" value="" ${!kind ? "checked" : ""}> 无（key 未配置代理时直连）</label>
+        <label class="inline"><input type="radio" class="cpk" name="cpk-ch" value="static" ${kind === "static" ? "checked" : ""}> 固定代理</label>
+        <label class="inline"><input type="radio" class="cpk" name="cpk-ch" value="ipv6pool" ${kind === "ipv6pool" ? "checked" : ""}> IPv6 代理池</label>
+      </div>
+      <div class="cp-static ${kind === "static" ? "" : "hidden"}">
+        <label>代理 URL <input class="cp-url" placeholder="http://user:pass@host:port 或 socks5://user:pass@host:port" value="${esc(p && p.url || "")}"></label>
+      </div>
+      <div class="cp-pool ${kind === "ipv6pool" ? "" : "hidden"}">
+        <div class="grid3">
+          <label>代理池
+            <select class="cp-poolid">
+              <option value="">（选择代理池…）</option>
+              ${poolOptions(curPoolId)}
+            </select>
+          </label>
+          <label class="inline" style="align-self:end;margin-bottom:10px" title="同「池+BaseURL」分组的 key 共用同一租约/IP；不勾选时渠道内每个 key 各自独立租约/IP"><input type="checkbox" class="cp-share" ${p && p.share ? "checked" : ""}> 跨渠道复用</label>
+          <label class="inline" style="align-self:end;margin-bottom:10px"><input type="checkbox" class="cp-persist" ${p && p.persistent ? "checked" : ""}> 常驻租约（免空闲回收）</label>
+        </div>
+        <div class="row" style="margin:4px 0">
+          <label class="inline">每 N 次请求换IP（0=关闭）<input class="cp-rotreq" type="number" min="0" value="${(p && p.rotate_requests) || 0}" style="width:90px"></label>
+          <label class="inline">每 N 秒换IP（0=关闭）<input class="cp-rotsec" type="number" min="0" value="${(p && p.rotate_interval_sec) || 0}" style="width:90px"></label>
+        </div>
+      </div>
+    </div>`;
+  const sync = () => {
+    const val = (div.querySelector("input.cpk:checked") || {}).value || "";
+    div.querySelector(".cp-static").classList.toggle("hidden", val !== "static");
+    div.querySelector(".cp-pool").classList.toggle("hidden", val !== "ipv6pool");
+  };
+  div.querySelectorAll("input.cpk").forEach((r) => r.addEventListener("change", sync));
+  return div;
+}
+
+// collectChannelProxy 读取渠道级代理块；未启用任何代理时返回 null。
+function collectChannelProxy() {
+  const wrap = $("#chChannelProxy");
+  const kind = (wrap.querySelector("input.cpk:checked") || {}).value || "";
+  if (kind === "static") {
+    return { kind: "static", url: wrap.querySelector(".cp-url").value.trim() };
+  }
+  if (kind === "ipv6pool") {
+    return {
+      kind: "ipv6pool",
+      pool_id: wrap.querySelector(".cp-poolid").value,
+      share: wrap.querySelector(".cp-share").checked,
+      persistent: wrap.querySelector(".cp-persist").checked,
+      rotate_interval_sec: parseInt(wrap.querySelector(".cp-rotsec").value, 10) || 0,
+      rotate_requests: parseInt(wrap.querySelector(".cp-rotreq").value, 10) || 0,
+    };
+  }
+  return null;
+}
+
+// renderCoolingKeys 编辑弹窗底部：该渠道冷却中的 key 一键解除。
+function renderCoolingKeys(ch) {
+  const wrap = $("#chCoolingKeys");
+  const cooling = coolingByKeyID();
+  const items = (ch.keys || []).filter((k) => cooling[k.id]);
+  if (!items.length) {
+    wrap.innerHTML = '<span class="muted" style="font-size:12px">（无冷却中的 key）</span>';
+    return;
+  }
+  wrap.innerHTML = items.map((k) => {
+    const c = cooling[k.id];
+    const left = c.left_ms > 0 ? Math.round(c.left_ms / 1000) : 0;
+    const scope = c.model ? `（${esc(c.model)}）` : "";
+    return `<span class="chip">${esc(k.name || k.id)}${scope} 剩 ${fmtLeft(left)}
+      <button class="btn small" data-clearkey="${esc(k.id)}">解除</button></span>`;
+  }).join("");
+  wrap.querySelectorAll("[data-clearkey]").forEach((b) => b.addEventListener("click", async () => {
+    try {
+      const r = await api("POST", "/admin/api/cooling/clear", { key_id: b.dataset.clearkey, channel_id: ch.id || "" });
+      toast(r.cleared > 0 ? `已解除 ${r.cleared} 条冷却` : "该 key 当前没有冷却");
+      await loadState();
+      renderCoolingKeys(STATE.channels.find((c) => c.id === ch.id) || ch);
+    } catch (e) { toast(e.message, true); }
+  }));
 }
 
 // 可用模型 chips 展示（跟随左侧文本框实时变化）；freeSet 非空时为对应模型标注「免费」
@@ -344,21 +475,35 @@ $("#addHeaderBtn").addEventListener("click", () => $("#chHeaders").appendChild(h
 function renderKeyBlocks(keys) {
   const wrap = $("#chKeys");
   wrap.innerHTML = "";
-  keys.forEach((k) => wrap.appendChild(keyBlock(k)));
+  keys.forEach((k) => wrap.appendChild(keyBlock(k, keyInheritInfo(k))));
   if (!keys.length) wrap.appendChild(keyBlock({ name: "", api_key: "", enabled: true }));
+}
+
+// keyInheritInfo 「跟随渠道」时展示当前实际生效的代理描述。
+function keyInheritInfo(k) {
+  if (k.proxy) return null;
+  const p = editChannel && editChannel.proxy;
+  if (p && p.kind) return { desc: keyProxyDesc(k, editChannel) };
+  return { desc: "直连（渠道未设置代理）" };
 }
 // key 块序号：radio 组名必须块间唯一——同名 radio 在整个文档内互斥，
 // 多 key 渠道会互相取消选中导致保存/测试读不到代理类型
 let keyBlockSeq = 0;
 
-function keyBlock(k) {
+function keyBlock(k, inheritInfo) {
   const div = document.createElement("div");
   div.className = "keyblock";
   div.dataset.keyId = k.id || ""; // 已保存 key 的真实 ID：测试/换IP/释放租约依赖
-  const kind = (k.proxy && k.proxy.kind) || "";
+  // proxy == null 时 key 未单独配置代理（跟随渠道级设置）；
+  // proxy 为空规格（kind 空对象）表示 key 显式直连，覆盖渠道级代理
+  const followsChannel = !k.proxy;
+  const kind = followsChannel ? "inherit" : ((k.proxy.kind) || "direct");
   // 当前绑定的池：新格式按 pool_id，旧格式按 pool_url 匹配池实体（后端已自动迁移）
   const curPoolId = (k.proxy && k.proxy.pool_id) || (k.proxy && (poolByURL(k.proxy.pool_url) || {}).id) || "";
   const pkName = "pk-" + (++keyBlockSeq);
+  const inheritLabel = inheritInfo && inheritInfo.desc
+    ? `<span class="muted" style="font-size:12px;align-self:center">（当前生效：${esc(inheritInfo.desc)}）</span>`
+    : "";
   div.innerHTML = `
     <div class="head">
       <input class="kb-name" placeholder="名称" value="${esc(k.name || "")}">
@@ -368,10 +513,12 @@ function keyBlock(k) {
     </div>
     <div class="proxybox">
       <div class="row" style="margin:4px 0">
-        <label class="inline"><input type="radio" class="pk" name="${pkName}" value="" ${!kind ? "checked" : ""}> 直连</label>
+        <label class="inline" title="未单独配置代理的 key 使用渠道级代理（渠道级未设置时直连）；渠道级为代理池时每个 key 独立租约/出口 IP"><input type="radio" class="pk" name="${pkName}" value="inherit" ${followsChannel ? "checked" : ""}> 跟随渠道</label>
+        <label class="inline"><input type="radio" class="pk" name="${pkName}" value="direct" ${kind === "direct" ? "checked" : ""}> 直连</label>
         <label class="inline"><input type="radio" class="pk" name="${pkName}" value="static" ${kind === "static" ? "checked" : ""}> 固定代理</label>
         <label class="inline"><input type="radio" class="pk" name="${pkName}" value="ipv6pool" ${kind === "ipv6pool" ? "checked" : ""}> IPv6 代理池</label>
         <span class="spacer"></span>
+        ${inheritLabel}
         <button class="btn small kb-test">测试</button>
         <button class="btn small kb-rotate">换IP</button>
         <button class="btn small kb-release">释放租约</button>
@@ -410,7 +557,7 @@ function keyBlock(k) {
     if (btn) btn.click();
   }));
   const syncProxyKind = () => {
-    const val = (div.querySelector("input.pk:checked") || {}).value || "";
+    const val = (div.querySelector("input.pk:checked") || {}).value || "inherit";
     div.querySelector(".kb-static").classList.toggle("hidden", val !== "static");
     div.querySelector(".kb-pool").classList.toggle("hidden", val !== "ipv6pool");
   };
@@ -453,7 +600,7 @@ function keyBlock(k) {
   });
   return div;
 }
-$("#addKeyBtn").addEventListener("click", () => $("#chKeys").appendChild(keyBlock({ name: "", api_key: "", enabled: true })));
+$("#addKeyBtn").addEventListener("click", () => $("#chKeys").appendChild(keyBlock({ name: "", api_key: "", enabled: true }, keyInheritInfo({}))));
 
 // ---- key 批量导入：每行一个，支持 "key" 或 "名称|key"（也兼容 "名称:key"），# 开头为注释 ----
 const BULK_NAME = "导入key";
@@ -543,8 +690,9 @@ $("#fetchApplyBtn").addEventListener("click", () => {
 });
 
 // collectKeyForm 从单个 key 块读取配置（不做校验）。
+// proxy=null 表示跟随渠道级代理；{kind:"none"} 表示 key 显式直连（覆盖渠道级）。
 function collectKeyForm(div) {
-  const kind = (div.querySelector("input.pk:checked") || {}).value || "";
+  const kind = (div.querySelector("input.pk:checked") || {}).value || "inherit";
   const k = {
     id: div.dataset.keyId || "",
     name: div.querySelector(".kb-name").value.trim(),
@@ -552,7 +700,9 @@ function collectKeyForm(div) {
     enabled: div.querySelector(".kb-enabled").checked,
     proxy: null,
   };
-  if (kind === "static") {
+  if (kind === "direct") {
+    k.proxy = { kind: "none" };
+  } else if (kind === "static") {
     k.proxy = { kind: "static", url: div.querySelector(".kb-url").value.trim() };
   } else if (kind === "ipv6pool") {
     k.proxy = {
@@ -579,6 +729,7 @@ function collectChannelForm() {
   });
   const models = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
   const keys = $$("#chKeys .keyblock").map(collectKeyForm);
+  const chProxy = collectChannelProxy();
   return {
     id: editChannel.id || "",
     name: $("#chName").value.trim(),
@@ -590,6 +741,7 @@ function collectChannelForm() {
     headers,
     rewrite_reasoning: $("#chRewrite").checked,
     cooldown_scope: $("#chCooldownScope").value,
+    proxy: chProxy,
     enabled: $("#chEnabled").checked,
     keys,
   };
@@ -650,17 +802,24 @@ $("#addGWKeyBtn").addEventListener("click", async () => {
   } catch (e) { toast(e.message, true); }
 });
 
-// ---- 请求日志 ----
-async function refreshLogs() {
-  try {
-    const data = await api("GET", "/admin/api/requests?limit=200");
-    const tbody = $("#logTable tbody");
-    const recs = data.records || [];
-    if (!recs.length) {
-      tbody.innerHTML = `<tr><td colspan="11" class="muted">暂无请求记录（记录 /v1/* 网关接口请求，以及后台渠道测试发出的上游请求）。</td></tr>`;
-      return;
-    }
-    tbody.innerHTML = recs.map((r) => `<tr>
+// ---- 请求日志 / 错误日志（分页） ----
+// 分页状态；页码、每页条数由后端 page/page_size 控制，自动刷新保持当前页
+const logsState = { page: 1, size: 100, pages: 1, total: 0 };
+const errsState = { page: 1, size: 100, pages: 1, total: 0 };
+let errorsTimer = null;
+
+function pagerInfo(st) {
+  if (!st.total) return "共 0 条";
+  return `第 ${st.page} / ${st.pages} 页 · 共 ${st.total} 条`;
+}
+
+function renderLogRows(tbodySel, recs, emptyTip) {
+  const tbody = $(tbodySel);
+  if (!recs.length) {
+    tbody.innerHTML = `<tr><td colspan="11" class="muted">${emptyTip}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = recs.map((r) => `<tr>
       <td class="muted">${esc((r.time || "").replace("T", " ").slice(2, 19))}</td>
       <td class="muted">${esc(r.path || "")}</td>
       <td><span class="badge ${r.status && r.status < 400 ? "on" : "off"}">${r.status || "ERR"}</span></td>
@@ -671,15 +830,69 @@ async function refreshLogs() {
       <td class="muted">${r.prompt_tokens || 0} / ${r.completion_tokens || 0}</td>
       <td>${esc(r.user || "")}</td>
       <td>${esc(r.client_ip || "")}</td>
-      <td class="err">${esc(r.error || "")}</td>
+      <td class="err" style="white-space:pre-wrap;word-break:break-all;max-width:480px">${esc(r.error || "")}</td>
     </tr>`).join("");
-  } catch (e) { toast(e.message, true); }
 }
-$("#logsRefresh").addEventListener("click", refreshLogs);
-$("#logsAuto").addEventListener("change", (e) => {
-  if (logsTimer) clearInterval(logsTimer);
-  if (e.target.checked) logsTimer = setInterval(refreshLogs, 5000);
-});
+
+// fetchLogPage 拉取一页；当前页超出总页数时回退到最后一页重取一次
+async function fetchLogPage(url, st, pagerSel, tbodySel, emptyTip) {
+  try {
+    const data = await api("GET", `${url}?page=${st.page}&page_size=${st.size}`);
+    st.total = data.total || 0;
+    st.pages = Math.max(1, data.total_pages || 1);
+    if (st.page > st.pages) {
+      st.page = st.pages;
+      return fetchLogPage(url, st, pagerSel, tbodySel, emptyTip);
+    }
+    renderLogRows(tbodySel, data.records || [], emptyTip);
+    $(pagerSel).textContent = pagerInfo(st);
+    return true;
+  } catch (e) { toast(e.message, true); return false; }
+}
+
+function syncPagerBtns(prefix, st) {
+  $(`#${prefix}Prev`).disabled = st.page <= 1;
+  $(`#${prefix}Next`).disabled = st.page >= st.pages;
+}
+
+async function refreshLogs() {
+  await fetchLogPage("/admin/api/requests", logsState, "#logsPagerInfo", "#logTable tbody",
+    "暂无请求记录（记录 /v1/* 网关接口请求，以及后台渠道测试发出的上游请求）。");
+  syncPagerBtns("logs", logsState);
+}
+
+function wirePager(prefix, st, refresh) {
+  $(`#${prefix}Refresh`).addEventListener("click", refresh);
+  $(`#${prefix}Prev`).addEventListener("click", () => {
+    if (st.page > 1) { st.page--; refresh(); }
+  });
+  $(`#${prefix}Next`).addEventListener("click", () => {
+    if (st.page < st.pages) { st.page++; refresh(); }
+  });
+  $(`#${prefix}PageSize`).addEventListener("change", (e) => {
+    st.size = parseInt(e.target.value, 10) || 100;
+    st.page = 1;
+    refresh();
+  });
+  $(`#${prefix}Auto`).addEventListener("change", (e) => {
+    if (prefix === "logs") {
+      if (logsTimer) clearInterval(logsTimer);
+      if (e.target.checked) logsTimer = setInterval(refresh, 5000);
+    } else {
+      if (errorsTimer) clearInterval(errorsTimer);
+      if (e.target.checked) errorsTimer = setInterval(refresh, 5000);
+    }
+  });
+}
+
+wirePager("logs", logsState, refreshLogs);
+
+async function refreshErrors() {
+  await fetchLogPage("/admin/api/errors", errsState, "#errorsPagerInfo", "#errTable tbody",
+    "暂无错误记录（失败请求单独记录在此，正常请求不会挤占）。");
+  syncPagerBtns("errors", errsState);
+}
+wirePager("errors", errsState, refreshErrors);
 
 // ---- 渠道测试 ----
 // 对指定渠道按模型逐个发起真实对话请求（后端按渠道 key 顺序故障转移），
@@ -825,21 +1038,33 @@ function testRowAndCount(res) {
 }
 
 // ---- 用量 ----
+// 数字单位格式化：超过 1K 用 K、超过 1M 用 M（B/T 类推），使用单位时保留
+// 两位小数；千以下保持原值。悬浮可见精确数值。
+// 单位采用计数惯用法 K/M/B/T（B=billion）；G 是 SI 词头，留给字节类量纲。
+function fmtNum(n) {
+  n = Number(n) || 0;
+  const abs = Math.abs(n);
+  if (abs >= 1e12) return (n / 1e12).toFixed(2) + "T";
+  if (abs >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (abs >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (abs >= 1e3) return (n / 1e3).toFixed(2) + "K";
+  return String(n);
+}
+
 async function refreshUsage() {
   const win = $("#usageWindow").value;
   try {
     const u = await api("GET", "/admin/api/usage?window=" + win);
-    const fmt = (n) => Number(n).toLocaleString();
     $("#usageCards").innerHTML = `
-      <div class="card"><div class="v">${fmt(u.requests)}</div><div class="k">请求</div></div>
-      <div class="card"><div class="v">${fmt(u.errors)}</div><div class="k">错误</div></div>
-      <div class="card"><div class="v">${fmt(u.prompt_tokens)}</div><div class="k">输入 tokens</div></div>
-      <div class="card"><div class="v">${fmt(u.completion_tokens)}</div><div class="k">输出 tokens</div></div>
-      <div class="card"><div class="v">${fmt(u.total_tokens)}</div><div class="k">总 tokens</div></div>`;
+      <div class="card"><div class="v" title="${u.requests}">${fmtNum(u.requests)}</div><div class="k">请求</div></div>
+      <div class="card"><div class="v" title="${u.errors}">${fmtNum(u.errors)}</div><div class="k">错误</div></div>
+      <div class="card"><div class="v" title="${u.prompt_tokens}">${fmtNum(u.prompt_tokens)}</div><div class="k">输入 tokens</div></div>
+      <div class="card"><div class="v" title="${u.completion_tokens}">${fmtNum(u.completion_tokens)}</div><div class="k">输出 tokens</div></div>
+      <div class="card"><div class="v" title="${u.total_tokens}">${fmtNum(u.total_tokens)}</div><div class="k">总 tokens</div></div>`;
     const table = (title, rows) => {
       if (!rows || !rows.length) return "";
       return `<h4>${title}</h4><table class="tbl"><thead><tr><th>名称</th><th>请求</th><th>错误</th><th>输入</th><th>输出</th><th>合计</th></tr></thead><tbody>` +
-        rows.map((r) => `<tr><td>${esc(r.name)}</td><td>${fmt(r.requests)}</td><td>${fmt(r.errors)}</td><td>${fmt(r.prompt_tokens)}</td><td>${fmt(r.completion_tokens)}</td><td>${fmt(r.total_tokens)}</td></tr>`).join("") +
+        rows.map((r) => `<tr><td>${esc(r.name)}</td><td title="${r.requests}">${fmtNum(r.requests)}</td><td title="${r.errors}">${fmtNum(r.errors)}</td><td title="${r.prompt_tokens}">${fmtNum(r.prompt_tokens)}</td><td title="${r.completion_tokens}">${fmtNum(r.completion_tokens)}</td><td title="${r.total_tokens}">${fmtNum(r.total_tokens)}</td></tr>`).join("") +
         `</tbody></table>`;
     };
     $("#usageTables").innerHTML =

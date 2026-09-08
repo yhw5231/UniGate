@@ -30,8 +30,10 @@ func adminAPIHandler() http.Handler {
 	mux.HandleFunc("GET /admin/api/pool/leases", handleAdminPoolLeases)
 	mux.HandleFunc("POST /admin/api/testkey", handleAdminTestKey)
 	mux.HandleFunc("POST /admin/api/channels/{id}/test-model", handleAdminTestModel)
+	mux.HandleFunc("POST /admin/api/cooling/clear", handleAdminClearCooling)
 	mux.HandleFunc("POST /admin/api/channels/{id}/fetch-models", handleAdminFetchModels)
 	mux.HandleFunc("GET /admin/api/requests", handleAdminRequests)
+	mux.HandleFunc("GET /admin/api/errors", handleAdminErrors)
 	mux.HandleFunc("GET /admin/api/usage", handleAdminUsage)
 	mux.HandleFunc("PUT /admin/api/settings", handleAdminPutSettings)
 
@@ -92,7 +94,7 @@ func handleAdminState(w http.ResponseWriter, r *http.Request) {
 			if k.Enabled {
 				ci.KeysOn++
 			}
-			if k.Proxy != nil && k.Proxy.Kind == "ipv6pool" {
+			if spec := k.effectiveProxy(ch); spec != nil && spec.Kind == "ipv6pool" {
 				ci.HasPoolKey = true
 			}
 		}
@@ -127,6 +129,34 @@ func handleAdminPutSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"policy": currentPolicy()})
 }
 
+// handleAdminClearCooling 手动解除上游 key 的冷却：body {key_id, channel_id?}。
+// key 级与 (key, model) 级冷却全部清除，返回清除条数。用于上游已恢复（如额度
+// 重置）时立即恢复路由，不必等冷却到期或跑一次渠道测试。
+func handleAdminClearCooling(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		KeyID     string `json:"key_id"`
+		ChannelID string `json:"channel_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
+		return
+	}
+	keyID := strings.TrimSpace(body.KeyID)
+	if keyID == "" {
+		writeJSONError(w, http.StatusBadRequest, "key_id required", "bad_request")
+		return
+	}
+	// 带渠道 ID 时校验 key 归属，避免对已删除 key 的误操作静默成功
+	if chID := strings.TrimSpace(body.ChannelID); chID != "" {
+		if _, _, ok := store.FindUpKey2(chID, keyID); !ok {
+			writeJSONError(w, http.StatusNotFound, "key not found in channel", "not_found")
+			return
+		}
+	}
+	cleared := cool.ClearKey(keyID)
+	writeJSON(w, http.StatusOK, map[string]any{"key_id": keyID, "cleared": cleared})
+}
+
 // handleAdminPutChannel 新增/整体更新渠道（含内嵌 keys），随后按全量配置
 // Reconcile 回收不再使用的池租约。
 func handleAdminPutChannel(w http.ResponseWriter, r *http.Request) {
@@ -144,22 +174,24 @@ func handleAdminPutChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 // reconcileLeases 按当前全部渠道配置构建在用 key 集合并回收孤儿租约。
+// 代理来源：key 自身配置优先，未配置时继承渠道级代理。
 func reconcileLeases() {
 	live := map[string]map[string]livePoolKey{}
 	for _, ch := range store.Snapshot().Channels {
 		for _, k := range ch.Keys {
-			if k.Proxy == nil || k.Proxy.Kind != "ipv6pool" {
+			spec := k.effectiveProxy(ch)
+			if spec == nil || spec.Kind != "ipv6pool" {
 				continue
 			}
-			spec, err := poolSpecReady(k.Proxy)
+			resolved, err := poolSpecReady(spec)
 			if err != nil {
 				log.Printf("reconcile: skip key %q: %v", k.Name, err)
 				continue // 池不可解析（如已删除）→ 该 key 的分配会被当作孤儿回收
 			}
-			if live[spec.PoolURL] == nil {
-				live[spec.PoolURL] = map[string]livePoolKey{}
+			if live[resolved.PoolURL] == nil {
+				live[resolved.PoolURL] = map[string]livePoolKey{}
 			}
-			live[spec.PoolURL][k.ID] = livePoolKey{Group: proxyGroup(ch, k), Shared: spec.Share}
+			live[resolved.PoolURL][k.ID] = livePoolKey{Group: proxyGroup(ch, k), Shared: resolved.Share}
 		}
 	}
 	leaseMgr.Reconcile(live)
@@ -293,16 +325,17 @@ func handleAdminPoolTest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, st)
 }
 
-// findKeySpec 取指定渠道 key 的代理配置（快照）。
+// findKeySpec 取指定渠道 key 生效的代理配置（快照；key 未配置时继承渠道级代理）。
 func findKeySpec(channelID, keyID string) (*ProxySpec, string, bool) {
-	_, k, ok := store.FindUpKey2(channelID, keyID)
+	ch, k, ok := store.FindUpKey2(channelID, keyID)
 	if !ok {
 		return nil, "", false
 	}
-	if k.Proxy == nil || k.Proxy.Kind != "ipv6pool" {
+	spec := k.effectiveProxy(ch)
+	if spec == nil || spec.Kind != "ipv6pool" {
 		return nil, k.Name, false
 	}
-	return k.Proxy, k.Name, true
+	return spec, k.Name, true
 }
 
 // handleAdminPoolRotate 手动换 IP（lease_id 直连本地代理池条目，或按 key 定位）。
@@ -485,7 +518,10 @@ func runTestOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user st
 	res := testOnce(ctx, ch, k, model, msg, user)
 	// 已连上出口后的网络错误（Status=0 且非代理解析失败）换 IP 重试一次，
 	// 与网关真实转发语义一致；代理解析/探测失败是池基础设施问题，换 IP 无济于事
-	if res.Status == 0 && !res.proxyFailed && k.Proxy != nil && k.Proxy.Kind == "ipv6pool" {
+	if res.Status == 0 && !res.proxyFailed && func() bool {
+		spec := k.effectiveProxy(ch)
+		return spec != nil && spec.Kind == "ipv6pool"
+	}() {
 		rotateOnNetErr(&candidate{ch: ch, k: k})
 		res2 := testOnce(ctx, ch, k, model, msg, user)
 		res2.Rotated = true
@@ -532,7 +568,7 @@ func testOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user strin
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 	bytesOut = int64(len(data))
-	leaseMgr.RecordUse(cand.k.Proxy, cand.k.ID)
+	leaseMgr.RecordUse(cand.k.effectiveProxy(cand.ch), cand.k.ID)
 	res.Status = resp.StatusCode
 	res.OK = resp.StatusCode >= 200 && resp.StatusCode < 300
 	res.Snippet = truncate(string(data), 512)
@@ -560,11 +596,11 @@ func recordTestRequest(start time.Time, target, user, channel, key, model string
 		Key:        maskKey(key + "@" + channel),
 	}
 	if res.Error != "" {
-		rec.ErrMsg = res.Error
+		rec.ErrMsg = truncate(res.Error, errMsgMax)
 	} else if rec.Status >= 400 {
 		rec.ErrMsg = truncate(res.Snippet, 200)
 	}
-	reqLog.Add(rec)
+	recordRequest(rec)
 }
 
 // parseTestModels 解析测试模型清单：支持逗号/空白/换行分隔，去重去空。

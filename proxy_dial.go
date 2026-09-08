@@ -169,6 +169,31 @@ func (c *bufConn) ReadByte() (byte, error) {
 	return c.reader.ReadByte()
 }
 
+// socksReplyText 把 SOCKS5 CONNECT 应答 rep 码翻成可读原因（RFC 1928），
+// 供日志/错误信息直接定位代理池问题。
+func socksReplyText(rep byte) string {
+	switch rep {
+	case 0x01:
+		return "general SOCKS server failure"
+	case 0x02:
+		return "connection not allowed by ruleset"
+	case 0x03:
+		return "network unreachable"
+	case 0x04:
+		return "host unreachable"
+	case 0x05:
+		return "connection refused by upstream (出口被拒)"
+	case 0x06:
+		return "TTL expired"
+	case 0x07:
+		return "command not supported"
+	case 0x08:
+		return "address type not supported"
+	default:
+		return fmt.Sprintf("unknown reply 0x%02x", rep)
+	}
+}
+
 // dialSocks5 作为 SOCKS5 客户端连接到 target（host:port），支持用户名/密码认证。
 func dialSocks5(ctx context.Context, serverAddr, user, pass, target string) (net.Conn, error) {
 	var d net.Dialer
@@ -245,7 +270,8 @@ func dialSocks5(ctx context.Context, serverAddr, user, pass, target string) (net
 	}
 	if hdr[1] != 0x00 {
 		conn.Close()
-		return nil, fmt.Errorf("socks5 connect failed with rep 0x%02x", hdr[1])
+		return nil, fmt.Errorf("socks5 connect to %s via %s failed: %s (rep 0x%02x)",
+			target, serverAddr, socksReplyText(hdr[1]), hdr[1])
 	}
 	if _, err := readSocksAddr(br, hdr[3]); err != nil {
 		conn.Close()

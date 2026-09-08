@@ -381,6 +381,163 @@ func TestAdminTestKeyRequestFormat(t *testing.T) {
 	}
 }
 
+// TestAdminRequestsPaginationAndErrors：请求记录分页参数与独立错误日志端点。
+func TestAdminRequestsPaginationAndErrors(t *testing.T) {
+	setupGateway(t)
+	initStats()
+	tok := adminToken(t)
+
+	// 5 条记录：3 成功 + 2 失败（错误另存独立错误日志）
+	reqLog.Add(RequestRecord{ID: "r1", Status: 200})
+	reqLog.Add(RequestRecord{ID: "r2", Status: 200})
+	reqLog.Add(RequestRecord{ID: "r3", Status: 200})
+	recordRequest(RequestRecord{ID: "e1", Status: 502, ErrMsg: "upstream boom"})
+	recordRequest(RequestRecord{ID: "e2", Status: 0, ErrMsg: "proxy resolve failed"})
+
+	// 默认 page_size=50：一页装下全部
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodGet, "/admin/api/requests", "", tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var page1 struct {
+		Total      int             `json:"total"`
+		Page       int             `json:"page"`
+		PageSize   int             `json:"page_size"`
+		TotalPages int             `json:"total_pages"`
+		Records    []RequestRecord `json:"records"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &page1); err != nil {
+		t.Fatal(err)
+	}
+	if page1.Total != 5 || page1.PageSize != 50 || page1.TotalPages != 1 || len(page1.Records) != 5 {
+		t.Fatalf("default page: %+v", page1)
+	}
+
+	// page=2&page_size=2：第二页应为第 3、4 新的记录（最新在前）
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodGet, "/admin/api/requests?page=2&page_size=2", "", tok))
+	var page2 struct {
+		Total      int             `json:"total"`
+		TotalPages int             `json:"total_pages"`
+		Records    []RequestRecord `json:"records"`
+	}
+	if err := json.Unmarshal(rr2.Body.Bytes(), &page2); err != nil {
+		t.Fatal(err)
+	}
+	if page2.Total != 5 || page2.TotalPages != 3 || len(page2.Records) != 2 {
+		t.Fatalf("page2: %+v", page2)
+	}
+	// Snapshot 最新在前：e2, e1, r3, r2, r1 → 第 2 页是 r3, r2
+	if page2.Records[0].ID != "r3" || page2.Records[1].ID != "r2" {
+		t.Fatalf("page2 order: %+v", page2.Records)
+	}
+
+	// 旧参数 limit 兼容
+	rr3 := httptest.NewRecorder()
+	rootHandler(rr3, adminReq(http.MethodGet, "/admin/api/requests?limit=2", "", tok))
+	var page3 struct {
+		Records []RequestRecord `json:"records"`
+	}
+	_ = json.Unmarshal(rr3.Body.Bytes(), &page3)
+	if len(page3.Records) != 2 || page3.Records[0].ID != "e2" {
+		t.Fatalf("limit compat: %+v", page3.Records)
+	}
+
+	// 独立错误日志：只有 2 条失败记录，最新在前
+	rr4 := httptest.NewRecorder()
+	rootHandler(rr4, adminReq(http.MethodGet, "/admin/api/errors?page=1&page_size=10", "", tok))
+	if rr4.Code != http.StatusOK {
+		t.Fatalf("errors status=%d body=%s", rr4.Code, rr4.Body.String())
+	}
+	var errs struct {
+		Total   int             `json:"total"`
+		Records []RequestRecord `json:"records"`
+	}
+	if err := json.Unmarshal(rr4.Body.Bytes(), &errs); err != nil {
+		t.Fatal(err)
+	}
+	if errs.Total != 2 || len(errs.Records) != 2 {
+		t.Fatalf("errors: total=%d records=%d", errs.Total, len(errs.Records))
+	}
+	if errs.Records[0].ID != "e2" || errs.Records[1].ID != "e1" {
+		t.Fatalf("errors order: %+v", errs.Records)
+	}
+
+	// 错误日志同样要求管理员 token
+	rr5 := httptest.NewRecorder()
+	rootHandler(rr5, adminReq(http.MethodGet, "/admin/api/errors", "", ""))
+	if rr5.Code != http.StatusUnauthorized {
+		t.Fatalf("errors without token: status=%d want 401", rr5.Code)
+	}
+}
+
+// TestAdminClearCooling：手动解除 key 冷却（key 级 + 按 (key, model) 级全部清除），
+// 解除后网关立即恢复该 key 的路由。
+func TestAdminClearCooling(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	ch := store.Snapshot().Channels[0]
+	kid := ch.Keys[0].ID
+
+	// 标记两类冷却：key 级 + (key, model) 级
+	cool.Mark(kid, "", time.Hour)
+	cool.Mark(kid, "m1", time.Hour)
+	if !cool.IsCooling(kid, "") || !cool.IsCooling(kid, "m1") {
+		t.Fatal("precondition: key should be cooling")
+	}
+
+	// 校验渠道归属：错误的 channel_id → 404
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/cooling/clear",
+		`{"key_id":"`+kid+`","channel_id":"wrong"}`, tok))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("wrong channel: status=%d want 404", rr.Code)
+	}
+	// 缺 key_id → 400
+	rr0 := httptest.NewRecorder()
+	rootHandler(rr0, adminReq(http.MethodPost, "/admin/api/cooling/clear", `{}`, tok))
+	if rr0.Code != http.StatusBadRequest {
+		t.Fatalf("missing key_id: status=%d want 400", rr0.Code)
+	}
+
+	// 正常解除
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodPost, "/admin/api/cooling/clear",
+		`{"key_id":"`+kid+`","channel_id":"`+ch.ID+`"}`, tok))
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("clear: status=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+	var out struct {
+		KeyID   string `json:"key_id"`
+		Cleared int    `json:"cleared"`
+	}
+	_ = json.Unmarshal(rr2.Body.Bytes(), &out)
+	if out.KeyID != kid || out.Cleared != 2 {
+		t.Fatalf("clear result: %+v", out)
+	}
+	if cool.IsCooling(kid, "") || cool.IsCooling(kid, "m1") {
+		t.Fatal("cooling must be cleared")
+	}
+
+	// 解除后网关立即恢复该 key 路由（不再穿透/502）
+	rr3 := httptest.NewRecorder()
+	forwardChat(rr3, chatRequest("m1"), nil, false, "m1")
+	if rr3.Code != http.StatusOK {
+		t.Fatalf("after clear: status=%d body=%s", rr3.Code, rr3.Body.String())
+	}
+
+	// 需要管理员 token
+	rr4 := httptest.NewRecorder()
+	rootHandler(rr4, adminReq(http.MethodPost, "/admin/api/cooling/clear", `{"key_id":"x"}`, ""))
+	if rr4.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: status=%d want 401", rr4.Code)
+	}
+}
+
 // TestAdminTestModelEndpoint：渠道级测试端点——逐 (key, 模型) 故障转移、
 // first_only、指定模型、responses 渠道请求体转换。
 func TestAdminTestModelEndpoint(t *testing.T) {

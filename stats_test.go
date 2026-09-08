@@ -34,6 +34,55 @@ func TestRequestLogSmallCap(t *testing.T) {
 	}
 }
 
+func TestRequestLogQueryPagination(t *testing.T) {
+	l := newRequestLog(10)
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		l.Add(RequestRecord{ID: id})
+	}
+	// 第 1 页（最新在前）
+	recs, total := l.Query(1, 2)
+	if total != 5 || len(recs) != 2 || recs[0].ID != "e" || recs[1].ID != "d" {
+		t.Fatalf("page1: total=%d recs=%+v", total, recs)
+	}
+	// 第 2、3 页
+	recs, _ = l.Query(2, 2)
+	if len(recs) != 2 || recs[0].ID != "c" || recs[1].ID != "b" {
+		t.Fatalf("page2: %+v", recs)
+	}
+	recs, _ = l.Query(3, 2)
+	if len(recs) != 1 || recs[0].ID != "a" {
+		t.Fatalf("page3: %+v", recs)
+	}
+	// 越界页返回空，但 total 保持
+	recs, total = l.Query(9, 2)
+	if total != 5 || len(recs) != 0 {
+		t.Fatalf("out-of-range page: total=%d recs=%+v", total, recs)
+	}
+}
+
+// TestErrorLogSeparateRecording：错误请求（状态 >=400 或带错误信息）必须
+// 单独写入错误日志，成功请求不进；主日志仍保留全部请求。
+func TestErrorLogSeparateRecording(t *testing.T) {
+	setupGateway(t)
+	initStats()
+
+	recordRequest(RequestRecord{ID: "ok1", Status: 200})
+	recordRequest(RequestRecord{ID: "ok2", Status: 200})
+	recordRequest(RequestRecord{ID: "bad1", Status: 502, ErrMsg: "model \"m\": upstream unavailable"})
+	recordRequest(RequestRecord{ID: "bad2", Status: 0, ErrMsg: "proxy resolve failed"})
+
+	if got := reqLog.Snapshot(); len(got) != 4 {
+		t.Fatalf("reqLog should keep all requests, got %d", len(got))
+	}
+	errs := errLog.Snapshot()
+	if len(errs) != 2 {
+		t.Fatalf("errLog should keep only errors, got %d: %+v", len(errs), errs)
+	}
+	if errs[0].ID != "bad2" || errs[1].ID != "bad1" {
+		t.Fatalf("errLog order wrong (newest first): %+v", errs)
+	}
+}
+
 func TestUsageStatsRecord(t *testing.T) {
 	s := newUsageStats()
 	now := time.Now()

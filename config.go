@@ -46,7 +46,8 @@ type Config struct {
 	TestTimeout time.Duration // 渠道/key 测试端点的整体超时（默认 45s，低于常见反代 60s）
 
 	// 可观察性
-	ReqLogSize         int
+	ReqLogSize         int // 请求记录环形缓冲容量（全部请求）
+	ErrLogSize         int // 错误记录环形缓冲容量（独立存储，不被成功请求挤出）
 	UsageDBPath        string
 	UsageRetentionDays int
 	UsageMaxRecords    int
@@ -133,6 +134,7 @@ func loadConfig() Config {
 		TestTimeout: durationEnv("TEST_TIMEOUT", 45*time.Second),
 
 		ReqLogSize:         intEnv("REQ_LOG_SIZE", 1000),
+		ErrLogSize:         intEnv("ERR_LOG_SIZE", 1000),
 		UsageDBPath:        usageDBPath,
 		UsageRetentionDays: intEnv("USAGE_RETENTION_DAYS", 30),
 		UsageMaxRecords:    intEnv("USAGE_MAX_RECORDS", 100000),

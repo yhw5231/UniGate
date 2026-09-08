@@ -147,6 +147,7 @@ type Channel struct {
 	Headers       map[string]string `json:"headers,omitempty"`        // 渠道级自定义请求头
 	Rewrite       bool              `json:"rewrite_reasoning"`        // reasoning -> reasoning_content 改写（Cline 等需要）
 	CooldownScope string            `json:"cooldown_scope,omitempty"` // 冷却粒度："" / "key" 按 key 跨模型共享（默认）；"key_model" 按 (key,model)
+	Proxy         *ProxySpec        `json:"proxy,omitempty"`          // 渠道级代理（如代理池）：未单独配置代理的 key 全部继承，每个 key 独立租约/出口 IP
 	Enabled       bool              `json:"enabled"`
 	Keys          []*UpKey          `json:"keys"`
 }
@@ -272,6 +273,19 @@ func (c *Channel) allowsModel(model string) bool {
 		}
 	}
 	return false
+}
+
+// effectiveProxy 返回 key 实际生效的代理配置：key 自身配置优先（含显式直连，
+// 即非 nil 但 Kind 为空的 ProxySpec，用于覆盖渠道级代理）；未单独配置（nil）时
+// 继承渠道级代理。渠道级代理池下每个 key 仍是独立租约/出口 IP（同设置不同 IP）。
+func (k *UpKey) effectiveProxy(ch *Channel) *ProxySpec {
+	if k != nil && k.Proxy != nil {
+		return k.Proxy
+	}
+	if ch != nil {
+		return ch.Proxy
+	}
+	return nil
 }
 
 // keyByID 查找渠道内的上游 key。
@@ -467,10 +481,15 @@ func (s *GatewayStore) PutChannel(ch *Channel) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 校验 ipv6pool key 引用的代理池存在（连接信息统一在池实体上配置）
+	// 校验 ipv6pool key 引用的代理池存在（连接信息统一在池实体上配置；
+	// 渠道级代理与 key 级代理都会引用池）
+	specs := []*ProxySpec{ch.Proxy}
 	for _, k := range ch.Keys {
-		if k.Proxy != nil && k.Proxy.Kind == "ipv6pool" && k.Proxy.PoolID != "" && s.proxyPoolByIDLocked(k.Proxy.PoolID) == nil {
-			return fmt.Errorf("ipv6pool key %q references unknown proxy pool %q (create it on the pool page first)", k.Name, k.Proxy.PoolID)
+		specs = append(specs, k.Proxy)
+	}
+	for _, spec := range specs {
+		if spec != nil && spec.Kind == "ipv6pool" && spec.PoolID != "" && s.proxyPoolByIDLocked(spec.PoolID) == nil {
+			return fmt.Errorf("ipv6pool proxy references unknown proxy pool %q (create it on the pool page first)", spec.PoolID)
 		}
 	}
 	if ch.ID == "" {
@@ -510,6 +529,12 @@ func normalizeChannel(ch *Channel) error {
 		return err
 	}
 	ch.CooldownScope = scope
+	if ch.Proxy != nil && ch.Proxy.Kind == "" {
+		ch.Proxy = nil // 空代理规格 = 未设置渠道级代理
+	}
+	if err := ch.Proxy.normalize(); err != nil {
+		return fmt.Errorf("channel proxy: %w", err)
+	}
 	if ch.Keys == nil {
 		ch.Keys = []*UpKey{}
 	}

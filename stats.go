@@ -79,6 +79,26 @@ func (l *RequestLog) count() int {
 	return l.cap
 }
 
+// Query 分页返回记录（最新在前；page 从 1 起，越界返回空页）。
+func (l *RequestLog) Query(page, pageSize int) ([]RequestRecord, int) {
+	all := l.Snapshot()
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	start := (page - 1) * pageSize
+	if start >= len(all) {
+		return []RequestRecord{}, len(all)
+	}
+	end := start + pageSize
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[start:end], len(all)
+}
+
 // ---- 用量统计 ----
 
 type UsageTotals struct {
@@ -175,14 +195,36 @@ func (s *UsageStats) Record(rec RequestRecord) {
 // ---- 全局实例 ----
 
 var (
-	reqLog    *RequestLog
+	reqLog    *RequestLog // 全部请求（环形缓冲，新记录覆盖最旧）
+	errLog    *RequestLog // 错误记录（独立环形缓冲，不被成功请求挤出）
 	usageStat *UsageStats
 )
+
+// errMsgMax 请求记录错误信息的最大长度（逐 key 失败轨迹完整保留，仅设上限防膨胀）。
+const errMsgMax = 8192
 
 // initStats 用配置初始化（幂等，reloadConfig 时调用）。
 func initStats() {
 	reqLog = newRequestLog(cfg.ReqLogSize)
+	errLog = newRequestLog(cfg.ErrLogSize)
 	usageStat = newUsageStats()
+}
+
+// isErrorRecord 判定错误记录：状态码 >=400，或带失败诊断信息
+// （覆盖测试链路 status=0 的代理解析失败等）。
+func isErrorRecord(rec RequestRecord) bool {
+	return rec.Status >= 400 || rec.ErrMsg != ""
+}
+
+// recordRequest 请求记录统一入口：全部请求进主日志；错误另存独立的错误
+// 日志，保证少量错误不会被海量成功请求在环形缓冲中挤出。
+func recordRequest(rec RequestRecord) {
+	if reqLog != nil {
+		reqLog.Add(rec)
+	}
+	if errLog != nil && isErrorRecord(rec) {
+		errLog.Add(rec)
+	}
 }
 
 // ---- 请求上下文元数据 ----
@@ -315,9 +357,9 @@ func statsServe(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 		CompletionTokens: rs.completionTokens,
 	}
 	if status >= 400 {
-		// 网关主动返回的错误（如 502 前逐 key 的失败原因）优先于状态文本
+		// 网关主动返回的错误（含逐 key 失败轨迹）优先于状态文本，完整入日志
 		if rs.errMsg != "" {
-			rec.ErrMsg = truncate(rs.errMsg, 500)
+			rec.ErrMsg = truncate(rs.errMsg, errMsgMax)
 		} else {
 			rec.ErrMsg = http.StatusText(status)
 		}
@@ -325,7 +367,7 @@ func statsServe(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 	if rec.Key != "" {
 		rec.Key = maskKey(rec.Key)
 	}
-	reqLog.Add(rec)
+	recordRequest(rec)
 	usageStat.Record(rec)
 
 	// 用量库记账（含输入/输出 token）
@@ -402,20 +444,55 @@ func handleAdminStats(w http.ResponseWriter) {
 	})
 }
 
-// handleAdminRequests 返回最近请求记录（最新在前，?limit= 控制条数）。
-func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
-	limit := 100
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
-			limit = n
+// parsePageArgs 解析分页参数：page（从 1 起）、page_size（默认 50，上限 500）。
+// 兼容旧参数 limit（等价 page_size，page=1）。
+func parsePageArgs(r *http.Request) (page, pageSize int) {
+	page, pageSize = 1, 50
+	q := r.URL.Query()
+	if v := q.Get("page_size"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pageSize = n
+		}
+	} else if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pageSize = n
 		}
 	}
-	recs := reqLog.Snapshot()
-	if len(recs) > limit {
-		recs = recs[:limit]
+	if pageSize > 500 {
+		pageSize = 500
 	}
+	if v := q.Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	return page, pageSize
+}
+
+// handleAdminRequests 返回请求记录（最新在前，分页：?page=&page_size=，
+// 兼容旧 ?limit=；响应带 total / page / page_size / total_pages）。
+func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
+	page, pageSize := parsePageArgs(r)
+	recs, total := reqLog.Query(page, pageSize)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"total":   reqLog.count(),
-		"records": recs,
+		"total":       total,
+		"page":        page,
+		"page_size":   pageSize,
+		"total_pages": (total + pageSize - 1) / pageSize,
+		"records":     recs,
+	})
+}
+
+// handleAdminErrors 返回错误请求记录（独立环形缓冲，分页同请求记录）。
+// 错误单独存储：不被成功请求挤出，便于事后排查「为什么 502」。
+func handleAdminErrors(w http.ResponseWriter, r *http.Request) {
+	page, pageSize := parsePageArgs(r)
+	recs, total := errLog.Query(page, pageSize)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total":       total,
+		"page":        page,
+		"page_size":   pageSize,
+		"total_pages": (total + pageSize - 1) / pageSize,
+		"records":     recs,
 	})
 }

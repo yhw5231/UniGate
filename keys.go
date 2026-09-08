@@ -59,6 +59,21 @@ func (c *Cooldowns) Clear(keyID, model string) {
 	delete(c.until, cooldownPair{keyID, model})
 }
 
+// ClearKey 解除某 key 的全部冷却（所有模型粒度），返回清除的条数。
+// WebUI「解除冷却」手动操作使用。
+func (c *Cooldowns) ClearKey(keyID string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for k := range c.until {
+		if k.keyID == keyID {
+			delete(c.until, k)
+			n++
+		}
+	}
+	return n
+}
+
 // CoolingKey 返回 (keyID, model) 的冷却到期时间（未冷却返回零值, false）。
 func (c *Cooldowns) CoolingKey(keyID, model string) (time.Time, bool) {
 	c.mu.Lock()

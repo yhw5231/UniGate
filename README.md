@@ -34,10 +34,16 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
   (key, model)）跳过故障 key。
 - **reasoning 改写**（渠道可选）：把上游 `reasoning` 复制为 `reasoning_content`，
   流式/非流式都支持（Cline 渠道需要，供 sub2api 等下游识别 thinking）。
+- **渠道级代理**：渠道可统一设置代理（固定代理或 IPv6 代理池），未单独配置代理的
+  key 全部继承——同一渠道共用同一套池设置，但**每个 key 仍是独立租约/出口 IP**
+  （同设置不同 IP）；key 块内可选择「跟随渠道」（默认）或单独覆盖为直连/固定代理/其它池。
 - **请求日志**：仅记录**大模型网关接口**请求（`/v1/*`，如 chat/completions、models、
   responses；Admin/WebUI 等系统后台请求不记），环形缓冲保留最近 N 条，含接口/渠道/
-  key/模型/token 数/状态/耗时/错误。**渠道测试请求例外**：无论成败都会写入请求
-  记录留痕，`user` 为发起测试的管理员，`path` 为实际上游路径。
+  key/模型/token 数/状态/耗时/错误，WebUI 分页展示。**渠道测试请求例外**：无论成败都会
+  写入请求记录留痕，`user` 为发起测试的管理员，`path` 为实际上游路径。
+- **错误日志**：失败请求（状态 ≥400 或带失败原因）单独存入独立的环形缓冲，不会被
+  海量成功请求挤出，便于事后排查；错误信息含**逐 key 失败轨迹**（哪个 key 因什么失败、
+  冷却跳过/穿透试探），同样的轨迹也会写进下游 502/429 错误体。
 - **用量统计**：SQLite 逐条记录输入/输出 token，支持 今日/24h/7d/30d/全部 窗口，
   按下游 key、渠道、模型、上游 key 聚合。
 - **WebUI**：渠道与 key 管理（支持关键字搜索 + 分组过滤）、通用密钥签发、日志、
@@ -398,7 +404,8 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 | `ROTATE_AFTER_5XX` | `3` | 同一 key 连续 5xx 超过该次数自动换出口 IP（0 = 关闭；仅 ipv6pool key 生效；也可在 WebUI「设置」页修改） |
 | `UPSTREAM_HEADER_TIMEOUT` | `10m` | 等待上游响应头超时（LLM 非流式可能较慢，勿设过小） |
 | `TEST_TIMEOUT` | `45s` | WebUI 渠道/key 测试的整体超时（默认低于常见反代 60s，避免测试被反代掐断成 504） |
-| `REQ_LOG_SIZE` | `1000` | 请求日志环形缓冲容量 |
+| `REQ_LOG_SIZE` | `1000` | 请求日志环形缓冲容量（全部请求） |
+| `ERR_LOG_SIZE` | `1000` | 错误日志环形缓冲容量（独立存储，不被成功请求挤出） |
 | `USAGE_DB_PATH` | `${DATA_DIR}/usage.db` | 用量 SQLite 路径（空 = 纯内存） |
 | `USAGE_RETENTION_DAYS` | `30` | 用量保留天数 |
 | `USAGE_MAX_RECORDS` | `100000` | 用量最大条数 |
@@ -423,7 +430,9 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 | `GET /admin/api/pool/leases` | 网关持有的租约列表 |
 | `POST /admin/api/testkey` | 用指定 key 发一条测试请求 `{channel_id, key_id, model?}` |
 | `POST /admin/api/channels/{id}/test-model` | 渠道级批量测试 `{key_id?, first_only?, models?}`（models 每行/逗号分隔，空 = 渠道已启用模型）；逐 key × 逐模型执行，HTTP 层不报错，成败均通过结果项的 `ok` 表达，且每次测试（含失败）都写入请求记录 |
-| `GET /admin/api/requests?limit=` | 最近请求日志 |
+| `GET /admin/api/requests?page=&page_size=` | 请求日志（分页，兼容旧 `?limit=`） |
+| `GET /admin/api/errors?page=&page_size=` | 错误日志（失败请求独立存储，分页） |
+| `POST /admin/api/cooling/clear` | 手动解除 key 冷却 `{key_id, channel_id?}`（key 级与按模型冷却全部清除） |
 | `GET /admin/api/usage?window=today\|24h\|7d\|30d\|all` | 用量统计（支持 `?user=&channel=&model=&key=`） |
 
 ## 渠道自定义请求头示例（Cline 渠道）

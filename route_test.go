@@ -466,6 +466,60 @@ func Test5xxStreakTriggersRotate(t *testing.T) {
 	}
 }
 
+// TestChannelLevelPoolProxyInheritance：渠道级代理池设置（key 未单独配置代理）。
+// 渠道内每个 key 继承同一池设置但各持独立租约/出口 IP（同设置不同 IP）；
+// key 显式配置直连（proxy: {kind:"none"}）时覆盖渠道级代理。
+func TestChannelLevelPoolProxyInheritance(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	socksAddr := startFakeSocks5(t)
+	pool, poolSrv := startFakePool(t)
+	socksPort, _ := strconv.Atoi(socksAddr[strings.LastIndex(socksAddr, ":")+1:])
+	pool.portOverride = socksPort
+	// 同一 fake SOCKS 端口服务所有租约；用分配表区分各 key 的租约
+
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Proxy: &ProxySpec{Kind: "ipv6pool", PoolURL: poolSrv.URL,
+			SocksHost: socksAddr[:strings.LastIndex(socksAddr, ":")]},
+		Keys: []*UpKey{
+			{Name: "k1", APIKey: "sk-1", Enabled: true},
+			{Name: "k2", APIKey: "sk-2", Enabled: true},
+			{Name: "k3", APIKey: "sk-3", Enabled: true, Proxy: &ProxySpec{Kind: "none"}},
+		}})
+
+	snap := store.Snapshot().Channels[0]
+	// k1、k2 继承渠道级池代理 → 各自独立租约；k3 显式直连不占用租约
+	for _, idx := range []int{0, 1, 2} {
+		k := snap.Keys[idx]
+		route, err := resolveProxy(&candidate{ch: snap, k: k})
+		if idx < 2 {
+			if err != nil || route == nil || route.Kind != "socks5" {
+				t.Fatalf("k%d must resolve pool route, got %v err=%v", idx+1, route, err)
+			}
+		} else if route != nil {
+			t.Fatalf("k3 explicit direct must not use proxy, got %s", route.describe())
+		}
+	}
+	// 池上应有 k1、k2 两个独立租约（k3 显式直连不占用）
+	if n := len(pool.leases); n != 2 {
+		t.Fatalf("expected 2 pool leases (k1,k2; k3 direct), got %d: %v", n, pool.leases)
+	}
+	// 继承语义单元检查
+	if p := snap.Keys[0].effectiveProxy(snap); p == nil || p.Kind != "ipv6pool" {
+		t.Fatalf("k1 must inherit channel pool proxy, got %+v", p)
+	}
+	// k3 显式直连：proxy 非 nil 且 Kind 归一化为空（normalize 后 "" = 直连）
+	if p := snap.Keys[2].effectiveProxy(snap); p == nil || p.Kind != "" {
+		t.Fatalf("k3 must override with direct (empty kind), got %+v", p)
+	}
+	// 端到端：正常转发经池隧道成功
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("forward status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 // ---- 下游鉴权 ----
 
 func TestGatewayAuth(t *testing.T) {
@@ -681,9 +735,10 @@ func TestFailureMessageCarriesUpstreamDetail(t *testing.T) {
 	}
 }
 
-// TestAllCoolingExplainsItself：全部 key 因上一轮故障冷却时，明确说明
-// 「未尝试任何上游」，而不是误导性的 "all upstream attempts failed"。
-func TestAllCoolingExplainsItself(t *testing.T) {
+// TestAllCoolingPiercesEarliest：全部 key 因上一轮 429 冷却时，不再硬 502，
+// 而是对最早到期的 key 穿透试探一次——上游往往已恢复，试探成功即解除冷却
+// 自愈（修复「渠道测试可用、网关却持续 502」的错位）。
+func TestAllCoolingPiercesEarliest(t *testing.T) {
 	setupGateway(t)
 	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
 	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
@@ -693,20 +748,60 @@ func TestAllCoolingExplainsItself(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("status=%d want 502", rr.Code)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (cooldown pierced), body=%s", rr.Code, rr.Body.String())
+	}
+	if up.count() != 1 {
+		t.Fatalf("pierced key must be attempted, calls=%d", up.count())
+	}
+	if cool.IsCooling(kid, "") {
+		t.Fatal("successful pierce must clear stale cooldown")
+	}
+
+	// 冷却已解除：后续请求恢复正常路由，不再需要穿透
+	rr2 := httptest.NewRecorder()
+	forwardChat(rr2, chatRequest("m1"), nil, false, "m1")
+	if rr2.Code != http.StatusOK || up.count() != 2 {
+		t.Fatalf("after self-heal: status=%d calls=%d", rr2.Code, up.count())
+	}
+}
+
+// TestAllCoolingPierceFailsKeepsCooldown：穿透试探仍失败时冷却保持，
+// 错误体附完整逐 key 轨迹与 Retry-After 提示。
+func TestAllCoolingPierceFailsKeepsCooldown(t *testing.T) {
+	setupGateway(t)
+	up1 := newUpstream(t, http.StatusTooManyRequests, `{"error":"still limited"}`)
+	up2 := newUpstream(t, http.StatusTooManyRequests, `{"error":"still limited 2"}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up1.srv.URL, Enabled: true,
+		Keys: []*UpKey{
+			{Name: "k1", APIKey: "sk-1", Enabled: true},
+			{Name: "k2", APIKey: "sk-2", Enabled: true, BaseURL: up2.srv.URL},
+		}})
+	k1 := store.Snapshot().Channels[0].Keys[0].ID
+	k2 := store.Snapshot().Channels[0].Keys[1].ID
+	// k1 已有存量冷却且更早到期 → k1 被穿透，k2 冷却跳过
+	cool.Mark(k1, "", 2*time.Minute)
+	cool.Mark(k2, "", 5*time.Minute)
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d want 429, body=%s", rr.Code, rr.Body.String())
+	}
+	if up1.count() != 1 || up2.count() != 0 {
+		t.Fatalf("pierce should hit earliest k1 only: up1=%d up2=%d", up1.count(), up2.count())
+	}
+	if !cool.IsCooling(k1, "") {
+		t.Fatal("failed pierce must keep cooldown")
 	}
 	body := rr.Body.String()
-	for _, want := range []string{"failure cooldown", "nothing attempted"} {
+	for _, want := range []string{"2 upstream key(s)", "cooldown_pierced", "cooldown_skipped", "still limited"} {
 		if !strings.Contains(body, want) {
-			t.Fatalf("502 body missing %q: %s", want, body)
+			t.Fatalf("429 body missing %q: %s", want, body)
 		}
 	}
-	if up.count() != 0 {
-		t.Fatalf("cooling key must not be attempted, calls=%d", up.count())
-	}
 	if rr.Header().Get("Retry-After") == "" {
-		t.Fatal("expected Retry-After hint on all-cooling response")
+		t.Fatal("expected Retry-After hint when pierce fails")
 	}
 }
 

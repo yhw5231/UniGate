@@ -28,6 +28,7 @@
       <button data-tab="test" class="tab">渠道测试</button>
       <button data-tab="gwkeys" class="tab">通用密钥</button>
       <button data-tab="logs" class="tab">请求日志</button>
+      <button data-tab="errors" class="tab">错误日志</button>
       <button data-tab="usage" class="tab">用量统计</button>
       <button data-tab="leases" class="tab">代理池</button>
       <button data-tab="settings" class="tab">设置</button>
@@ -110,7 +111,40 @@
         <label class="inline"><input type="checkbox" id="logsAuto"> 自动刷新</label>
         <button id="logsRefresh" class="btn">刷新</button>
       </div>
+      <div class="row" style="margin:8px 0">
+        <span class="muted" id="logsPagerInfo">—</span>
+        <span class="spacer"></span>
+        <label class="inline">每页
+          <select id="logsPageSize"><option>50</option><option selected>100</option><option>200</option><option>500</option></select>
+        </label>
+        <button id="logsPrev" class="btn small">← 上一页</button>
+        <button id="logsNext" class="btn small">下一页 →</button>
+      </div>
       <table class="tbl" id="logTable">
+        <thead><tr><th>时间</th><th>接口</th><th>状态</th><th>耗时</th><th>渠道</th><th>key</th><th>模型</th><th>Tokens (入/出)</th><th>下游</th><th>出口</th><th>错误</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- 错误日志 -->
+    <section id="tab-errors" class="tabpane hidden">
+      <div class="row">
+        <h2>错误日志</h2>
+        <div class="spacer"></div>
+        <label class="inline"><input type="checkbox" id="errorsAuto"> 自动刷新</label>
+        <button id="errorsRefresh" class="btn">刷新</button>
+      </div>
+      <p class="muted" style="margin:4px 0 8px">只收录失败请求（状态 ≥400 或带失败原因），独立保存、不会被成功请求挤出；错误信息含逐 key 失败轨迹，可回答「为什么 502」。</p>
+      <div class="row" style="margin:8px 0">
+        <span class="muted" id="errorsPagerInfo">—</span>
+        <span class="spacer"></span>
+        <label class="inline">每页
+          <select id="errorsPageSize"><option>50</option><option selected>100</option><option>200</option><option>500</option></select>
+        </label>
+        <button id="errorsPrev" class="btn small">← 上一页</button>
+        <button id="errorsNext" class="btn small">下一页 →</button>
+      </div>
+      <table class="tbl" id="errTable">
         <thead><tr><th>时间</th><th>接口</th><th>状态</th><th>耗时</th><th>渠道</th><th>key</th><th>模型</th><th>Tokens (入/出)</th><th>下游</th><th>出口</th><th>错误</th></tr></thead>
         <tbody></tbody>
       </table>
@@ -248,6 +282,10 @@
       <div id="chHeaders"></div>
       <button class="btn small" id="addHeaderBtn">+ 添加请求头</button>
 
+      <h4>渠道级代理（可选）</h4>
+      <div id="chChannelProxy" class="keyblock" style="margin:4px 0 12px"></div>
+      <p class="muted" style="font-size:12px;margin:0 0 8px">为整个渠道统一设置代理（如代理池）：未单独配置代理的 key 全部继承此设置——同一渠道内每个 key 仍是独立租约/出口 IP（同设置不同 IP）。key 块内仍可单独覆盖。</p>
+
       <h4>上游 Key（按顺序故障转移）</h4>
       <div id="chKeys"></div>
       <div class="row" style="margin-top:6px">
@@ -262,6 +300,10 @@
           <button class="btn small" id="bulkImportBtn">导入</button>
         </div>
       </div>
+      <div class="key-line" style="margin:10px 0 0">
+        <span class="muted" style="font-size:12px">冷却中的 key 可在此手动解除（上游已恢复时立即恢复路由，不必等冷却到期）：</span>
+      </div>
+      <div id="chCoolingKeys" class="chips" style="margin:4px 0 0"></div>
     </div>
     <div class="modal-foot">
       <span id="channelErr" class="err"></span>

@@ -91,12 +91,13 @@ func buildCandidates(model string) []candidate {
 
 // resolveProxy 解析候选的代理路由（ipv6pool 懒解析：首次用时向池申请租约并缓存）。
 // probe=true 时对池 SOCKS 出口做快速可达性探测（测试链路用，快速失败给可读错误）。
+// 代理来源：key 自身配置优先，未单独配置时继承渠道级代理（同设置不同 IP）。
 func resolveProxy(cand *candidate) (*ProxyRoute, error) {
 	return resolveProxyOpts(cand, false)
 }
 
 func resolveProxyOpts(cand *candidate, probe bool) (*ProxyRoute, error) {
-	spec := cand.k.Proxy
+	spec := cand.k.effectiveProxy(cand.ch)
 	if spec == nil || spec.Kind == "" {
 		return nil, nil
 	}
@@ -116,8 +117,9 @@ func resolveProxyOpts(cand *candidate, probe bool) (*ProxyRoute, error) {
 }
 
 // rotateExit 更换 ipv6pool 出口 IP（best effort），reason 用于日志定位。
+// 渠道级代理池（key 继承）同样生效。
 func rotateExit(cand *candidate, reason string) {
-	spec := cand.k.Proxy
+	spec := cand.k.effectiveProxy(cand.ch)
 	if spec == nil || spec.Kind != "ipv6pool" {
 		return
 	}
@@ -181,21 +183,36 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 			Err:   detail,
 		})
 	}
+	// 全部候选都在冷却时不硬 502：对最早到期的 key 穿透试探一次。冷却防的是
+	// 反复冲击限流上游，但上游可能已恢复（并发型 429 恢复极快、短窗口限流
+	// 数十秒即过），试探成功即解除冷却自愈——否则会一直表现为「渠道测试可用
+	// 而网关持续 502」，只能靠手工测试解冻。
+	pierceKey, pierceModel := "", ""
+	if pierce := earliestCooldown(cands, model); pierce != nil {
+		pierceKey, pierceModel = pierce.k.ID, pierce.cooldownModel(model)
+	}
+	pierced := false
 	for _, cand := range cands {
 		if attempts >= maxTries {
 			break
 		}
 		cm := cand.cooldownModel(model)
 		if cool.IsCooling(cand.k.ID, cm) {
-			cooled++
-			recordTrace(&cand, "cooldown_skipped", "")
-			continue
+			if cand.k.ID != pierceKey || cm != pierceModel {
+				cooled++
+				recordTrace(&cand, "cooldown_skipped", "")
+				continue
+			}
+			// 穿透：其余候选全在冷却，对此最早到期 key 做一次真实尝试
+			pierced = true
+			recordTrace(&cand, "cooldown_pierced", "")
 		}
 		attempts++
 
 		route, err := resolveProxy(&cand)
 		if err != nil {
 			lastErr = "resolve proxy: " + err.Error()
+			recordTrace(&cand, "proxy_error", lastErr)
 			log.Printf("route: key %s proxy resolve failed: %v", cand.k.Name, err)
 			continue
 		}
@@ -223,7 +240,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 			rateLimited = true
 			d := retryAfterDuration(resp.Header.Get("Retry-After"), pol.RateLimitCooldown)
 			cool.Mark(cand.k.ID, cm, d)
-			leaseMgr.RecordUse(cand.k.Proxy, cand.k.ID)
+			leaseMgr.RecordUse(cand.k.effectiveProxy(cand.ch), cand.k.ID)
 			lastErr = "upstream " + rejectReason(resp)
 			recordTrace(&cand, "rejected_429", lastErr)
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
@@ -255,8 +272,13 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 		// 正常拿到响应（2xx/3xx/4xx 业务语义）：清零该 key 的 5xx 连续计数
 		streaks.Reset(cand.k.ID)
 
+		// 穿透成功：该 key 的存量冷却与事实相悖，立即解除（后续请求恢复正常路由）
+		if pierced {
+			cool.Clear(cand.k.ID, cand.cooldownModel(model))
+		}
+
 		// 成功拿到可透传的响应：改写（可选）后回给下游
-		leaseMgr.RecordUse(cand.k.Proxy, cand.k.ID)
+		leaseMgr.RecordUse(cand.k.effectiveProxy(cand.ch), cand.k.ID)
 		serveUpstreamResponse(w, resp, stream, cand.ch.Rewrite, cand.ch.EndpointType)
 		served = &cand
 		break
@@ -268,8 +290,8 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 
 	// 无候选成功：把诊断信息写进请求日志（渠道/key/逐 key 原因），再回给下游
 	msg := describeRouteFailure(model, len(cands), attempts, cooled, lastErr, trace)
-	if attempts == 0 && cooled > 0 {
-		// 全部 key 都在冷却：附上最早可重试时间，下游可据此退避
+	// 429 余波（全部冷却或本轮撞过 429）：附上最早可重试时间，下游可据此退避
+	if attempts == 0 || rateLimited {
 		pairs := make([]cooldownPair, 0, len(cands))
 		for _, c := range cands {
 			pairs = append(pairs, cooldownPair{c.k.ID, c.cooldownModel(model)})
@@ -283,18 +305,8 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 	setReqErrMsg(r, msg)
 
 	if rateLimited {
-		// 按各候选渠道的冷却粒度构建冷却键（渠道可能混用两种粒度）
-		pairs := make([]cooldownPair, 0, len(cands))
-		for _, c := range cands {
-			pairs = append(pairs, cooldownPair{c.k.ID, c.cooldownModel(model)})
-		}
-		if d, ok := cool.EarliestRetry(pairs); ok {
-			secs := int64(d.Seconds()) + 1
-			w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
-			writeJSONError(w, http.StatusTooManyRequests,
-				"all upstream keys rate limited for model "+model, "rate_limited")
-			return nil
-		}
+		writeJSONError(w, http.StatusTooManyRequests, msg, "rate_limited")
+		return nil
 	}
 	writeJSONError(w, http.StatusBadGateway, msg, "upstream_error")
 	return nil
@@ -308,8 +320,24 @@ type attemptTrace struct {
 	Err   string `json:"error,omitempty"`
 }
 
+// formatTrace 把逐 key 尝试轨迹压成一行紧凑文本，如
+// "sk-1****c1 rejected_429(upstream 429: rate limited); sk-2****c2 network_error(...)"。
+// 事件名保留原始英文标识，与日志/测试断言一致，避免翻译漂移。
+func formatTrace(trace []attemptTrace) string {
+	var parts []string
+	for _, t := range trace {
+		p := t.Key + " " + t.Event
+		if t.Err != "" {
+			p += "(" + t.Err + ")"
+		}
+		parts = append(parts, p)
+	}
+	return strings.Join(parts, "; ")
+}
+
 // describeRouteFailure 汇总一轮故障转移的结果：可用 key 总数、尝试数、
-// 冷却跳过数与最后失败原因，供下游错误体与请求日志使用。
+// 冷却跳过数、最后失败原因与逐 key 尝试轨迹，供下游错误体与请求日志使用。
+// 轨迹完整跟随（不再截断），保证「哪个 key 因什么失败」在错误信息里可查。
 func describeRouteFailure(model string, total, attempted, cooled int, lastErr string, trace []attemptTrace) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "model %q: %d upstream key(s) unavailable", model, total)
@@ -323,7 +351,7 @@ func describeRouteFailure(model string, total, attempted, cooled int, lastErr st
 			fmt.Fprintf(&b, ": %s", lastErr)
 		}
 	} else {
-		// 一次都没尝试：全部 key 处于故障冷却中（典型为上一轮 429/5xx 的余波）
+		// 一次都没尝试：全部 key 处于故障冷却中（典型为上一轮 429 的余波）
 		fmt.Fprintf(&b, " (all %d in failure cooldown, nothing attempted", total)
 		if len(trace) > 0 {
 			var keys []string
@@ -334,7 +362,30 @@ func describeRouteFailure(model string, total, attempted, cooled int, lastErr st
 		}
 		b.WriteString(")")
 	}
+	if len(trace) > 0 {
+		b.WriteString("; attempts: ")
+		b.WriteString(formatTrace(trace))
+	}
 	return b.String()
+}
+
+// earliestCooldown 在「全部候选都处于冷却」时返回最早到期的候选（穿透试探
+// 用）；存在任一未冷却候选时返回 nil——此时正常故障转移即可，不做穿透。
+func earliestCooldown(cands []candidate, model string) *candidate {
+	var best *candidate
+	var bestUntil time.Time
+	for i := range cands {
+		cm := cands[i].cooldownModel(model)
+		until, ok := cool.CoolingKey(cands[i].k.ID, cm)
+		if !ok {
+			return nil
+		}
+		if best == nil || until.Before(bestUntil) {
+			best = &cands[i]
+			bestUntil = until
+		}
+	}
+	return best
 }
 
 // rejectReason 读取上游拒绝（4xx/5xx）响应体的开头作为失败原因

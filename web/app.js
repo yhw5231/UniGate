@@ -581,7 +581,11 @@ function keyBlock(k, inheritInfo) {
     try {
       const r = await api("POST", "/admin/api/testkey", { channel: ch, model });
       if (r.ok) toast(`测试成功 ${r.status}（${r.latency_ms}ms，经 ${r.proxy}）`);
-      else toast("测试失败: " + (r.error || r.snippet || r.status), true);
+      else {
+        let msg = r.error || r.snippet || r.status;
+        if (r.rotated && r.prior) msg = `换 IP 重试仍失败: ${msg}；首次: ${r.prior.error || r.prior.snippet || r.prior.status}`;
+        toast("测试失败: " + msg, true);
+      }
     } catch (e) { toast(e.message, true); }
   });
   div.querySelector(".kb-rotate").addEventListener("click", async () => {
@@ -949,6 +953,9 @@ function testRow(res) {
     <td class="muted">${esc(res.proxy || "")}</td>
     <td class="t-snippet"></td>`;
   renderTestStatus(tr.querySelector(".t-status"), tr.querySelector(".t-code"), tr.querySelector(".t-snippet"), res);
+  if (res.rotated && res.prior) {
+    tr.title = `换 IP 后重试的结果；首次错误：${res.prior.error || res.prior.snippet || "HTTP " + (res.prior.status || 0)}`;
+  }
   return tr;
 }
 
@@ -958,6 +965,9 @@ function renderTestStatus(statusEl, codeEl, snippetEl, res) {
     return;
   }
   statusEl.innerHTML = res.ok ? '<span class="badge on">通过</span>' : '<span class="badge off">失败</span>';
+  if (res.rotated) {
+    statusEl.innerHTML += ' <span class="muted" title="首次网络失败后已自动换出口 IP 重试">（换IP重试）</span>';
+  }
   codeEl.innerHTML = res.status ? `<span class="badge ${res.status < 400 ? "on" : "off"}">${res.status}</span>` : '<span class="muted">—</span>';
   snippetEl.innerHTML = res.ok
     ? `<span class="muted">${esc(res.snippet || "")}</span>`

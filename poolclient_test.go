@@ -246,6 +246,59 @@ func TestLeaseManagerRotateAndRelease(t *testing.T) {
 	}
 }
 
+// TestRotateRecyclesIdleTunnel：换 IP 后旧出口上的空闲隧道必须被关闭——
+// transport 连接池按路由地址缓存，不关闭的话下一个请求会复用换 IP 前建立的
+// 旧隧道，新请求仍从旧出口发出（换 IP 形同虚设）。
+func TestRotateRecyclesIdleTunnel(t *testing.T) {
+	_, poolSrv := startFakePool(t)
+	socksAddr, socks := startFakeSocks5Opts(t, 0)
+	host := socksAddr[:strings.LastIndex(socksAddr, ":")]
+	socksPort, _ := strconv.Atoi(socksAddr[strings.LastIndex(socksAddr, ":")+1:])
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(up.Close)
+
+	spec := &ProxySpec{Kind: "ipv6pool", PoolURL: poolSrv.URL,
+		SocksHost: host + ":" + strconv.Itoa(socksPort)}
+	ctx := context.Background()
+	route, err := leaseMgr.Ensure(ctx, spec, "k1", "")
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if route.Kind != "socks5" {
+		t.Fatalf("expected socks5 route, got %q", route.Kind)
+	}
+	doRequest := func(r *ProxyRoute) {
+		t.Helper()
+		client := &http.Client{Transport: transportFor(r)}
+		resp, err := client.Post(up.URL, "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("request via socks tunnel: %v", err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	doRequest(route)
+	if got := socks.count(); got != 1 {
+		t.Fatalf("socks connects = %d, want 1 after first request", got)
+	}
+	// 等待响应连接归还 transport 空闲池，再换 IP
+	time.Sleep(200 * time.Millisecond)
+	if _, err := leaseMgr.Rotate(ctx, spec, "k1"); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	route2, err := leaseMgr.Ensure(ctx, spec, "k1", "")
+	if err != nil {
+		t.Fatalf("Ensure after rotate: %v", err)
+	}
+	doRequest(route2)
+	// 换 IP 后必须重新拨号建立新隧道，而不是复用旧出口的空闲连接
+	if got := socks.count(); got != 2 {
+		t.Fatalf("socks connects = %d, want 2 (idle tunnel must be recycled on rotate)", got)
+	}
+}
+
 func TestPoolClientReleaseMissingOK(t *testing.T) {
 	_, srv := startFakePool(t)
 	c := newPoolClient(srv.URL, "")

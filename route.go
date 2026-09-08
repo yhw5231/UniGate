@@ -9,7 +9,8 @@
 //   - 429                  → 唯一记冷却的故障：Retry-After 优先，缺省 RATE_LIMIT_COOLDOWN（默认 1h）
 //   - 5xx                  → 只换 key 不冷却；按 key 记连续次数（正常请求清零），连续超过
 //     ROTATE_AFTER_5XX（默认 3）自动换出口 IP（ipv6pool key 生效）
-//   - 网络/代理错误         → 只换 key 不冷却，立即自动换出口 IP
+//   - 网络/代理错误         → 只换 key 不冷却；ipv6pool 候选换出口 IP 后同 key 立即
+//     重试一次（坏出口自愈），仍失败再继续下一个 key
 //   - 401/403              → 只换 key，不冷却、不换出口
 //   - 其他（含上游 400）   → 原样透传给下游（上游的业务语义不动）
 package main
@@ -117,11 +118,11 @@ func resolveProxyOpts(cand *candidate, probe bool) (*ProxyRoute, error) {
 }
 
 // rotateExit 更换 ipv6pool 出口 IP（best effort），reason 用于日志定位。
-// 渠道级代理池（key 继承）同样生效。
-func rotateExit(cand *candidate, reason string) {
+// 渠道级代理池（key 继承）同样生效。返回换 IP 失败的错误（非池代理返回 nil）。
+func rotateExit(cand *candidate, reason string) error {
 	spec := cand.k.effectiveProxy(cand.ch)
 	if spec == nil || spec.Kind != "ipv6pool" {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	_, err := leaseMgr.Rotate(ctx, spec, cand.k.ID)
@@ -129,11 +130,18 @@ func rotateExit(cand *candidate, reason string) {
 	if err != nil {
 		log.Printf("rotate lease for key %s (%s): %v", cand.k.Name, reason, err)
 	}
+	return err
 }
 
 // rotateOnNetErr 网络/代理失败时换 IP（ipv6pool key 均生效，无开关）。
-func rotateOnNetErr(cand *candidate) {
-	rotateExit(cand, "network error")
+func rotateOnNetErr(cand *candidate) error {
+	return rotateExit(cand, "network error")
+}
+
+// isPoolKey 判断候选是否使用 ipv6pool 代理（key 级配置或继承渠道级）。
+func isPoolKey(cand *candidate) bool {
+	spec := cand.k.effectiveProxy(cand.ch)
+	return spec != nil && spec.Kind == "ipv6pool"
 }
 
 // applyChannelHeaders 把渠道级自定义头写入请求（头名原样保留，空值跳过）。
@@ -192,28 +200,36 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 		pierceKey, pierceModel = pierce.k.ID, pierce.cooldownModel(model)
 	}
 	pierced := false
-	for _, cand := range cands {
-		if attempts >= maxTries {
+	// egressRetried 记录本轮请求中已做过「换出口重试」的 key（每 key 最多一次）
+	egressRetried := map[string]bool{}
+	for i := 0; i < len(cands); {
+		cand := cands[i]
+		isRetry := egressRetried[cand.k.ID]
+		if !isRetry && attempts >= maxTries {
 			break
 		}
 		cm := cand.cooldownModel(model)
-		if cool.IsCooling(cand.k.ID, cm) {
+		if !isRetry && cool.IsCooling(cand.k.ID, cm) {
 			if cand.k.ID != pierceKey || cm != pierceModel {
 				cooled++
 				recordTrace(&cand, "cooldown_skipped", "")
+				i++
 				continue
 			}
 			// 穿透：其余候选全在冷却，对此最早到期 key 做一次真实尝试
 			pierced = true
 			recordTrace(&cand, "cooldown_pierced", "")
 		}
-		attempts++
+		if !isRetry {
+			attempts++
+		}
 
 		route, err := resolveProxy(&cand)
 		if err != nil {
 			lastErr = "resolve proxy: " + err.Error()
 			recordTrace(&cand, "proxy_error", lastErr)
 			log.Printf("route: key %s proxy resolve failed: %v", cand.k.Name, err)
+			i++
 			continue
 		}
 
@@ -230,7 +246,17 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 			// 网络错误只换 key，不冷却（瞬断不该把健康 key 冷停）
 			lastErr = "network: " + err.Error()
 			recordTrace(&cand, "network_error", lastErr)
-			rotateOnNetErr(&cand)
+			// ipv6pool 候选：换出口后同 key 立即重试一次——SOCKS CONNECT 被拒
+			// （rep 0x05）等出口级故障常只影响单个出口 IP，新出口可能立即可用；
+			// 不重试的话单 key 渠道本次请求直接 502，要等下一次请求才用上新 IP。
+			// 与测试链路 runTestOnce 的换 IP 重试语义一致；重试不计入 attempts
+			//（MaxRouteTries 限制的是候选数），重试仍失败则继续下一个候选。
+			if isPoolKey(&cand) && !isRetry && rotateOnNetErr(&cand) == nil {
+				egressRetried[cand.k.ID] = true
+				recordTrace(&cand, "egress_retry", "")
+				continue // 不推进 i：同一候选换出口后原地重试
+			}
+			i++
 			continue
 		}
 
@@ -245,6 +271,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 			recordTrace(&cand, "rejected_429", lastErr)
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
+			i++
 			continue
 		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 			// 鉴权失败只换 key，不冷却、不换出口
@@ -252,20 +279,24 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 			recordTrace(&cand, "rejected_auth", lastErr)
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
+			i++
 			continue
 		case resp.StatusCode >= 500:
 			// 上游 5xx 只换 key，不冷却；但按 key 记连续次数（成功请求清零），
 			// 连续超过阈值（默认 3，即第 4 次起）说明当前出口大概率被上游
 			// 封禁/降级，自动换出口 IP
 			n := streaks.Inc(cand.k.ID)
-			if pol.RotateAfter5xx > 0 && n > pol.RotateAfter5xx {
-				streaks.Reset(cand.k.ID)
-				rotateExit(&cand, fmt.Sprintf("%d consecutive 5xx", n))
-			}
 			lastErr = "upstream " + rejectReason(resp)
 			recordTrace(&cand, "rejected_5xx", lastErr)
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
+			// 关闭 body（连接归还连接池）之后再换 IP：换 IP 会作废旧出口的
+			// 空闲隧道，太早调用会漏掉当前这条刚用完的连接
+			if pol.RotateAfter5xx > 0 && n > pol.RotateAfter5xx {
+				streaks.Reset(cand.k.ID)
+				rotateExit(&cand, fmt.Sprintf("%d consecutive 5xx", n))
+			}
+			i++
 			continue
 		}
 

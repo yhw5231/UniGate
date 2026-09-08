@@ -104,25 +104,46 @@ func (u *upstreamRecorder) setStatus(status int) {
 
 // fakeSocks5 最小 SOCKS5 服务端：no-auth 握手 + CONNECT 后转发到真实目标。
 func startFakeSocks5(t *testing.T) string {
+	addr, _ := startFakeSocks5Opts(t, 0)
+	return addr
+}
+
+// fakeSocksState fake SOCKS5 的可观测/可配置状态。
+type fakeSocksState struct {
+	mu       sync.Mutex
+	connects int // 收到的 CONNECT 请求数
+	refuseN  int // 前 N 次 CONNECT 直接回 rep 0x05（模拟坏出口被拒）
+}
+
+func (st *fakeSocksState) count() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.connects
+}
+
+// startFakeSocks5Opts 带状态的 fake SOCKS5：refuseN>0 时前 N 次 CONNECT 返回
+// rep 0x05 connection refused（模拟代理出口连目标被拒，如被目标封禁）。
+func startFakeSocks5Opts(t *testing.T, refuseN int) (string, *fakeSocksState) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("socks5 listen: %v", err)
 	}
 	t.Cleanup(func() { ln.Close() })
+	st := &fakeSocksState{refuseN: refuseN}
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go handleFakeSocks5(conn)
+			go handleFakeSocks5State(conn, st)
 		}
 	}()
-	return ln.Addr().String()
+	return ln.Addr().String(), st
 }
 
-func handleFakeSocks5(conn net.Conn) {
+func handleFakeSocks5State(conn net.Conn, st *fakeSocksState) {
 	defer conn.Close()
 	br := bufio.NewReader(conn)
 	// 握手：VER + NMETHODS + METHODS
@@ -152,6 +173,17 @@ func handleFakeSocks5(conn net.Conn) {
 	}
 	port := int(portBytes[0])<<8 | int(portBytes[1])
 	target := net.JoinHostPort(host, strconv.Itoa(port))
+	if st != nil {
+		st.mu.Lock()
+		st.connects++
+		refuse := st.connects <= st.refuseN
+		st.mu.Unlock()
+		if refuse {
+			// rep 0x05 connection refused：模拟代理出口连目标被拒
+			_, _ = conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+	}
 	up, err := net.Dial("tcp", target)
 	if err != nil {
 		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -377,7 +409,7 @@ func TestNetErrRotatesEgress(t *testing.T) {
 	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	deadURL := dead.URL
 	dead.Close()
-	socksAddr := startFakeSocks5(t)
+	socksAddr, socks := startFakeSocks5Opts(t, 0)
 	pool, poolSrv := startFakePool(t)
 	socksPort, _ := strconv.Atoi(socksAddr[strings.LastIndex(socksAddr, ":")+1:])
 	pool.portOverride = socksPort
@@ -401,6 +433,76 @@ func TestNetErrRotatesEgress(t *testing.T) {
 	}
 	if cool.IsCooling(kid, "") {
 		t.Fatal("network error must not mark cooldown")
+	}
+	// 换出口后同 key 恰好重试一次（首次 CONNECT 被拒 + 重试），不多不少
+	if c := socks.count(); c != 2 {
+		t.Fatalf("socks connects = %d, want 2 (first attempt + one rotate retry)", c)
+	}
+}
+
+// TestNetErrEgressRetrySameKey：ipv6pool 候选首次请求因出口被拒（rep 0x05）
+// 失败时，换出口 IP 后同 key 原地重试并成功——单 key 渠道一次请求内自愈，
+// 不必等下一次请求才用上新出口。
+func TestNetErrEgressRetrySameKey(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	socksAddr, socks := startFakeSocks5Opts(t, 1) // 第 1 次 CONNECT 回 rep 0x05
+	pool, poolSrv := startFakePool(t)
+	socksPort, _ := strconv.Atoi(socksAddr[strings.LastIndex(socksAddr, ":")+1:])
+	pool.portOverride = socksPort
+
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true,
+			Proxy: &ProxySpec{Kind: "ipv6pool", PoolURL: poolSrv.URL,
+				SocksHost: socksAddr[:strings.LastIndex(socksAddr, ":")]}}}})
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (success on rotate retry), body=%s", rr.Code, rr.Body.String())
+	}
+	if up.count() != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (only the successful retry reaches it)", up.count())
+	}
+	pool.mu.Lock()
+	n := pool.rotateN
+	pool.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("rotate count = %d, want 1", n)
+	}
+	if c := socks.count(); c != 2 {
+		t.Fatalf("socks connects = %d, want 2 (refused first + successful retry)", c)
+	}
+	if cool.IsCooling(store.Snapshot().Channels[0].Keys[0].ID, "") {
+		t.Fatal("network error must not mark cooldown")
+	}
+}
+
+// TestStaticProxyNetErrNoSameKeyRetry：固定代理（static）网络错误不重试同 key
+// （固定出口无法更换，重试只会重复失败），直接转移到下一个候选。
+func TestStaticProxyNetErrNoSameKeyRetry(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	socksAddr, socks := startFakeSocks5Opts(t, 100) // 全部拒绝
+
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{
+			{Name: "k1", APIKey: "sk-1", Enabled: true,
+				Proxy: &ProxySpec{Kind: "static", URL: "socks5://" + socksAddr}},
+			{Name: "k2", APIKey: "sk-2", Enabled: true},
+		}})
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (failover to k2), body=%s", rr.Code, rr.Body.String())
+	}
+	// k1 的固定代理只被尝试一次（不重试），k2 直连成功
+	if c := socks.count(); c != 1 {
+		t.Fatalf("socks connects = %d, want 1 (static proxy must not retry same key)", c)
+	}
+	if up.count() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", up.count())
 	}
 }
 

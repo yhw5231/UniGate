@@ -196,8 +196,10 @@ func (c *PoolClient) Release(ctx context.Context, id string) error {
 type leaseEntry struct {
 	lease      *PoolLease
 	multiplex  bool
-	socksPort  int    // multiplex 模式的基础 SOCKS5 端口
-	poolToken  string // 最近一次使用的池 token（供缓存直连操作复用）
+	socksPort  int         // multiplex 模式的基础 SOCKS5 端口
+	socksHost  string      // SOCKS5 服务地址（spec 解析结果，供路由重建）
+	poolToken  string      // 最近一次使用的池 token（供缓存直连操作复用）
+	route      *ProxyRoute // Ensure 最近返回的路由（换 IP 后据此作废旧隧道）
 	lastRotate time.Time
 	requests   int
 }
@@ -481,6 +483,44 @@ func (m *LeaseManager) resolveLease(spec *ProxySpec, keyID, group string) (lease
 	return "", true
 }
 
+// socksRouteLocked 由 entry 当前状态重建 SOCKS5 路由（信息不全返回 nil）。
+// multiplex 模式要求基础端口已知（Ensure 已补齐），per_ipv6 要求租约有端口。
+// 调用方持有写锁。
+func (m *LeaseManager) socksRouteLocked(e *leaseEntry, leaseID string) *ProxyRoute {
+	if e.socksHost == "" {
+		return nil
+	}
+	if e.multiplex {
+		if e.socksPort == 0 {
+			return nil
+		}
+		return &ProxyRoute{Kind: "socks5", Addr: socksAddr(e.socksHost, e.socksPort),
+			User: "user:" + leaseID, Pass: "x"}
+	}
+	if e.lease == nil || e.lease.Port == 0 {
+		return nil
+	}
+	return &ProxyRoute{Kind: "socks5", Addr: socksAddr(e.socksHost, e.lease.Port)}
+}
+
+// recycleRoute 关闭指向该租约 SOCKS 地址的空闲隧道连接。transport 连接池按
+// 路由地址缓存，出口 IP 变化不会使既有连接失效——不主动关闭的话，换 IP 后
+// 的下一个请求可能复用换 IP 前建立的旧隧道，出口实际没换。
+func recycleRoute(route *ProxyRoute) {
+	if route != nil && route.Kind == "socks5" {
+		transportFor(route).CloseIdleConnections()
+	}
+}
+
+// recycleIfIPChanged 出口 IP 变化时作废旧路由的空闲隧道（换 IP 只有在旧连接
+// 被关闭后才对后续请求真正生效——transport 连接池按路由地址缓存隧道，复用
+// 旧隧道会继续从旧出口发出请求）。old == nil 时无事发生。
+func recycleIfIPChanged(old *ProxyRoute, oldIPv6, newIPv6 string) {
+	if old != nil && oldIPv6 != newIPv6 {
+		recycleRoute(old)
+	}
+}
+
 // refreshEntryLocked 创建/刷新租约缓存条目（调用方持有写锁）。
 func (m *LeaseManager) refreshEntryLocked(ck string, lease *PoolLease, spec *ProxySpec) *leaseEntry {
 	entry, ok := m.entries[ck]
@@ -488,12 +528,24 @@ func (m *LeaseManager) refreshEntryLocked(ck string, lease *PoolLease, spec *Pro
 		entry = &leaseEntry{lastRotate: time.Now()}
 		m.entries[ck] = entry
 	}
+	var old *ProxyRoute
+	oldIP := ""
+	if entry.lease != nil {
+		old, oldIP = entry.route, entry.lease.IPv6
+	}
 	entry.lease = lease
 	entry.multiplex = lease.Port == 0
 	entry.poolToken = spec.PoolToken
+	host := strings.TrimSpace(spec.SocksHost)
+	if host == "" {
+		host = poolHost(spec.PoolURL)
+	}
+	entry.socksHost = host
 	if entry.multiplex {
 		entry.socksPort = m.socksBase[spec.PoolURL] // 可能尚未查询，由调用方补齐
 	}
+	entry.route = nil
+	recycleIfIPChanged(old, oldIP, lease.IPv6)
 	return entry
 }
 
@@ -562,10 +614,16 @@ func (m *LeaseManager) Ensure(ctx context.Context, spec *ProxySpec, keyID, group
 		// 换 IP 失败不阻塞请求：保留旧租约继续用，仅记录日志
 		if lease, err := client.Rotate(ctx, leaseID); err == nil {
 			m.mu.Lock()
+			old, oldIP := entry.route, ""
+			if entry.lease != nil {
+				oldIP = entry.lease.IPv6
+			}
 			entry.lease = lease
 			entry.lastRotate = time.Now()
 			entry.requests = 0
+			entry.route = nil
 			m.mu.Unlock()
+			recycleIfIPChanged(old, oldIP, lease.IPv6)
 		} else {
 			log.Printf("lease %s rotate failed: %v", leaseID, err)
 		}
@@ -580,18 +638,20 @@ func (m *LeaseManager) Ensure(ctx context.Context, spec *ProxySpec, keyID, group
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if entry.multiplex {
-		if entry.socksPort == 0 {
+	entry.socksHost = host
+	route := m.socksRouteLocked(entry, leaseID)
+	multiplex := entry.multiplex
+	if route != nil {
+		entry.route = route
+	}
+	m.mu.Unlock()
+	if route == nil {
+		if multiplex {
 			return nil, fmt.Errorf("pool %s multiplex socks port unknown", spec.PoolURL)
 		}
-		return &ProxyRoute{Kind: "socks5", Addr: socksAddr(host, entry.socksPort),
-			User: "user:" + leaseID, Pass: "x"}, nil
-	}
-	if entry.lease.Port == 0 {
 		return nil, fmt.Errorf("pool %s lease %s has no socks port", spec.PoolURL, leaseID)
 	}
-	return &ProxyRoute{Kind: "socks5", Addr: socksAddr(host, entry.lease.Port)}, nil
+	return route, nil
 }
 
 // EnsureProbed Ensure + SOCKS 出口快速可达性探测：测试链路（Admin key 测试）使用。
@@ -674,12 +734,19 @@ func (m *LeaseManager) Rotate(ctx context.Context, spec *ProxySpec, keyID string
 		return nil, err
 	}
 	m.mu.Lock()
+	var old *ProxyRoute
+	oldIP := ""
 	if e, ok := m.entries[leaseCacheKey(spec.PoolURL, leaseID)]; ok {
+		if e.lease != nil {
+			old, oldIP = e.route, e.lease.IPv6
+		}
 		e.lease = lease
 		e.lastRotate = time.Now()
 		e.requests = 0
+		e.route = nil // Ensure 下次会重建并缓存新路由
 	}
 	m.mu.Unlock()
+	recycleIfIPChanged(old, oldIP, lease.IPv6)
 	return lease, nil
 }
 
@@ -764,8 +831,13 @@ func (m *LeaseManager) RotateCached(ctx context.Context, poolURL, leaseID string
 	m.mu.Lock()
 	e, ok := m.entries[leaseCacheKey(poolURL, leaseID)]
 	token := ""
+	var old *ProxyRoute
+	oldIP := ""
 	if ok {
 		token = e.poolToken
+		if e.lease != nil {
+			old, oldIP = e.route, e.lease.IPv6
+		}
 	}
 	m.mu.Unlock()
 	if !ok {
@@ -780,8 +852,11 @@ func (m *LeaseManager) RotateCached(ctx context.Context, poolURL, leaseID string
 		e2.lease = lease
 		e2.lastRotate = time.Now()
 		e2.requests = 0
+		e2.route = nil
 	}
 	m.mu.Unlock()
+	// 出口 IP 已变：作废旧出口上的空闲隧道（同 Rotate）
+	recycleIfIPChanged(old, oldIP, lease.IPv6)
 	return lease, nil
 }
 

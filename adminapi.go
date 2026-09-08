@@ -505,7 +505,7 @@ type testResult struct {
 	Error     string `json:"error,omitempty"`
 	// Rotated 非空 = 网络失败自动换 IP 后重试，本条是重试结果（Prior 为首次结果）
 	Rotated bool        `json:"rotated,omitempty"`
-	Prior   *testResult `json:"-"`
+	Prior   *testResult `json:"prior,omitempty"`
 	// proxyFailed 失败发生在代理解析/探测阶段（池基础设施问题，非"已连上
 	// 出口后的网络错误"）——换 IP 无济于事，测试链路不重试。
 	proxyFailed bool
@@ -518,10 +518,7 @@ func runTestOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user st
 	res := testOnce(ctx, ch, k, model, msg, user)
 	// 已连上出口后的网络错误（Status=0 且非代理解析失败）换 IP 重试一次，
 	// 与网关真实转发语义一致；代理解析/探测失败是池基础设施问题，换 IP 无济于事
-	if res.Status == 0 && !res.proxyFailed && func() bool {
-		spec := k.effectiveProxy(ch)
-		return spec != nil && spec.Kind == "ipv6pool"
-	}() {
+	if res.Status == 0 && !res.proxyFailed && isPoolKey(&candidate{ch: ch, k: k}) {
 		rotateOnNetErr(&candidate{ch: ch, k: k})
 		res2 := testOnce(ctx, ch, k, model, msg, user)
 		res2.Rotated = true

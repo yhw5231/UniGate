@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,10 +36,8 @@ type Config struct {
 
 	// 故障转移与冷却
 	MaxRouteTries     int           // 单请求最多尝试的 key 数（0 = 全部）
-	RateLimitCooldown time.Duration // 429 冷却（无 Retry-After 时）
-	AuthFailCooldown  time.Duration // 401/403 冷却
-	ServerErrCooldown time.Duration // 5xx 冷却
-	NetErrCooldown    time.Duration // 网络错误冷却
+	RateLimitCooldown time.Duration // 429 冷却（无 Retry-After 时；其余故障不冷却，只换 key）
+	RotateAfter5xx    int           // 连续 5xx 超过该次数自动换出口 IP（默认 3，0 = 关闭）
 
 	// 上游传输
 	UpstreamHeaderTimeout time.Duration
@@ -127,9 +126,7 @@ func loadConfig() Config {
 
 		MaxRouteTries:     intEnv("MAX_ROUTE_TRIES", 0),
 		RateLimitCooldown: durationEnv("RATE_LIMIT_COOLDOWN", time.Hour),
-		AuthFailCooldown:  durationEnv("AUTH_FAIL_COOLDOWN", 10*time.Minute),
-		ServerErrCooldown: durationEnv("SERVER_ERR_COOLDOWN", 30*time.Second),
-		NetErrCooldown:    durationEnv("NET_ERR_COOLDOWN", 15*time.Second),
+		RotateAfter5xx:    intEnv("ROTATE_AFTER_5XX", 3),
 
 		UpstreamHeaderTimeout: durationEnv("UPSTREAM_HEADER_TIMEOUT", 10*time.Minute),
 
@@ -146,6 +143,8 @@ func loadConfig() Config {
 func resetCfgForTest() {
 	cfg = loadConfig()
 	cool = newCooldowns()
+	streaks = newStreaks()
+	policy.Store(defaultPolicy())
 	leaseMgr = newLeaseManager()
 	globalTransportCache = &transportCache{trs: map[string]*http.Transport{}}
 	initStats()
@@ -190,6 +189,49 @@ func durationEnv(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// RoutePolicy 运行时路由策略：环境变量提供默认值，WebUI 设置（gateway.json）
+// 显式覆盖。原子持有，保存设置时与在途请求无数据竞争。
+type RoutePolicy struct {
+	RateLimitCooldown time.Duration // 429 冷却（无 Retry-After 时）
+	RotateAfter5xx    int           // 连续 5xx 换出口阈值（0 = 关闭）
+	MaxRouteTries     int           // 单请求最多尝试 key 数（0 = 全部）
+}
+
+var policy atomic.Pointer[RoutePolicy]
+
+// defaultPolicy 环境变量默认策略。
+func defaultPolicy() *RoutePolicy {
+	return &RoutePolicy{
+		RateLimitCooldown: cfg.RateLimitCooldown,
+		RotateAfter5xx:    cfg.RotateAfter5xx,
+		MaxRouteTries:     cfg.MaxRouteTries,
+	}
+}
+
+// currentPolicy 返回生效中的路由策略（未初始化时回退环境变量默认）。
+func currentPolicy() *RoutePolicy {
+	if p := policy.Load(); p != nil {
+		return p
+	}
+	return defaultPolicy()
+}
+
+// applySettings 把 WebUI 设置（gateway.json，非 nil 字段）覆盖到环境变量
+// 默认之上并立即生效；store.load 与保存设置后调用。
+func applySettings(set GatewaySettings) {
+	p := defaultPolicy()
+	if set.RateLimitCooldownSec != nil {
+		p.RateLimitCooldown = time.Duration(*set.RateLimitCooldownSec) * time.Second
+	}
+	if set.RotateAfter5xx != nil {
+		p.RotateAfter5xx = *set.RotateAfter5xx
+	}
+	if set.MaxRouteTries != nil {
+		p.MaxRouteTries = *set.MaxRouteTries
+	}
+	policy.Store(p)
 }
 
 // splitCSV 按逗号切分并去空白、去空项。

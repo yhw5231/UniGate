@@ -33,6 +33,7 @@ func adminAPIHandler() http.Handler {
 	mux.HandleFunc("POST /admin/api/channels/{id}/fetch-models", handleAdminFetchModels)
 	mux.HandleFunc("GET /admin/api/requests", handleAdminRequests)
 	mux.HandleFunc("GET /admin/api/usage", handleAdminUsage)
+	mux.HandleFunc("PUT /admin/api/settings", handleAdminPutSettings)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, ok := requireAdmin(w, r)
@@ -104,7 +105,26 @@ func handleAdminState(w http.ResponseWriter, r *http.Request) {
 		"proxy_pools":  snap.ProxyPools,
 		"leases":       leaseMgr.ListLeases(),
 		"channel_info": chans,
+		"cooling":      cool.CoolingList(),
+		"settings":     store.Settings(),
+		"policy":       currentPolicy(),
 	})
+}
+
+// handleAdminPutSettings 更新路由策略设置（全量替换；字段缺省 = 恢复环境
+// 变量默认值）。保存后立即生效，无需重启。
+func handleAdminPutSettings(w http.ResponseWriter, r *http.Request) {
+	var set GatewaySettings
+	if err := json.NewDecoder(r.Body).Decode(&set); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid settings json: "+err.Error(), "bad_request")
+		return
+	}
+	if err := store.PutSettings(&set); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
+		return
+	}
+	applySettings(store.Settings())
+	writeJSON(w, http.StatusOK, map[string]any{"policy": currentPolicy()})
 }
 
 // handleAdminPutChannel 新增/整体更新渠道（含内嵌 keys），随后按全量配置
@@ -453,6 +473,9 @@ type testResult struct {
 	// Rotated 非空 = 网络失败自动换 IP 后重试，本条是重试结果（Prior 为首次结果）
 	Rotated bool        `json:"rotated,omitempty"`
 	Prior   *testResult `json:"-"`
+	// proxyFailed 失败发生在代理解析/探测阶段（池基础设施问题，非"已连上
+	// 出口后的网络错误"）——换 IP 无济于事，测试链路不重试。
+	proxyFailed bool
 }
 
 // runTestOnce 用指定渠道 key 发一条最小测试请求（与客户端直连形态一致：
@@ -460,14 +483,20 @@ type testResult struct {
 // 每次测试（含失败）都会写入请求记录，user 为发起测试的管理员。
 func runTestOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user string) testResult {
 	res := testOnce(ctx, ch, k, model, msg, user)
-	// 网络层失败（Status=0）且配置了「网络失败自动换 IP」时换 IP 重试一次，
-	// 与网关真实转发语义一致（配置错误导致的失败不换，直接返回）
-	if res.Status == 0 && k.Proxy != nil && k.Proxy.Kind == "ipv6pool" && k.Proxy.RotateOnNetErr {
+	// 已连上出口后的网络错误（Status=0 且非代理解析失败）换 IP 重试一次，
+	// 与网关真实转发语义一致；代理解析/探测失败是池基础设施问题，换 IP 无济于事
+	if res.Status == 0 && !res.proxyFailed && k.Proxy != nil && k.Proxy.Kind == "ipv6pool" {
 		rotateOnNetErr(&candidate{ch: ch, k: k})
 		res2 := testOnce(ctx, ch, k, model, msg, user)
 		res2.Rotated = true
 		res2.Prior = &res
-		return res2
+		res = res2
+	}
+	if res.OK {
+		// 测试是真实打通的请求：据此解除该 key 的存量冷却（key 级与 (key,model)
+		// 级都清），避免「渠道测试通过、网关却因冷却继续 502」的错位
+		cool.Clear(k.ID, "")
+		cool.Clear(k.ID, model)
 	}
 	return res
 }
@@ -487,6 +516,7 @@ func testOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user strin
 	// 测试链路带探测：池 SOCKS 出口不可达时秒级返回可读错误（真实转发不受影响）
 	route, err := resolveProxyOpts(&cand, true)
 	if err != nil {
+		res.proxyFailed = true
 		res.Error = "proxy resolve failed: " + err.Error()
 		return res
 	}

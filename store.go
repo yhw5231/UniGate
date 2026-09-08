@@ -71,23 +71,16 @@ type ProxySpec struct {
 	PoolToken string `json:"pool_token,omitempty"`
 
 	LeaseID   string `json:"lease_id,omitempty"`   // 租约 ID；空则自动 "gw-<keyID>"
-	SocksHost string `json:"socks_host,omitempty"` // SOCKS5 服务地址（默认取池管理端 host；新配置在代理池上）
+	SocksHost string `json:"socks_host,omitempty"` // SOCKS 服务地址（默认取池管理端 host；新配置在代理池上）
 	Share     bool   `json:"share,omitempty"`      // 跨渠道复用：同「池+BaseURL」分组的 key 共用同一租约/IP
 
 	// 租约行为
-	Persistent      bool  `json:"persistent,omitempty"`          // 常驻租约（免空闲回收）
-	RotateOnNetErr  bool  `json:"rotate_on_net_err,omitempty"`   // 网络失败自动换 IP
-	RotateStatuses  []int `json:"rotate_statuses,omitempty"`     // 上游返回这些状态码时换 IP（如 403,429）
-	RotateIntervalS int   `json:"rotate_interval_sec,omitempty"` // 每 N 秒自动换 IP（0 关闭）
-	RotateRequests  int   `json:"rotate_requests,omitempty"`     // 每 N 次请求自动换 IP（0 关闭）
-}
-
-// GetRotateStatuses 返回状态码换 IP 清单（nil 安全）。
-func (p *ProxySpec) GetRotateStatuses() []int {
-	if p == nil {
-		return nil
-	}
-	return p.RotateStatuses
+	Persistent      bool `json:"persistent,omitempty"`          // 常驻租约（免空闲回收）
+	RotateIntervalS int  `json:"rotate_interval_sec,omitempty"` // 每 N 秒自动换 IP（0 关闭）
+	RotateRequests  int  `json:"rotate_requests,omitempty"`     // 每 N 次请求自动换 IP（0 关闭）
+	// 注：网络/代理错误、连续 5xx 超阈值（ROTATE_AFTER_5XX）时自动换 IP，
+	// 不再提供按 key 开关或按状态码配置（旧的 rotate_on_net_err /
+	// rotate_statuses 字段读取时忽略，保存时不再写入）。
 }
 
 // normalize 清理代理配置并校验。
@@ -300,11 +293,37 @@ type GWKey struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// GatewaySettings 路由策略设置（WebUI「设置」页可改，持久化到 gateway.json）。
+// 指针字段：nil = 未在前端设置，沿用环境变量默认值；非 nil = 显式覆盖。
+type GatewaySettings struct {
+	RateLimitCooldownSec *int `json:"rate_limit_cooldown_sec,omitempty"` // 429 冷却秒数（默认 3600）
+	RotateAfter5xx       *int `json:"rotate_after_5xx,omitempty"`        // 连续 5xx 换出口阈值（默认 3，0 关闭）
+	MaxRouteTries        *int `json:"max_route_tries,omitempty"`         // 单请求最多尝试 key 数（默认 0 = 全部）
+}
+
+// normalize 校验设置值（nil 合法 = 未设置）。
+func (s *GatewaySettings) normalize() error {
+	if s == nil {
+		return nil
+	}
+	for name, v := range map[string]*int{
+		"rate_limit_cooldown_sec": s.RateLimitCooldownSec,
+		"rotate_after_5xx":        s.RotateAfter5xx,
+		"max_route_tries":         s.MaxRouteTries,
+	} {
+		if v != nil && *v < 0 {
+			return fmt.Errorf("%s must be >= 0", name)
+		}
+	}
+	return nil
+}
+
 // gatewayConfig gateway.json 的持久化格式。
 type gatewayConfig struct {
-	Channels   []*Channel   `json:"channels"`
-	GWKeys     []*GWKey     `json:"gateway_keys"`
-	ProxyPools []*ProxyPool `json:"proxy_pools"`
+	Channels   []*Channel       `json:"channels"`
+	GWKeys     []*GWKey         `json:"gateway_keys"`
+	ProxyPools []*ProxyPool     `json:"proxy_pools"`
+	Settings   *GatewaySettings `json:"settings,omitempty"`
 }
 
 // GatewayStore 配置存储（进程内单例，mutex 保护）。
@@ -705,6 +724,28 @@ func (s *GatewayStore) DeleteGWKey(id string) (*GWKey, bool) {
 		}
 	}
 	return nil, false
+}
+
+// Settings 返回路由策略设置快照（无设置时返回零值对象，字段均为 nil）。
+func (s *GatewayStore) Settings() GatewaySettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.data.Settings == nil {
+		return GatewaySettings{}
+	}
+	return *s.data.Settings
+}
+
+// PutSettings 整体更新路由策略设置（全量替换，字段 nil = 清除该项覆盖、
+// 回退环境变量默认值）。保存后由调用方 applySettings 生效。
+func (s *GatewayStore) PutSettings(set *GatewaySettings) error {
+	if err := set.normalize(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Settings = set
+	return s.saveLocked()
 }
 
 // FindUpKey 按 keyID 全局查找（返回渠道 + key 快照）。

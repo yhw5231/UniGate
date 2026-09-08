@@ -28,9 +28,6 @@ func setupGateway(t *testing.T) {
 	t.Setenv("USAGE_DB_PATH", "") // :memory:
 	t.Setenv("GW_KEY_AUTH", "true")
 	t.Setenv("RATE_LIMIT_COOLDOWN", "60s")
-	t.Setenv("AUTH_FAIL_COOLDOWN", "60s")
-	t.Setenv("SERVER_ERR_COOLDOWN", "60s")
-	t.Setenv("NET_ERR_COOLDOWN", "60s")
 	t.Setenv("REQ_LOG_SIZE", "100")
 	resetCfgForTest()
 	store = newGatewayStore(filepath.Join(t.TempDir(), "gateway.json"))
@@ -96,6 +93,13 @@ func (u *upstreamRecorder) lastAuth() string {
 		return ""
 	}
 	return u.auths[len(u.auths)-1]
+}
+
+// setStatus 动态切换上游返回状态码（模拟故障恢复）。
+func (u *upstreamRecorder) setStatus(status int) {
+	u.mu.Lock()
+	u.status = status
+	u.mu.Unlock()
 }
 
 // fakeSocks5 最小 SOCKS5 服务端：no-auth 握手 + CONNECT 后转发到真实目标。
@@ -206,7 +210,9 @@ func TestAllRateLimitedReturns429(t *testing.T) {
 	}
 }
 
-func TestAuthFailCooldown(t *testing.T) {
+// TestAuthFailNoCooldownJustFailover：401/403 不冷却 key，只故障转移到下一个 key；
+// 后续请求仍会先尝试该 key（不因鉴权失败被跳过）。
+func TestAuthFailNoCooldownJustFailover(t *testing.T) {
 	setupGateway(t)
 	up1 := newUpstream(t, http.StatusUnauthorized, `{"error":"bad key"}`)
 	up2 := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
@@ -215,14 +221,25 @@ func TestAuthFailCooldown(t *testing.T) {
 			{Name: "k1", APIKey: "sk-1", Enabled: true},
 			{Name: "k2", APIKey: "sk-2", Enabled: true, BaseURL: up2.srv.URL},
 		}})
+	k1 := store.Snapshot().Channels[0].Keys[0].ID
 
 	rr := httptest.NewRecorder()
 	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
-	if !cool.IsCooling(store.Snapshot().Channels[0].Keys[0].ID, "m1") {
-		t.Fatal("401 should mark auth cooldown")
+	if up2.count() != 1 {
+		t.Fatalf("expected failover to up2, calls=%d", up2.count())
+	}
+	if cool.IsCooling(k1, "m1") {
+		t.Fatal("401 must not mark cooldown")
+	}
+
+	// 不冷却：下一次请求仍先试 k1（仍 401）再切换 k2
+	rr2 := httptest.NewRecorder()
+	forwardChat(rr2, chatRequest("m1"), nil, false, "m1")
+	if up1.count() != 2 || up2.count() != 2 {
+		t.Fatalf("auth-failed key must be retried next request: up1=%d up2=%d", up1.count(), up2.count())
 	}
 }
 
@@ -353,9 +370,47 @@ func TestIPv6PoolProxyRouting(t *testing.T) {
 	}
 }
 
-func TestRotateOnStatus(t *testing.T) {
+// TestNetErrRotatesEgress：网络/代理错误（如出口连不上上游）只换 key 不冷却，
+// 且立即自动换出口 IP。
+func TestNetErrRotatesEgress(t *testing.T) {
 	setupGateway(t)
-	up := newUpstream(t, http.StatusForbidden, `{"error":"banned"}`)
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	socksAddr := startFakeSocks5(t)
+	pool, poolSrv := startFakePool(t)
+	socksPort, _ := strconv.Atoi(socksAddr[strings.LastIndex(socksAddr, ":")+1:])
+	pool.portOverride = socksPort
+
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: deadURL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true,
+			Proxy: &ProxySpec{Kind: "ipv6pool", PoolURL: poolSrv.URL,
+				SocksHost: socksAddr[:strings.LastIndex(socksAddr, ":")]}}}})
+	kid := store.Snapshot().Channels[0].Keys[0].ID
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502, body=%s", rr.Code, rr.Body.String())
+	}
+	pool.mu.Lock()
+	n := pool.rotateN
+	pool.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("network error must rotate egress, got %d", n)
+	}
+	if cool.IsCooling(kid, "") {
+		t.Fatal("network error must not mark cooldown")
+	}
+}
+
+// Test5xxStreakTriggersRotate：5xx 不冷却只换 key，但按 key 记连续次数
+// （成功清零）；连续超过阈值（ROTATE_AFTER_5XX，默认 3，即第 4 次）触发换出口 IP。
+func Test5xxStreakTriggersRotate(t *testing.T) {
+	setupGateway(t)
+	t.Setenv("ROTATE_AFTER_5XX", "3")
+	resetCfgForTest()
+	up := newUpstream(t, http.StatusInternalServerError, `{"error":"boom"}`)
 	socksAddr := startFakeSocks5(t)
 	pool, poolSrv := startFakePool(t)
 	socksPort, _ := strconv.Atoi(socksAddr[strings.LastIndex(socksAddr, ":")+1:])
@@ -364,20 +419,50 @@ func TestRotateOnStatus(t *testing.T) {
 	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
 		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true,
 			Proxy: &ProxySpec{Kind: "ipv6pool", PoolURL: poolSrv.URL,
-				SocksHost:      socksAddr[:strings.LastIndex(socksAddr, ":")],
-				RotateStatuses: []int{403, 429}}}}})
+				SocksHost: socksAddr[:strings.LastIndex(socksAddr, ":")]}}}})
 
-	rr := httptest.NewRecorder()
-	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("status=%d (all failed), body=%s", rr.Code, rr.Body.String())
+	// 前 3 次 5xx：只换 key 不换出口
+	for i := 0; i < 3; i++ {
+		rr := httptest.NewRecorder()
+		forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+		if rr.Code != http.StatusBadGateway {
+			t.Fatalf("req %d: status=%d want 502", i, rr.Code)
+		}
 	}
-	// 403 命中 RotateStatuses → 池子应收到一次 rotate
 	pool.mu.Lock()
 	n := pool.rotateN
 	pool.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("no rotate before threshold exceeded, got %d", n)
+	}
+
+	// 第 4 次连续 5xx（>3）：触发换出口
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	pool.mu.Lock()
+	n = pool.rotateN
+	pool.mu.Unlock()
 	if n != 1 {
-		t.Fatalf("expected rotate after 403, got %d", n)
+		t.Fatalf("expected rotate after %d consecutive 5xx, got %d", cfg.RotateAfter5xx, n)
+	}
+
+	// 恢复成功：计数清零，后续再连 3 次 5xx 不触发换出口
+	up.setStatus(http.StatusOK)
+	rrOK := httptest.NewRecorder()
+	forwardChat(rrOK, chatRequest("m1"), nil, false, "m1")
+	if rrOK.Code != http.StatusOK {
+		t.Fatalf("recovery status=%d body=%s", rrOK.Code, rrOK.Body.String())
+	}
+	up.setStatus(http.StatusInternalServerError)
+	for i := 0; i < 3; i++ {
+		rr2 := httptest.NewRecorder()
+		forwardChat(rr2, chatRequest("m1"), nil, false, "m1")
+	}
+	pool.mu.Lock()
+	n = pool.rotateN
+	pool.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("success must reset streak; expected still 1 rotate, got %d", n)
 	}
 }
 
@@ -532,6 +617,149 @@ func TestCooldownScopeKeyModel(t *testing.T) {
 	}
 	if up1.count() != 2 {
 		t.Fatalf("scope=key_model: m2 must retry k1, up1 calls = %d", up1.count())
+	}
+}
+
+// TestClientCancelNoCooldownPoisoning：下游客户端断开/超时导致上游请求被中止时，
+// 不得把该 key 记入网络错误冷却（否则后续请求全部跳过健康 key，表现为
+// 「渠道测试通过但网关 502」），且不应继续对剩余候选做无谓的故障转移。
+func TestClientCancelNoCooldownPoisoning(t *testing.T) {
+	setupGateway(t)
+	releaseCh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseCh // 挂起直到测试放行，模拟上游慢响应
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	t.Cleanup(release)
+	t.Cleanup(up.Close)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	kid := store.Snapshot().Channels[0].Keys[0].ID
+
+	// 客户端在 50ms 后取消，上游 1s 内不回包
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	defer cancel()
+	req := chatRequest("m1").WithContext(ctx)
+	rr := httptest.NewRecorder()
+	forwardChat(rr, req, nil, false, "m1")
+
+	if cool.IsCooling(kid, "") {
+		t.Fatal("client cancel must not mark upstream key cooldown")
+	}
+
+	// 冷却未中毒：同一 key 立即重试应正常命中并成功
+	release()
+	rr2 := httptest.NewRecorder()
+	forwardChat(rr2, chatRequest("m1"), nil, false, "m1")
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("retry after client cancel: status=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+}
+
+// TestFailureMessageCarriesUpstreamDetail：上游拒绝时，502 错误体应包含
+// 上游状态码与响应体摘要，让「为什么失败」在请求日志/下游侧可直接定位。
+func TestFailureMessageCarriesUpstreamDetail(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusInternalServerError, `{"error":{"message":"quota exceeded for org"}}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{"500", "quota exceeded for org", "1 attempted"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("502 body missing %q: %s", want, body)
+		}
+	}
+}
+
+// TestAllCoolingExplainsItself：全部 key 因上一轮故障冷却时，明确说明
+// 「未尝试任何上游」，而不是误导性的 "all upstream attempts failed"。
+func TestAllCoolingExplainsItself(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	kid := store.Snapshot().Channels[0].Keys[0].ID
+	cool.Mark(kid, "", time.Minute)
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502", rr.Code)
+	}
+	body := rr.Body.String()
+	for _, want := range []string{"failure cooldown", "nothing attempted"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("502 body missing %q: %s", want, body)
+		}
+	}
+	if up.count() != 0 {
+		t.Fatalf("cooling key must not be attempted, calls=%d", up.count())
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Fatal("expected Retry-After hint on all-cooling response")
+	}
+}
+
+// TestSettingsOverrideRoutePolicy：WebUI 设置（gateway.json settings）应覆盖
+// 环境变量默认值并即时生效——max_route_tries=1 时首个 key 失败即 502，
+// 恢复默认（0=全部）后故障转移到第二个 key 成功。
+func TestSettingsOverrideRoutePolicy(t *testing.T) {
+	setupGateway(t)
+	up1 := newUpstream(t, http.StatusInternalServerError, `{"error":"boom"}`)
+	up2 := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up1.srv.URL, Enabled: true,
+		Keys: []*UpKey{
+			{Name: "k1", APIKey: "sk-1", Enabled: true},
+			{Name: "k2", APIKey: "sk-2", Enabled: true, BaseURL: up2.srv.URL},
+		}})
+
+	tries := 1
+	if err := store.PutSettings(&GatewaySettings{MaxRouteTries: &tries}); err != nil {
+		t.Fatalf("PutSettings: %v", err)
+	}
+	applySettings(store.Settings())
+	if p := currentPolicy(); p.MaxRouteTries != 1 {
+		t.Fatalf("policy max_route_tries = %d, want 1", p.MaxRouteTries)
+	}
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("max_route_tries=1: status=%d want 502", rr.Code)
+	}
+	if up2.count() != 0 {
+		t.Fatalf("max_route_tries=1 must not reach k2, calls=%d", up2.count())
+	}
+
+	// 设置持久化：重新加载 gateway.json 仍读得到（在恢复默认之前检查）
+	path := store.path
+	store2 := newGatewayStore(path)
+	if err := store2.load(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := store2.Settings().MaxRouteTries; got == nil || *got != 1 {
+		t.Fatalf("settings not persisted, got %v", got)
+	}
+
+	// 恢复默认（全量替换、字段缺省）：故障转移恢复
+	if err := store.PutSettings(&GatewaySettings{}); err != nil {
+		t.Fatalf("PutSettings(reset): %v", err)
+	}
+	applySettings(store.Settings())
+	rr2 := httptest.NewRecorder()
+	forwardChat(rr2, chatRequest("m1"), nil, false, "m1")
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("after reset: status=%d body=%s", rr2.Code, rr2.Body.String())
 	}
 }
 

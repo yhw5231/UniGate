@@ -197,11 +197,20 @@ type reqStats struct {
 	key              string
 	promptTokens     int64
 	completionTokens int64
+	errMsg           string // 网关转发失败的诊断信息（覆盖通用的 HTTP 状态文本）
 }
 
 func reqStatsFrom(ctx context.Context) *reqStats {
 	rs, _ := ctx.Value(reqStatsKey{}).(*reqStats)
 	return rs
+}
+
+// setReqErrMsg 记录本次请求的失败诊断信息（路由引擎在放弃时调用），
+// 请求日志会优先展示它而非笼统的 "Bad Gateway"。
+func setReqErrMsg(r *http.Request, msg string) {
+	if rs := reqStatsFrom(r.Context()); rs != nil && rs.errMsg == "" {
+		rs.errMsg = msg
+	}
 }
 
 // ---- responseRecorder：捕获状态码与输出字节数 ----
@@ -306,7 +315,12 @@ func statsServe(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 		CompletionTokens: rs.completionTokens,
 	}
 	if status >= 400 {
-		rec.ErrMsg = http.StatusText(status)
+		// 网关主动返回的错误（如 502 前逐 key 的失败原因）优先于状态文本
+		if rs.errMsg != "" {
+			rec.ErrMsg = truncate(rs.errMsg, 500)
+		} else {
+			rec.ErrMsg = http.StatusText(status)
+		}
 	}
 	if rec.Key != "" {
 		rec.Key = maskKey(rec.Key)

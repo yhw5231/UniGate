@@ -45,6 +45,9 @@ func main() {
 	}
 
 	cool = newCooldowns()
+	streaks = newStreaks()
+	policy.Store(defaultPolicy())   // 环境变量默认
+	applySettings(store.Settings()) // WebUI 设置覆盖（gateway.json）
 	initStats()
 	initUsageDB()
 

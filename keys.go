@@ -1,9 +1,8 @@
 // 冷却表：按 (上游 keyID, model 部分) 记录故障冷却，路由引擎据此跳过不可用 key。
 // model 部分由渠道级冷却粒度开关决定：默认按 key 跨模型共享（传空串），
 // 渠道显式 "key_model" 时按 (key, model) 独立冷却。
-// 不同上游故障使用不同冷却时长：429 按 Retry-After（缺省 RATE_LIMIT_COOLDOWN）、
-// 鉴权失败（401/403）用 AUTH_FAIL_COOLDOWN、服务端错误（5xx）用 SERVER_ERR_COOLDOWN、
-// 网络错误用 NET_ERR_COOLDOWN。
+// 目前只有上游 429 记冷却：按 Retry-After（缺省 RATE_LIMIT_COOLDOWN）；
+// 其余故障（401/403、5xx、网络错误）只做故障转移，不冷却 key。
 package main
 
 import (
@@ -52,6 +51,54 @@ func (c *Cooldowns) Mark(keyID, model string, dur time.Duration) {
 	}
 }
 
+// Clear 解除 (keyID, model) 的冷却。渠道测试成功后调用：
+// 真实请求已打通该 key，存量冷却与事实相悖（表现为「测试通过但网关 502」）。
+func (c *Cooldowns) Clear(keyID, model string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.until, cooldownPair{keyID, model})
+}
+
+// CoolingKey 返回 (keyID, model) 的冷却到期时间（未冷却返回零值, false）。
+func (c *Cooldowns) CoolingKey(keyID, model string) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	until, ok := c.until[cooldownPair{keyID, model}]
+	if !ok || !time.Now().Before(until) {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// CoolingEntry 一条生效中的冷却（Admin state 用；key 按 ID 引用，WebUI 换算名称）。
+type CoolingEntry struct {
+	KeyID  string `json:"key_id"`
+	Model  string `json:"model,omitempty"` // 空 = 按 key 共享粒度
+	Until  int64  `json:"until_unix"`
+	LeftMS int64  `json:"left_ms"`
+}
+
+// CoolingList 列出全部生效中的冷却（快照）。
+func (c *Cooldowns) CoolingList() []CoolingEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	out := []CoolingEntry{}
+	for p, until := range c.until {
+		left := until.Sub(now)
+		if left <= 0 {
+			continue
+		}
+		out = append(out, CoolingEntry{
+			KeyID:  p.keyID,
+			Model:  p.model,
+			Until:  until.Unix(),
+			LeftMS: left.Milliseconds(),
+		})
+	}
+	return out
+}
+
 // EarliestRetry 返回给定冷却键（keyID+model 部分，由调用方按渠道粒度生成）
 // 集合中最早的冷却到期剩余时长；全部未冷却返回 0, false。
 func (c *Cooldowns) EarliestRetry(pairs []cooldownPair) (time.Duration, bool) {
@@ -91,6 +138,36 @@ func (c *Cooldowns) pruneLocked() {
 			delete(c.until, k)
 		}
 	}
+}
+
+// ---- 5xx 连续错误计数 ----
+
+// Streaks 按 key 记录连续上游 5xx 次数：成功请求清零，连续超过阈值
+// （ROTATE_AFTER_5XX，默认 3）触发自动换出口 IP。5xx 本身不冷却，只换 key。
+type Streaks struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+var streaks *Streaks
+
+func newStreaks() *Streaks {
+	return &Streaks{n: map[string]int{}}
+}
+
+// Inc 记一次 5xx，返回当前连续次数。
+func (s *Streaks) Inc(keyID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.n[keyID]++
+	return s.n[keyID]
+}
+
+// Reset 清零该 key 的连续计数（成功请求后调用）。
+func (s *Streaks) Reset(keyID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.n, keyID)
 }
 
 // retryAfterDuration 从上游 Retry-After 响应头解析冷却时长；空/解析失败返回 def。

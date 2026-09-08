@@ -89,6 +89,7 @@ textarea { resize: vertical; }
 .badge.off { background: rgba(224,82,82,.15); color: var(--err); }
 .badge.info { background: rgba(79,140,255,.15); color: var(--accent); }
 .badge.group { background: rgba(224,168,60,.15); color: var(--warn); }
+.badge.warn { background: rgba(224,168,60,.2); color: var(--warn); }
 .badge.free { background: rgba(53,194,110,.15); color: var(--ok); font-size: 11px; padding: 1px 6px; font-style: normal; }
 
 /* 版本号 */

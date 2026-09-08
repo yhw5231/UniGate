@@ -99,6 +99,7 @@ $$(".tab").forEach((btn) => btn.addEventListener("click", () => {
   if (btn.dataset.tab === "test") refreshTestTab();
   if (btn.dataset.tab === "usage") refreshUsage();
   if (btn.dataset.tab === "leases") { renderPools(); refreshLeases(); }
+  if (btn.dataset.tab === "settings") fillSettingsForm();
 }));
 
 // ---- 状态加载 ----
@@ -107,8 +108,41 @@ async function loadState() {
   renderChannels();
   renderGWKeys();
   renderPools();
+  fillSettingsForm();
   if (!$("#tab-leases").classList.contains("hidden")) refreshLeases();
 }
+
+// ---- 路由策略设置 ----
+// state.settings = 前端显式设置（留空字段 = 未设置）；state.policy = 当前生效值
+function fillSettingsForm() {
+  const s = (STATE && STATE.settings) || {};
+  const p = (STATE && STATE.policy) || {};
+  $("#setRateLimitCooldown").value = s.rate_limit_cooldown_sec ?? "";
+  $("#setRotateAfter5xx").value = s.rotate_after_5xx ?? "";
+  $("#setMaxRouteTries").value = s.max_route_tries ?? "";
+  const tries = (p.max_route_tries || 0) === 0 ? "全部" : p.max_route_tries;
+  $("#policyNow").textContent =
+    `429 冷却 ${p.rate_limit_cooldown_sec ?? 3600}s · 连续 5xx 超过 ${p.rotate_after_5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key`;
+}
+
+$("#settingsSaveBtn").addEventListener("click", async () => {
+  const body = {};
+  const num = (sel, name) => {
+    const v = $(sel).value.trim();
+    if (v === "") return; // 留空 = 恢复环境变量默认
+    const n = parseInt(v, 10);
+    if (!Number.isFinite(n) || n < 0) { throw new Error(`${name} 必须是不小于 0 的整数`); }
+    body[name] = n;
+  };
+  try {
+    num("#setRateLimitCooldown", "rate_limit_cooldown_sec");
+    num("#setRotateAfter5xx", "rotate_after_5xx");
+    num("#setMaxRouteTries", "max_route_tries");
+    await api("PUT", "/admin/api/settings", body);
+    toast("设置已保存并生效");
+    await loadState();
+  } catch (e) { toast(e.message, true); }
+});
 
 // ---- 渠道列表 ----
 // 渠道过滤：按关键字（名称/分组/BaseURL/模型）与分组下拉筛选
@@ -139,6 +173,7 @@ function renderChannels() {
   refreshGroupOptions();
   const wrap = $("#channelList");
   const chans = filterChannels((STATE && STATE.channels) || []);
+  const cooling = coolingByKeyID();
   if (!(STATE && STATE.channels || []).length) {
     wrap.innerHTML = `<p class="muted">还没有渠道。点击右上角「新建渠道」添加第一个 OpenAI 兼容上游。</p>`;
     return;
@@ -151,9 +186,11 @@ function renderChannels() {
     const keys = ch.keys || [];
     const keyLines = keys.map((k) => {
       const p = k.proxy && k.proxy.kind ? proxyDesc(k.proxy) : "直连";
+      const cd = coolingBadge(cooling, k.id);
       return `<div class="key-line">
         <span class="badge ${k.enabled ? "on" : "off"}">${k.enabled ? "启用" : "停用"}</span>
         <span>${esc(k.name || "(未命名)")}</span>
+        ${cd}
         <span class="pname">代理: ${esc(p)}</span>
       </div>`;
     }).join("");
@@ -195,6 +232,23 @@ $("#channelGroupFilter").addEventListener("change", renderChannels);
 
 // 代理池查找：按 ID（新格式引用）或 URL（旧内联格式）→ 池实体
 function poolById(id) { return ((STATE && STATE.proxy_pools) || []).find((p) => p.id === id); }
+
+// ---- 冷却状态 ----
+// state.cooling: [{key_id, model, until_unix, left_ms}]，按 keyID 索引
+function coolingByKeyID() {
+  const m = {};
+  for (const c of (STATE && STATE.cooling) || []) {
+    if (!m[c.key_id] || c.left_ms > m[c.key_id].left_ms) m[c.key_id] = c;
+  }
+  return m;
+}
+function coolingBadge(cooling, keyID) {
+  const c = cooling[keyID];
+  if (!c) return "";
+  const left = c.left_ms > 0 ? Math.round(c.left_ms / 1000) : 0;
+  const scope = c.model ? `（${esc(c.model)}）` : "";
+  return `<span class="badge warn" title="该 key 因上游故障处于冷却中，网关转发会跳过它；渠道测试成功会自动解除">冷却中${scope} · 剩 ${left}s</span>`;
+}
 function poolByURL(url) {
   const u = String(url || "").replace(/\/+$/, "");
   return ((STATE && STATE.proxy_pools) || []).find((p) => String(p.pool_url || "").replace(/\/+$/, "") === u);
@@ -221,8 +275,7 @@ function proxyDesc(p) {
     if (p.lease_id) parts.push(`租约 ${p.lease_id}`);
     else parts.push("租约(自动)");
     if (p.share) parts.push("跨渠道复用(同渠道各用IP/跨渠道可共用)");
-    if (p.rotate_on_net_err) parts.push("网络失败换IP");
-    if (p.rotate_statuses && p.rotate_statuses.length) parts.push(`状态码${p.rotate_statuses.join("/")}换IP`);
+    parts.push("网络错误/连续5xx自动换IP");
     if (p.rotate_interval_sec) parts.push(`${p.rotate_interval_sec}s换IP`);
     if (p.rotate_requests) parts.push(`${p.rotate_requests}次换IP`);
     return parts.join(", ");
@@ -335,7 +388,7 @@ function keyBlock(k) {
             </select>
           </label>
           <label>租约 ID（空=自动 gw-keyID） <input class="kb-leaseid" value="${esc(k.proxy && k.proxy.lease_id || "")}"></label>
-          <label>换IP状态码（逗号分隔，如 403,429） <input class="kb-rotstatus" value="${esc((k.proxy && k.proxy.rotate_statuses || []).join(","))}"></label>
+          <span class="muted" style="font-size:12px;align-self:end;margin-bottom:10px" title="网络/代理错误，或连续 5xx 超过阈值（ROTATE_AFTER_5XX，默认 3）时自动换出口 IP">自动换IP：网络错误或连续 5xx 超阈值</span>
         </div>
         <div class="grid3">
           <label>每 N 次请求换IP（0=关闭） <input class="kb-rotreq" type="number" min="0" value="${(k.proxy && k.proxy.rotate_requests) || 0}"></label>
@@ -343,7 +396,6 @@ function keyBlock(k) {
           <label class="inline" style="align-self:end;margin-bottom:10px" title="同「池+BaseURL」分组的 key 共用同一租约/IP"><input type="checkbox" class="kb-share" ${k.proxy && k.proxy.share ? "checked" : ""}> 跨渠道复用</label>
         </div>
         <div class="row" style="margin:4px 0">
-          <label class="inline"><input type="checkbox" class="kb-rotnet" ${k.proxy && k.proxy.rotate_on_net_err ? "checked" : ""}> 网络失败自动换IP</label>
           <label class="inline">每 N 秒换IP（0=关闭）<input class="kb-rotsec" type="number" min="0" value="${(k.proxy && k.proxy.rotate_interval_sec) || 0}" style="width:90px"></label>
           <span class="spacer"></span>
           <span class="muted" style="font-size:12px">池的连接信息在「<a href="#" class="swap-tab" data-tab="leases">代理池</a>」页配置</span>
@@ -503,15 +555,12 @@ function collectKeyForm(div) {
   if (kind === "static") {
     k.proxy = { kind: "static", url: div.querySelector(".kb-url").value.trim() };
   } else if (kind === "ipv6pool") {
-    const statuses = div.querySelector(".kb-rotstatus").value.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
     k.proxy = {
       kind: "ipv6pool",
       pool_id: div.querySelector(".kb-poolid").value,
       lease_id: div.querySelector(".kb-leaseid").value.trim(),
       persistent: div.querySelector(".kb-persist").checked,
       share: div.querySelector(".kb-share").checked,
-      rotate_on_net_err: div.querySelector(".kb-rotnet").checked,
-      rotate_statuses: statuses,
       rotate_interval_sec: parseInt(div.querySelector(".kb-rotsec").value, 10) || 0,
       rotate_requests: parseInt(div.querySelector(".kb-rotreq").value, 10) || 0,
     };

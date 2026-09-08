@@ -30,6 +30,7 @@
       <button data-tab="logs" class="tab">请求日志</button>
       <button data-tab="usage" class="tab">用量统计</button>
       <button data-tab="leases" class="tab">代理池</button>
+      <button data-tab="settings" class="tab">设置</button>
     </nav>
     <div class="spacer"></div>
     <span class="ver muted" id="topVersion" title="构建版本"></span>
@@ -156,6 +157,33 @@
       </div>
       <div id="usageCards" class="cards"></div>
       <div id="usageTables"></div>
+    </section>
+
+    <!-- 设置 -->
+    <section id="tab-settings" class="tabpane hidden">
+      <div class="row">
+        <h2>设置</h2>
+        <div class="spacer"></div>
+        <button id="settingsSaveBtn" class="btn primary">保存设置</button>
+      </div>
+      <div class="panel" style="max-width:720px">
+        <h3 style="margin:0 0 4px">路由策略</h3>
+        <p class="muted" style="font-size:12px;margin:0 0 12px">保存后立即生效（持久化，无需重启）。留空 = 使用环境变量默认值。</p>
+        <div class="grid2">
+          <label title="上游返回 429 且无 Retry-After 头时的冷却时长；429 是唯一会冷却 key 的故障">429 冷却秒数（无 Retry-After 时）
+            <input id="setRateLimitCooldown" type="number" min="0" placeholder="环境变量 RATE_LIMIT_COOLDOWN（默认 3600）">
+          </label>
+          <label title="同一 key 连续 5xx 超过该次数自动换出口 IP（第 N+1 次触发）；0 = 关闭。正常请求会清零计数">连续 5xx 换出口阈值
+            <input id="setRotateAfter5xx" type="number" min="0" placeholder="环境变量 ROTATE_AFTER_5XX（默认 3）">
+          </label>
+          <label title="单次下游请求最多尝试的 (渠道,key) 候选数；0 = 全部尝试">单请求最多尝试 key 数
+            <input id="setMaxRouteTries" type="number" min="0" placeholder="环境变量 MAX_ROUTE_TRIES（默认 0 = 全部）">
+          </label>
+        </div>
+        <p class="muted" style="font-size:12px;margin:10px 0 0">
+          当前生效：<span id="policyNow" class="muted"></span>
+        </p>
+      </div>
     </section>
   </main>
 </div>

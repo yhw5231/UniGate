@@ -26,8 +26,8 @@ services:
       # ADMIN_PASSWORD: admin
       # 下游是否强制通用 key（默认 true）
       # GW_KEY_AUTH: "true"
-      # 故障转移冷却（可按需调整）
+      # 故障转移：仅 429 记冷却；网络错误/连续 5xx 超阈值自动换出口 IP
       # RATE_LIMIT_COOLDOWN: 1h
-      # AUTH_FAIL_COOLDOWN: 10m
+      # ROTATE_AFTER_5XX: 3
     volumes:
       - ./data:/data

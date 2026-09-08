@@ -363,17 +363,21 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 候选顺序 = 渠道在配置中的顺序（即优先级）→ 渠道内 key 顺序。单请求最多尝试
 `MAX_ROUTE_TRIES` 个候选（默认全部）。命中冷却的候选直接跳过：
 
-| 故障 | 冷却时长（环境变量） | 默认 |
-|---|---|---|
-| 上游 429 | `Retry-After` 优先，否则 `RATE_LIMIT_COOLDOWN` | 1h |
-| 上游 401/403（鉴权失败） | `AUTH_FAIL_COOLDOWN` | 10m |
-| 上游 5xx | `SERVER_ERR_COOLDOWN` | 30s |
-| 网络/代理错误 | `NET_ERR_COOLDOWN` | 15s |
-| 全部候选失败 | 有 429 记录则返回 429 + `Retry-After`，否则 502 | |
+| 故障 | 处理 |
+|---|---|
+| 上游 429 | **唯一记冷却的故障**：`Retry-After` 优先，否则 `RATE_LIMIT_COOLDOWN`（默认 1h） |
+| 上游 5xx | 只切换到下一个 key，不冷却；按 key 记连续次数（正常请求清零），**连续超过 `ROTATE_AFTER_5XX`（默认 3）自动换出口 IP** |
+| 网络/代理错误 | 只切换到下一个 key，不冷却，**立即自动换出口 IP** |
+| 上游 401/403 | 只切换到下一个 key，不冷却、不换出口 |
+| 上游其他 4xx（如 400） | 不切换，原样透传给下游 |
+| 全部候选失败 | 有 429 记录则返回 429 + `Retry-After`，否则 502（错误体与请求日志含逐 key 失败原因） |
 
-冷却粒度按渠道配置（`cooldown_scope`）：默认**按 key 跨模型共享**——某模型故障即冷停
+冷却粒度按渠道配置（`cooldown_scope`）：默认**按 key 跨模型共享**——某模型触发 429 即冷却
 该 key 的全部模型（适合 key 配额共享的上游）；渠道可选 `key_model` 按 `(key, model)`
-独立记录——同一账号不同模型的额度互不影响。
+独立记录——同一账号不同模型的额度互不影响。渠道测试成功会自动解除该 key 的存量冷却。
+
+429 冷却时长、5xx 换出口阈值、单请求最大尝试数均可在 WebUI「**设置**」页调整
+（保存到 `gateway.json`，保存后立即生效）；环境变量仅提供默认值，前端显式设置优先。
 
 ## 配置项（环境变量）
 
@@ -389,11 +393,9 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 | `TOKEN_TTL` | `24h` | 登录 token 有效期 |
 | `TOKEN_SECRET` | 空 | 登录 token 签名密钥（缺省自动持久化到 data/token-secret） |
 | `GW_KEY_AUTH` | `true` | 下游是否必须携带通用 key |
-| `MAX_ROUTE_TRIES` | 0（全部） | 单请求最多尝试的 key 数 |
-| `RATE_LIMIT_COOLDOWN` | `1h` | 429 冷却（无 `Retry-After` 时；有则优先） |
-| `AUTH_FAIL_COOLDOWN` | `10m` | 401/403 冷却 |
-| `SERVER_ERR_COOLDOWN` | `30s` | 5xx 冷却 |
-| `NET_ERR_COOLDOWN` | `15s` | 网络错误冷却 |
+| `MAX_ROUTE_TRIES` | 0（全部） | 单请求最多尝试的 key 数（也可在 WebUI「设置」页修改） |
+| `RATE_LIMIT_COOLDOWN` | `1h` | 429 冷却（无 `Retry-After` 时；有则优先。其余故障不冷却，只换 key；也可在 WebUI「设置」页修改） |
+| `ROTATE_AFTER_5XX` | `3` | 同一 key 连续 5xx 超过该次数自动换出口 IP（0 = 关闭；仅 ipv6pool key 生效；也可在 WebUI「设置」页修改） |
 | `UPSTREAM_HEADER_TIMEOUT` | `10m` | 等待上游响应头超时（LLM 非流式可能较慢，勿设过小） |
 | `TEST_TIMEOUT` | `45s` | WebUI 渠道/key 测试的整体超时（默认低于常见反代 60s，避免测试被反代掐断成 504） |
 | `REQ_LOG_SIZE` | `1000` | 请求日志环形缓冲容量 |

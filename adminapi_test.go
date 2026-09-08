@@ -183,6 +183,86 @@ func TestAdminTestKeyEndpoint(t *testing.T) {
 
 // TestAdminTestKeyWritesRequestLog：测试请求也要进请求记录（reqLog），
 // user 记为发起测试的管理员；路径为上游对话端点，成功状态为 200。
+// TestTestKeySuccessClearsCooldown：渠道测试成功 = 真实请求已打通该 key，
+// 应解除其存量冷却（含按 key 共享与按 (key,model) 两种粒度），
+// 避免「渠道测试全部通过、网关却因冷却继续 502」的错位。
+func TestTestKeySuccessClearsCooldown(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"pong"}}]}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	kid := store.Snapshot().Channels[0].Keys[0].ID
+	chid := store.Snapshot().Channels[0].ID
+
+	// 模拟历史上该 key 触发过 429/网络错误：两种粒度都冷却中
+	cool.Mark(kid, "", time.Minute)   // key 级共享冷却
+	cool.Mark(kid, "m1", time.Minute) // (key, model) 冷却
+	if !cool.IsCooling(kid, "") || !cool.IsCooling(kid, "m1") {
+		t.Fatal("precondition: key should be cooling")
+	}
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/testkey",
+		`{"channel_id":"`+chid+`","key_id":"`+kid+`","model":"m1"}`, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if cool.IsCooling(kid, "") || cool.IsCooling(kid, "m1") {
+		t.Fatal("successful test must clear cooldown for the tested key")
+	}
+}
+
+// TestAdminSettingsEndpoint：PUT /admin/api/settings 全量替换设置并即时生效；
+// 字段缺省 = 恢复环境变量默认；校验在 state 接口回读。
+func TestAdminSettingsEndpoint(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+
+	cd := 600
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPut, "/admin/api/settings",
+		`{"rate_limit_cooldown_sec":600,"rotate_after_5xx":5,"max_route_tries":2}`, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if p := currentPolicy(); p.RateLimitCooldown != 600*time.Second || p.RotateAfter5xx != 5 || p.MaxRouteTries != 2 {
+		t.Fatalf("policy after PUT: %+v", p)
+	}
+
+	// state 回读：settings 为显式值、policy 为生效值
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodGet, "/admin/api/state", "", tok))
+	var st struct {
+		Settings GatewaySettings `json:"settings"`
+		Policy   RoutePolicy     `json:"policy"`
+	}
+	_ = json.Unmarshal(rr2.Body.Bytes(), &st)
+	if st.Settings.RateLimitCooldownSec == nil || *st.Settings.RateLimitCooldownSec != cd {
+		t.Fatalf("state settings: %+v", st.Settings)
+	}
+	if st.Policy.RateLimitCooldown != 600*time.Second {
+		t.Fatalf("state policy: %+v", st.Policy)
+	}
+
+	// 非法值 → 400
+	rr3 := httptest.NewRecorder()
+	rootHandler(rr3, adminReq(http.MethodPut, "/admin/api/settings", `{"rotate_after_5xx":-1}`, tok))
+	if rr3.Code != http.StatusBadRequest {
+		t.Fatalf("negative value: status=%d want 400", rr3.Code)
+	}
+
+	// 字段缺省 = 恢复环境变量默认（RATE_LIMIT_COOLDOWN 在 setupGateway 中为 60s）
+	rr4 := httptest.NewRecorder()
+	rootHandler(rr4, adminReq(http.MethodPut, "/admin/api/settings", `{}`, tok))
+	if rr4.Code != http.StatusOK {
+		t.Fatalf("reset: status=%d", rr4.Code)
+	}
+	if p := currentPolicy(); p.RateLimitCooldown != 60*time.Second || p.RotateAfter5xx != 3 || p.MaxRouteTries != 0 {
+		t.Fatalf("policy after reset should fall back to env defaults: %+v", p)
+	}
+}
+
 func TestAdminTestKeyWritesRequestLog(t *testing.T) {
 	setupGateway(t)
 	initStats()

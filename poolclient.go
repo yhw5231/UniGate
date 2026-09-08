@@ -322,6 +322,46 @@ func socksBasePort(listenAddr string) int {
 	return n
 }
 
+// probeSocksReachable 快速探测池的 SOCKS5 端口是否可用：TCP 连通 + SOCKS5 greeting
+// 得到方法选择回复（不做完整 CONNECT）。上游测试前调用：端口挂死/防火墙丢弃/
+// accept 不服务等情况立刻给出可读错误，避免测试请求挂在 SOCKS 拨号/握手直到
+// 整体超时（WebUI 表现为长时间无响应，经反代时易被判定 504）。
+func probeSocksReachable(host string, port int) error {
+	if host == "" || port <= 0 {
+		return nil // 信息不全时跳过探测（Ensure 阶段仍有兜底报错）
+	}
+	addr := socksAddr(host, port)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("socks proxy %s unreachable: %w", addr, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	// greeting：VER=5，1 个方法（无鉴权 0x00；池会拒绝并走用户名密码——能得到
+	// 任何方法选择回复即证明是活的 SOCKS5 服务，具体鉴权交给正式请求）
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return fmt.Errorf("socks proxy %s greeting write: %w", addr, err)
+	}
+	reply := make([]byte, 2)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		return fmt.Errorf("socks proxy %s no socks5 greeting reply (服务挂起?): %w", addr, err)
+	}
+	if reply[0] != 0x05 {
+		return fmt.Errorf("socks proxy %s not a socks5 service (reply ver 0x%02x)", addr, reply[0])
+	}
+	return nil
+}
+
+// socksAddr 归一化 SOCKS 服务地址：socks_host 允许写完整 "host:port"（覆盖端口），
+// 裸 host（含 [IPv6] 字面量）与租约/基础端口拼接。
+func socksAddr(host string, port int) string {
+	if h, p, err := net.SplitHostPort(host); err == nil && p != "" {
+		return net.JoinHostPort(h, p)
+	}
+	host = strings.Trim(host, "[]")
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 // leaseIDFor 非共享模式的确定性租约 ID：显式配置优先，否则 gw-<keyID>。
 func leaseIDFor(spec *ProxySpec, keyID string) string {
 	if id := strings.TrimSpace(spec.LeaseID); id != "" {
@@ -545,13 +585,28 @@ func (m *LeaseManager) Ensure(ctx context.Context, spec *ProxySpec, keyID, group
 		if entry.socksPort == 0 {
 			return nil, fmt.Errorf("pool %s multiplex socks port unknown", spec.PoolURL)
 		}
-		return &ProxyRoute{Kind: "socks5", Addr: net.JoinHostPort(host, strconv.Itoa(entry.socksPort)),
+		return &ProxyRoute{Kind: "socks5", Addr: socksAddr(host, entry.socksPort),
 			User: "user:" + leaseID, Pass: "x"}, nil
 	}
 	if entry.lease.Port == 0 {
 		return nil, fmt.Errorf("pool %s lease %s has no socks port", spec.PoolURL, leaseID)
 	}
-	return &ProxyRoute{Kind: "socks5", Addr: net.JoinHostPort(host, strconv.Itoa(entry.lease.Port))}, nil
+	return &ProxyRoute{Kind: "socks5", Addr: socksAddr(host, entry.lease.Port)}, nil
+}
+
+// EnsureProbed Ensure + SOCKS 出口快速可达性探测：测试链路（Admin key 测试）使用。
+// 探测不可达时立刻返回可读错误，避免测试请求挂在 SOCKS 拨号/握手直到整体超时
+// （WebUI 表现为长时间无响应，经反代时易被判定 504）。真实转发不探测——
+// 上游是否可用以实际请求为准，探测只用于快速反馈。
+func (m *LeaseManager) EnsureProbed(ctx context.Context, spec *ProxySpec, keyID, group string) (*ProxyRoute, error) {
+	route, err := m.Ensure(ctx, spec, keyID, group)
+	if err != nil {
+		return nil, err
+	}
+	if err := probeSocksReachable(route.AddrHost(), route.AddrPort()); err != nil {
+		return nil, err
+	}
+	return route, nil
 }
 
 // multiplexPort 查询（并缓存）multiplex 模式的基础 SOCKS5 端口。

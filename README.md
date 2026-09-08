@@ -395,6 +395,7 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 | `SERVER_ERR_COOLDOWN` | `30s` | 5xx 冷却 |
 | `NET_ERR_COOLDOWN` | `15s` | 网络错误冷却 |
 | `UPSTREAM_HEADER_TIMEOUT` | `10m` | 等待上游响应头超时（LLM 非流式可能较慢，勿设过小） |
+| `TEST_TIMEOUT` | `45s` | WebUI 渠道/key 测试的整体超时（默认低于常见反代 60s，避免测试被反代掐断成 504） |
 | `REQ_LOG_SIZE` | `1000` | 请求日志环形缓冲容量 |
 | `USAGE_DB_PATH` | `${DATA_DIR}/usage.db` | 用量 SQLite 路径（空 = 纯内存） |
 | `USAGE_RETENTION_DAYS` | `30` | 用量保留天数 |

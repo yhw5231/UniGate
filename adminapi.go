@@ -450,12 +450,29 @@ type testResult struct {
 	LatencyMS int64  `json:"latency_ms"`
 	Snippet   string `json:"snippet,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// Rotated 非空 = 网络失败自动换 IP 后重试，本条是重试结果（Prior 为首次结果）
+	Rotated bool        `json:"rotated,omitempty"`
+	Prior   *testResult `json:"-"`
 }
 
 // runTestOnce 用指定渠道 key 发一条最小测试请求（与客户端直连形态一致：
 // 不带 max_tokens，标准 chat 请求体；responses 渠道由 doUpstreamRequest 自动转换）。
 // 每次测试（含失败）都会写入请求记录，user 为发起测试的管理员。
 func runTestOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user string) testResult {
+	res := testOnce(ctx, ch, k, model, msg, user)
+	// 网络层失败（Status=0）且配置了「网络失败自动换 IP」时换 IP 重试一次，
+	// 与网关真实转发语义一致（配置错误导致的失败不换，直接返回）
+	if res.Status == 0 && k.Proxy != nil && k.Proxy.Kind == "ipv6pool" && k.Proxy.RotateOnNetErr {
+		rotateOnNetErr(&candidate{ch: ch, k: k})
+		res2 := testOnce(ctx, ch, k, model, msg, user)
+		res2.Rotated = true
+		res2.Prior = &res
+		return res2
+	}
+	return res
+}
+
+func testOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user string) testResult {
 	res := testResult{ChannelID: ch.ID, Channel: ch.Name, KeyID: k.ID, Key: k.Name, Model: model}
 	reqBody, _ := json.Marshal(map[string]any{
 		"model":    model,
@@ -467,7 +484,8 @@ func runTestOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user st
 	begin := time.Now()
 	var bytesOut int64
 	defer func() { recordTestRequest(begin, target, user, ch.Name, k.Name, model, res, bytesOut) }()
-	route, err := resolveProxy(&cand)
+	// 测试链路带探测：池 SOCKS 出口不可达时秒级返回可读错误（真实转发不受影响）
+	route, err := resolveProxyOpts(&cand, true)
 	if err != nil {
 		res.Error = "proxy resolve failed: " + err.Error()
 		return res
@@ -596,7 +614,7 @@ func handleAdminTestKey(w http.ResponseWriter, r *http.Request) {
 	if msg == "" {
 		msg = "ping"
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), cfg.TestTimeout)
 	defer cancel()
 	writeJSON(w, http.StatusOK, runTestOnce(ctx, ch, k, model, msg, adminUserFrom(r.Context())))
 }
@@ -643,7 +661,7 @@ func handleAdminTestModel(w http.ResponseWriter, r *http.Request) {
 	results := make([]testResult, 0, len(keys)*len(models))
 	for _, m := range models {
 		for _, k := range keys {
-			ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+			ctx, cancel := context.WithTimeout(r.Context(), cfg.TestTimeout)
 			res := runTestOnce(ctx, ch, k, m, "ping", adminUserFrom(r.Context()))
 			cancel()
 			results = append(results, res)

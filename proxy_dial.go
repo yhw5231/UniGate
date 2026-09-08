@@ -61,6 +61,31 @@ func (r *ProxyRoute) key() string {
 	return r.Kind + "://" + r.User + "@" + r.Addr
 }
 
+// AddrHost 返回 Addr 的 host 部分（IPv6 字面量去掉方括号）。
+func (r *ProxyRoute) AddrHost() string {
+	if r == nil {
+		return ""
+	}
+	h, _, err := net.SplitHostPort(r.Addr)
+	if err != nil {
+		return strings.Trim(r.Addr, "[]")
+	}
+	return h
+}
+
+// AddrPort 返回 Addr 的端口部分（解析失败为 0）。
+func (r *ProxyRoute) AddrPort() int {
+	if r == nil {
+		return 0
+	}
+	_, p, err := net.SplitHostPort(r.Addr)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(p)
+	return n
+}
+
 // describe 返回可读描述（脱敏密码）。
 func (r *ProxyRoute) describe() string {
 	if r == nil || r.Kind == "none" {

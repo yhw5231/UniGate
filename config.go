@@ -43,6 +43,9 @@ type Config struct {
 	// 上游传输
 	UpstreamHeaderTimeout time.Duration
 
+	// 测试
+	TestTimeout time.Duration // 渠道/key 测试端点的整体超时（默认 45s，低于常见反代 60s）
+
 	// 可观察性
 	ReqLogSize         int
 	UsageDBPath        string
@@ -129,6 +132,8 @@ func loadConfig() Config {
 		NetErrCooldown:    durationEnv("NET_ERR_COOLDOWN", 15*time.Second),
 
 		UpstreamHeaderTimeout: durationEnv("UPSTREAM_HEADER_TIMEOUT", 10*time.Minute),
+
+		TestTimeout: durationEnv("TEST_TIMEOUT", 45*time.Second),
 
 		ReqLogSize:         intEnv("REQ_LOG_SIZE", 1000),
 		UsageDBPath:        usageDBPath,

@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func adminToken(t *testing.T) string {
@@ -601,9 +603,9 @@ func TestAdminTestKeyInlineChannel(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	var out struct {
-		OK    bool   `json:"ok"`
-		Status int   `json:"status"`
-		Proxy string `json:"proxy"`
+		OK     bool   `json:"ok"`
+		Status int    `json:"status"`
+		Proxy  string `json:"proxy"`
 	}
 	_ = json.Unmarshal(rr.Body.Bytes(), &out)
 	if !out.OK || out.Status != 200 || out.Proxy != "direct" {
@@ -689,5 +691,64 @@ func TestAdminTestKeyInlineIPv6Pool(t *testing.T) {
 	pool.mu.Unlock()
 	if !ok {
 		t.Fatalf("expected gw-preview lease on pool, leases: %v", pool.leases)
+	}
+}
+
+// TestAdminTestKeyDeadSocksFastFail：渠道编辑页「测试」的池 SOCKS 出口挂死
+// （accept 后不响应）时，测试须秒级失败并给出可读错误，而不是挂到整体超时
+// （WebUI 长时间无响应，经反代时被判定 504）。
+func TestAdminTestKeyDeadSocksFastFail(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"pong"}}]}`)
+	_, poolSrv := startFakePool(t) // 池管理端正常（模拟「代理池页测试可用」）
+
+	// 挂死的"SOCKS"端口：accept 后不读不回
+	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { deadLn.Close() })
+	go func() {
+		for {
+			c, err := deadLn.Accept()
+			if err != nil {
+				return
+			}
+			_ = c // 永不响应
+		}
+	}()
+	deadAddr := deadLn.Addr().String()
+
+	p := &ProxyPool{Name: "p", PoolURL: poolSrv.URL, SocksHost: deadAddr}
+	if err := store.PutProxyPool(p); err != nil {
+		t.Fatalf("PutProxyPool: %v", err)
+	}
+
+	inline := `{"channel":{"name":"ch","base_url":"` + up.URL + `","enabled":true,
+		"keys":[{"name":"k1","api_key":"sk-1","enabled":true,
+			"proxy":{"kind":"ipv6pool","pool_id":"` + p.ID + `"}}]},"model":"m1"}`
+	start := time.Now()
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/testkey", inline, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if out.OK {
+		t.Fatal("dead socks test must fail")
+	}
+	if !strings.Contains(out.Error, "socks proxy") {
+		t.Fatalf("expected readable socks error, got: %q", out.Error)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("test must fail fast on dead socks, took %v", d)
+	}
+	if up.count() != 0 {
+		t.Fatalf("upstream must not be reached via dead socks, calls=%d", up.count())
 	}
 }

@@ -87,7 +87,12 @@ func buildCandidates(model string) []candidate {
 }
 
 // resolveProxy 解析候选的代理路由（ipv6pool 懒解析：首次用时向池申请租约并缓存）。
+// probe=true 时对池 SOCKS 出口做快速可达性探测（测试链路用，快速失败给可读错误）。
 func resolveProxy(cand *candidate) (*ProxyRoute, error) {
+	return resolveProxyOpts(cand, false)
+}
+
+func resolveProxyOpts(cand *candidate, probe bool) (*ProxyRoute, error) {
 	spec := cand.k.Proxy
 	if spec == nil || spec.Kind == "" {
 		return nil, nil
@@ -98,6 +103,9 @@ func resolveProxy(cand *candidate) (*ProxyRoute, error) {
 	case "ipv6pool":
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		if probe {
+			return leaseMgr.EnsureProbed(ctx, spec, cand.k.ID, proxyGroup(cand.ch, cand.k))
+		}
 		return leaseMgr.Ensure(ctx, spec, cand.k.ID, proxyGroup(cand.ch, cand.k))
 	default:
 		return nil, nil

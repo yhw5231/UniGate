@@ -5,10 +5,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -440,5 +444,109 @@ func TestNonShareKeysStayDedicated(t *testing.T) {
 	f.mu.Unlock()
 	if n != 2 {
 		t.Fatalf("expected 2 leases, got %d", n)
+	}
+}
+
+// TestSocksAddr 归一化：完整 host:port、裸 host、IPv6 字面量（带/不带方括号）。
+func TestSocksAddr(t *testing.T) {
+	cases := []struct {
+		host string
+		port int
+		want string
+	}{
+		{"127.0.0.1:19109", 1080, "127.0.0.1:19109"}, // socks_host 带端口时覆盖
+		{"127.0.0.1", 1080, "127.0.0.1:1080"},
+		{"2001:db8::1", 1080, "[2001:db8::1]:1080"},
+		{"[2001:db8::1]", 1080, "[2001:db8::1]:1080"},
+	}
+	for _, c := range cases {
+		if got := socksAddr(c.host, c.port); got != c.want {
+			t.Errorf("socksAddr(%q,%d) = %q, want %q", c.host, c.port, got, c.want)
+		}
+	}
+}
+
+// TestProbeSocksReachable：活的 SOCKS5（真实握手回方法）通过；accept 后不响应
+// 的挂死端口 5s 内报错；连接拒绝立刻报错。
+func TestProbeSocksReachable(t *testing.T) {
+	// 活的 SOCKS5：模拟 greeting → 返回方法选择
+	okLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer okLn.Close()
+	go func() {
+		for {
+			c, err := okLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 3)
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				c.Write([]byte{0x05, 0x00}) // method 选择回复
+			}(c)
+		}
+	}()
+	host, portStr, _ := net.SplitHostPort(okLn.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+	if err := probeSocksReachable(host, port); err != nil {
+		t.Fatalf("alive socks should pass probe: %v", err)
+	}
+
+	// 挂死端口：accept 后不读不回
+	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deadLn.Close()
+	go func() {
+		for {
+			c, err := deadLn.Accept()
+			if err != nil {
+				return
+			}
+			_ = c // 保持连接但永不响应
+		}
+	}()
+	host2, portStr2, _ := net.SplitHostPort(deadLn.Addr().String())
+	port2, _ := strconv.Atoi(portStr2)
+	start := time.Now()
+	err = probeSocksReachable(host2, port2)
+	if err == nil {
+		t.Fatal("hung socks must fail probe")
+	}
+	if d := time.Since(start); d > 8*time.Second {
+		t.Fatalf("probe should fail fast (~5s), took %v", d)
+	}
+
+	// 连接拒绝
+	if err := probeSocksReachable("127.0.0.1", 1); err == nil {
+		t.Fatal("refused port must fail probe")
+	}
+
+	// 信息不全时跳过
+	if err := probeSocksReachable("", 0); err != nil {
+		t.Fatalf("empty host/port must skip probe: %v", err)
+	}
+}
+
+// TestEnsureProbed：探测通过的路由与 Ensure 一致（复用 fake socks + fake pool）。
+func TestEnsureProbed(t *testing.T) {
+	f, srv := startFakePool(t)
+	socksAddr := startFakeSocks5(t)
+	socksPort, _ := strconv.Atoi(socksAddr[strings.LastIndex(socksAddr, ":")+1:])
+	f.portOverride = socksPort
+	spec := &ProxySpec{Kind: "ipv6pool", PoolURL: srv.URL,
+		SocksHost: socksAddr[:strings.LastIndex(socksAddr, ":")]}
+	route, err := leaseMgr.EnsureProbed(context.Background(), spec, "P1", "https://x/v1")
+	if err != nil {
+		t.Fatalf("EnsureProbed: %v", err)
+	}
+	if route.Kind != "socks5" {
+		t.Fatalf("expected socks5 route, got %q", route.Kind)
 	}
 }

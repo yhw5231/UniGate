@@ -82,6 +82,14 @@ type ProxySpec struct {
 	RotateRequests  int   `json:"rotate_requests,omitempty"`     // 每 N 次请求自动换 IP（0 关闭）
 }
 
+// GetRotateStatuses 返回状态码换 IP 清单（nil 安全）。
+func (p *ProxySpec) GetRotateStatuses() []int {
+	if p == nil {
+		return nil
+	}
+	return p.RotateStatuses
+}
+
 // normalize 清理代理配置并校验。
 func (p *ProxySpec) normalize() error {
 	if p == nil {

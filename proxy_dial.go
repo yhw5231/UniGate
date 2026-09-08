@@ -170,17 +170,18 @@ func (c *bufConn) ReadByte() (byte, error) {
 }
 
 // socksReplyText 把 SOCKS5 CONNECT 应答 rep 码翻成可读原因（RFC 1928），
-// 供日志/错误信息直接定位代理池问题。
+// 供日志/错误信息直接定位代理池问题。注意：出口是 IPv6-only（代理池绑定
+// 租约 IPv6 作源地址），0x03/0x04 常见原因是目标无 AAAA 记录或解析被污染。
 func socksReplyText(rep byte) string {
 	switch rep {
 	case 0x01:
-		return "general SOCKS server failure"
+		return "general SOCKS server failure (代理内部错误)"
 	case 0x02:
 		return "connection not allowed by ruleset"
 	case 0x03:
-		return "network unreachable"
+		return "network unreachable (出口不可达：目标无 IPv6/路由不可达)"
 	case 0x04:
-		return "host unreachable"
+		return "host unreachable (目标不可达：域名解析失败)"
 	case 0x05:
 		return "connection refused by upstream (出口被拒)"
 	case 0x06:

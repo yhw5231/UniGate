@@ -522,7 +522,11 @@ func runTestOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user st
 		rotateOnNetErr(&candidate{ch: ch, k: k})
 		res2 := testOnce(ctx, ch, k, model, msg, user)
 		res2.Rotated = true
-		res2.Prior = &res
+		// Prior 必须指向首次结果的独立副本：直接 &res 会取到随后被 res=res2
+		// 覆盖的同一变量地址，结构体自引用成环，json.Marshal 直接失败
+		//（表现为 WebUI 测试报 "marshal failed"）。
+		first := res
+		res2.Prior = &first
 		res = res2
 	}
 	if res.OK {

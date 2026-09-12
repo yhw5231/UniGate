@@ -144,13 +144,21 @@ func isPoolKey(cand *candidate) bool {
 	return spec != nil && spec.Kind == "ipv6pool"
 }
 
-// applyChannelHeaders 把渠道级自定义头写入请求（头名原样保留，空值跳过）。
-func applyChannelHeaders(h http.Header, headers map[string]string) {
+// applyCustomHeaders 把渠道级自定义头写入上游请求：同名覆盖、无同名新增，
+// 空值跳过。头名统一经 http.Header.Set 规范化——直接写 map 会保留原始大小写，
+// 非规范名与网关自身设置的规范名并存成重复头（而非覆盖），HTTP/2 上游还会
+// 因头名含大写被拒。Host 是特例：它不由头表下发（HTTP/1 由 req.Host 决定，
+// HTTP/2 走 :authority），配置同名头时转入 req.Host 生效。
+func applyCustomHeaders(req *http.Request, headers map[string]string) {
 	for name, value := range headers {
-		if value == "" {
+		if name == "" || value == "" {
 			continue
 		}
-		h[name] = []string{value}
+		req.Header.Set(name, value)
+	}
+	if host := req.Header.Get("Host"); host != "" {
+		req.Host = host
+		req.Header.Del("Host")
 	}
 }
 
@@ -310,6 +318,12 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 
 		// 成功拿到可透传的响应：改写（可选）后回给下游
 		leaseMgr.RecordUse(cand.k.effectiveProxy(cand.ch), cand.k.ID)
+		if resp.StatusCode >= 400 {
+			// 上游 4xx/5xx 业务错误原样透传，但把响应体片段记入请求日志：
+			// 不记的话错误日志只有 "Bad Request" 状态文本，回答不了
+			//「上游为什么 400/404」（无效 key、模型不存在等具体原因）。
+			peekUpstreamError(r, resp)
+		}
 		serveUpstreamResponse(w, resp, stream, cand.ch.Rewrite, cand.ch.EndpointType)
 		served = &cand
 		break
@@ -431,9 +445,24 @@ func rejectReason(resp *http.Response) string {
 	return fmt.Sprintf("%d: %s", resp.StatusCode, truncate(s, 200))
 }
 
+// peekUpstreamError 预读上游错误响应（透传分支）开头一段响应体，作为失败
+// 原因写入请求日志；预读的字节重新拼回 Body，透传给下游的内容不受影响。
+func peekUpstreamError(r *http.Request, resp *http.Response) {
+	prefix, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if len(prefix) == 0 {
+		return
+	}
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(prefix), resp.Body), resp.Body}
+	setReqErrMsg(r, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(strings.TrimSpace(string(prefix)), 200)))
+}
+
 // doUpstreamRequest 构造并发送上游请求：注入渠道头 + Bearer key，
 // 透传下游的 UA/Accept（无则按流式/非流式给默认值），保证请求与标准
-// OpenAI 客户端直连形态一致。
+// OpenAI 客户端直连形态一致。渠道自定义头最后写入：同名覆盖网关默认头
+//（含 Authorization / Content-Type / UA / Accept），无同名新增。
 // 渠道端点类型为 responses 时，先把 chat/completions 请求体转换为 Responses API 格式。
 func doUpstreamRequest(ctx context.Context, client *http.Client, cand *candidate, rawBody []byte, stream bool, srcHeader http.Header) (*http.Response, error) {
 	body := rawBody
@@ -462,6 +491,6 @@ func doUpstreamRequest(ctx context.Context, client *http.Client, cand *candidate
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	applyChannelHeaders(req.Header, cand.ch.Headers)
+	applyCustomHeaders(req, cand.ch.Headers)
 	return client.Do(req)
 }

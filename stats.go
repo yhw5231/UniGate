@@ -4,6 +4,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"sort"
@@ -11,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ---- 请求记录 ----
@@ -77,6 +81,15 @@ func (l *RequestLog) count() int {
 		return l.n
 	}
 	return l.cap
+}
+
+// Clear 清空全部记录（管理员在 WebUI 手动清空日志用）。重新分配底层数组，
+// 顺带释放已存错误信息（单条可达 8KB）的内存引用。
+func (l *RequestLog) Clear() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.recs = make([]RequestRecord, l.cap)
+	l.next, l.n = 0, 0
 }
 
 // Query 分页返回记录（最新在前；page 从 1 起，越界返回空页）。
@@ -299,12 +312,37 @@ func clientIP(r *http.Request) string {
 }
 
 // maskKey 脱敏 key：sk-12345678abcd -> sk-12****abcd；过短整体打码。
+// 掩码常作用于 "名称@渠道"（中文名称），必须按 rune 边界截取——按字节切
+// 会把 UTF-8 字符拦腰斩断，日志里出现「导�****b.ai」式的乱码。
 func maskKey(key string) string {
 	const mask = "****"
 	if len(key) <= 8 {
 		return mask
 	}
-	return key[:4] + mask + key[len(key)-4:]
+	return maskPrefix(key, 4) + mask + maskSuffix(key, 4)
+}
+
+// maskPrefix 取前 n 字节，越界回退到 rune 起点。
+func maskPrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// maskSuffix 取后 n 字节，越界推进到 rune 起点。
+func maskSuffix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := len(s) - n
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut++
+	}
+	return s[cut:]
 }
 
 // statsMiddleware 包裹任意 handler：为请求注入 reqStats 上下文与 responseRecorder；
@@ -495,4 +533,34 @@ func handleAdminErrors(w http.ResponseWriter, r *http.Request) {
 		"total_pages": (total + pageSize - 1) / pageSize,
 		"records":     recs,
 	})
+}
+
+// handleAdminClearLogs 清空请求日志/错误日志：body {"scope":"requests"|"errors"|"all"}，
+// scope 省略默认 all。只清内存环形缓冲，不影响用量统计与用库记录。
+func handleAdminClearLogs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Scope string `json:"scope"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
+			return
+		}
+	}
+	cleared := body.Scope
+	switch body.Scope {
+	case "", "all":
+		reqLog.Clear()
+		errLog.Clear()
+		cleared = "all"
+	case "requests":
+		reqLog.Clear()
+	case "errors":
+		errLog.Clear()
+	default:
+		writeJSONError(w, http.StatusBadRequest, "scope must be requests / errors / all", "bad_request")
+		return
+	}
+	log.Printf("admin cleared logs: scope=%s", cleared)
+	writeJSON(w, http.StatusOK, map[string]any{"cleared": cleared})
 }

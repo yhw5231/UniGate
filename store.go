@@ -571,7 +571,27 @@ func normalizeUpKey(k *UpKey) error {
 	k.Name = strings.TrimSpace(k.Name)
 	k.APIKey = strings.TrimSpace(k.APIKey)
 	k.BaseURL = strings.TrimSpace(k.BaseURL)
+	if k.APIKey != "" {
+		if err := validateAPIKey(k.APIKey); err != nil {
+			return err
+		}
+	}
 	return k.Proxy.normalize()
+}
+
+// validateAPIKey 拒绝明显损坏的上游 key：内部空白/控制字符、非 ASCII 字符
+// （全角符号、中文、零宽字符——多为复制粘贴带入且肉眼不可见）。这类 key
+// 保存后必然在上游鉴权失败（表现为网关日志里上游 400/401），必须在保存时拦下。
+func validateAPIKey(key string) error {
+	for i, r := range key {
+		switch {
+		case r <= 0x20 || r == 0x7F:
+			return fmt.Errorf("api_key contains whitespace/control character at position %d", i)
+		case r > 0x7E:
+			return fmt.Errorf("api_key contains non-ASCII character %q at position %d (paste corruption?)", r, i)
+		}
+	}
+	return nil
 }
 
 // DeleteChannel 删除渠道。

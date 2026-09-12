@@ -79,6 +79,29 @@ func TestStoreChannelValidation(t *testing.T) {
 	}
 }
 
+// TestStoreAPIKeyValidation：明显损坏的 key（内部空白/控制字符/非 ASCII——
+// 多为复制粘贴带入）在保存时拒绝，不给上游 400/401 的机会。
+func TestStoreAPIKeyValidation(t *testing.T) {
+	s := newTestStore(t)
+	for _, bad := range []string{"sk-abc 123", "sk-abc\t123", "sk-abc：123", "导入key1", "sk-abc\u200B123"} {
+		ch := &Channel{Name: "x", BaseURL: "http://x", Keys: []*UpKey{{Name: "k", APIKey: bad, Enabled: true}}}
+		if err := s.PutChannel(ch); err == nil {
+			t.Fatalf("api_key %q should be rejected", bad)
+		}
+	}
+	// 合法 key（纯 ASCII 可打印）与空 key（免鉴权渠道）正常保存
+	for _, ok := range []string{"sk-abc123-_=+/~.", "trailing:punct:"} {
+		ch := &Channel{Name: "x", BaseURL: "http://x", Keys: []*UpKey{{Name: "k", APIKey: ok, Enabled: true}}}
+		if err := s.PutChannel(ch); err != nil {
+			t.Fatalf("api_key %q should pass: %v", ok, err)
+		}
+	}
+	ch := &Channel{Name: "x", BaseURL: "http://x", Keys: []*UpKey{{Name: "k", Enabled: true}}}
+	if err := s.PutChannel(ch); err != nil {
+		t.Fatalf("empty api_key should pass: %v", err)
+	}
+}
+
 func TestStoreUpdateAndDelete(t *testing.T) {
 	s := newTestStore(t)
 	ch := &Channel{Name: "a", BaseURL: "http://a", Enabled: true, Keys: []*UpKey{{Name: "k1", Enabled: true}}}

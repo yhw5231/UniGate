@@ -34,6 +34,7 @@ func adminAPIHandler() http.Handler {
 	mux.HandleFunc("POST /admin/api/channels/{id}/fetch-models", handleAdminFetchModels)
 	mux.HandleFunc("GET /admin/api/requests", handleAdminRequests)
 	mux.HandleFunc("GET /admin/api/errors", handleAdminErrors)
+	mux.HandleFunc("POST /admin/api/logs/clear", handleAdminClearLogs)
 	mux.HandleFunc("GET /admin/api/usage", handleAdminUsage)
 	mux.HandleFunc("PUT /admin/api/settings", handleAdminPutSettings)
 

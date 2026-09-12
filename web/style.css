@@ -70,6 +70,29 @@ textarea { resize: vertical; }
 .tbl th { color: var(--muted); font-weight: 600; background: var(--panel2); }
 .tbl tr:last-child td { border-bottom: none; }
 
+/* 请求/错误日志表：固定列布局——窄列固定宽度并单行截断（悬停 title 看全文），
+   错误列占满剩余宽度，内容限高滚动，避免长错误轨迹把行撑得异常高；
+   窗口过窄时表格横向滚动，不压缩列宽 */
+.tbl-scroll { overflow-x: auto; }
+.tbl.logtbl { table-layout: fixed; min-width: 1020px; }
+.tbl.logtbl th, .tbl.logtbl td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tbl.logtbl col.c-time { width: 100px; }
+.tbl.logtbl col.c-path { width: 128px; }
+.tbl.logtbl col.c-status { width: 52px; }
+.tbl.logtbl col.c-dur { width: 60px; }
+.tbl.logtbl col.c-chan { width: 92px; }
+.tbl.logtbl col.c-key { width: 92px; }
+.tbl.logtbl col.c-model { width: 132px; }
+.tbl.logtbl col.c-tok { width: 100px; }
+.tbl.logtbl col.c-user { width: 80px; }
+.tbl.logtbl col.c-ip { width: 100px; }
+.tbl.logtbl td.err {
+  display: table-cell; max-width: none;
+  white-space: pre-wrap; word-break: break-all; text-overflow: clip;
+}
+.tbl.logtbl .errwrap { max-height: 88px; overflow-y: auto; }
+.tbl.logtbl td[colspan] { white-space: normal; text-overflow: clip; }
+
 /* 登录 */
 .login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
 .login-card {

@@ -375,6 +375,85 @@ func newUpstreamStream(t *testing.T, sse string) *httptest.Server {
 	return srv
 }
 
+// TestChannelHeadersOverwriteAndAdd：渠道自定义头同名覆盖、无同名新增。
+// 头名不区分大小写（小写/混排也要真正覆盖网关注入的同名头，且不产生重复头），
+// 空值跳过；Host 同名头转入 req.Host（头表里的 Host 本身不会上线）。
+func TestChannelHeadersOverwriteAndAdd(t *testing.T) {
+	setupGateway(t)
+	var mu sync.Mutex
+	var got http.Header
+	var gotHost string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got, gotHost = r.Header.Clone(), r.Host
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	t.Cleanup(up.Close)
+
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Headers: map[string]string{
+			"authorization": "Bearer from-headers", // 同名覆盖网关注入的 Bearer key；头名小写也必须生效且不重复
+			"x-api-key":     "v123",                // 无同名新增（服务端会规范化为 X-Api-Key）
+			"user-agent":    "custom-ua",           // 覆盖透传的下游 UA
+			"X-Empty":       "",                    // 空值跳过
+		},
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-real", Enabled: true}}})
+
+	req := chatRequest("m1")
+	req.Header.Set("User-Agent", "downstream-ua")
+	rr := httptest.NewRecorder()
+	forwardChat(rr, req, nil, false, "m1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	mu.Lock()
+	auth := got.Values("Authorization")
+	apiKey := got.Get("X-Api-Key")
+	ua := got.Values("User-Agent")
+	empty := got.Get("X-Empty")
+	host1 := gotHost
+	mu.Unlock()
+	if len(auth) != 1 || auth[0] != "Bearer from-headers" {
+		t.Fatalf("Authorization = %v, want exactly [Bearer from-headers] (no duplicates)", auth)
+	}
+	if apiKey != "v123" {
+		t.Fatalf("X-Api-Key = %q, want v123", apiKey)
+	}
+	if len(ua) != 1 || ua[0] != "custom-ua" {
+		t.Fatalf("User-Agent = %v, want exactly [custom-ua]", ua)
+	}
+	if empty != "" {
+		t.Fatalf("X-Empty = %q, want absent", empty)
+	}
+	if want := strings.TrimPrefix(up.URL, "http://"); host1 != want {
+		t.Fatalf("Host = %q, want unchanged %q", host1, want)
+	}
+
+	// Host 覆盖：同名头转入 req.Host（先停用渠道 c，让请求路由到 c2）
+	snap := store.Snapshot()
+	c1 := snap.Channels[0]
+	c1.Enabled = false
+	_ = store.PutChannel(c1)
+	mustPutChannel(t, &Channel{Name: "c2", BaseURL: up.URL, Enabled: true,
+		Headers: map[string]string{"Host": "upstream.example"},
+		Keys:    []*UpKey{{Name: "k2", APIKey: "sk-2", Enabled: true}}})
+	req2 := chatRequest("m1")
+	rr2 := httptest.NewRecorder()
+	forwardChat(rr2, req2, nil, false, "m1")
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("c2 status=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+	mu.Lock()
+	host2 := gotHost
+	mu.Unlock()
+	if host2 != "upstream.example" {
+		t.Fatalf("Host = %q, want upstream.example", host2)
+	}
+}
+
 // ---- ipv6pool 联动：真实 SOCKS5 stub + fake pool ----
 
 func TestIPv6PoolProxyRouting(t *testing.T) {
@@ -833,6 +912,37 @@ func TestFailureMessageCarriesUpstreamDetail(t *testing.T) {
 	for _, want := range []string{"500", "quota exceeded for org", "1 attempted"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("502 body missing %q: %s", want, body)
+		}
+	}
+}
+
+// TestUpstream400PassthroughLogsSnippet：上游 4xx 业务错误原样透传（状态码与
+// 响应体不动），同时把响应体片段记入错误日志——否则错误日志只有 "Bad Request"
+// 状态文本，回答不了「上游为什么 400」（坏 key 被上游拒绝的典型现场）。
+func TestUpstream400PassthroughLogsSnippet(t *testing.T) {
+	setupGateway(t)
+	initStats()
+	up := newUpstream(t, http.StatusBadRequest, `{"error":{"message":"Invalid API key provided","type":"invalid_request_error"}}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-bad", Enabled: true}}})
+
+	rr := httptest.NewRecorder()
+	// 走完整 statsMiddleware 链路：errMsg 只在 statsServe 收尾时进错误日志
+	statsMiddleware(gatewayChat)(rr, chatRequest("m1"))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400 (passthrough), body=%s", rr.Code, rr.Body.String())
+	}
+	// 预读片段重新拼回 Body，透传内容必须完整（不能被预读截掉开头）
+	if !strings.Contains(rr.Body.String(), "Invalid API key provided") {
+		t.Fatalf("downstream body truncated: %q", rr.Body.String())
+	}
+	recs := errLog.Snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("errLog has %d records, want 1", len(recs))
+	}
+	for _, want := range []string{"upstream 400", "Invalid API key provided"} {
+		if !strings.Contains(recs[0].ErrMsg, want) {
+			t.Fatalf("errLog error missing %q: %q", want, recs[0].ErrMsg)
 		}
 	}
 }

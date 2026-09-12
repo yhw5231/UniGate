@@ -83,6 +83,28 @@ func TestErrorLogSeparateRecording(t *testing.T) {
 	}
 }
 
+// TestRequestLogClear：Clear 清空主/错误日志，清空后环形缓冲继续正常写入。
+func TestRequestLogClear(t *testing.T) {
+	setupGateway(t)
+	initStats()
+
+	recordRequest(RequestRecord{ID: "ok1", Status: 200})
+	recordRequest(RequestRecord{ID: "bad1", Status: 502, ErrMsg: "boom"})
+	reqLog.Clear()
+	errLog.Clear()
+	if got := reqLog.Snapshot(); len(got) != 0 {
+		t.Fatalf("reqLog after clear = %d records, want 0", len(got))
+	}
+	if got := errLog.Snapshot(); len(got) != 0 {
+		t.Fatalf("errLog after clear = %d records, want 0", len(got))
+	}
+	recordRequest(RequestRecord{ID: "ok2", Status: 200})
+	recs := reqLog.Snapshot()
+	if len(recs) != 1 || recs[0].ID != "ok2" {
+		t.Fatalf("after clear add: %+v", recs)
+	}
+}
+
 func TestUsageStatsRecord(t *testing.T) {
 	s := newUsageStats()
 	now := time.Now()
@@ -110,6 +132,13 @@ func TestMaskKey(t *testing.T) {
 	}
 	if maskKey("short") != "****" {
 		t.Fatalf("got %q", maskKey("short"))
+	}
+	// 中文名称按 rune 边界截取：按字节切会把 UTF-8 字符斩成乱码（导�****b.ai）
+	if got, want := maskKey("导入key1@b.ai"), "导****b.ai"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if got, want := maskKey("测试渠道名称@channel"), "测****nnel"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 

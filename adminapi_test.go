@@ -472,6 +472,52 @@ func TestAdminRequestsPaginationAndErrors(t *testing.T) {
 	}
 }
 
+// TestAdminClearLogs：清空日志端点（scope 校验、按需清空请求/错误日志、未授权拒绝）。
+func TestAdminClearLogs(t *testing.T) {
+	setupGateway(t)
+	initStats()
+	tok := adminToken(t)
+	recordRequest(RequestRecord{ID: "ok1", Status: 200})
+	recordRequest(RequestRecord{ID: "bad1", Status: 502, ErrMsg: "boom"})
+
+	// 非法 scope
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/logs/clear", `{"scope":"nope"}`, tok))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid scope: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	// scope=requests 只清请求日志
+	rr = httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/logs/clear", `{"scope":"requests"}`, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("clear requests: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if got := reqLog.Snapshot(); len(got) != 0 {
+		t.Fatalf("reqLog after clear = %d, want 0", len(got))
+	}
+	if got := errLog.Snapshot(); len(got) != 1 || got[0].ID != "bad1" {
+		t.Fatalf("errLog must be kept: %+v", got)
+	}
+
+	// scope 省略默认清全部
+	rr = httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/logs/clear", `{}`, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("clear all: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if got := errLog.Snapshot(); len(got) != 0 {
+		t.Fatalf("errLog after clear all = %d, want 0", len(got))
+	}
+
+	// 未授权
+	rr = httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/logs/clear", `{}`, ""))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("clear without token: status=%d want 401", rr.Code)
+	}
+}
+
 // TestAdminClearCooling：手动解除 key 冷却（key 级 + 按 (key, model) 级全部清除），
 // 解除后网关立即恢复该 key 的路由。
 func TestAdminClearCooling(t *testing.T) {

@@ -606,34 +606,75 @@ function keyBlock(k, inheritInfo) {
 }
 $("#addKeyBtn").addEventListener("click", () => $("#chKeys").appendChild(keyBlock({ name: "", api_key: "", enabled: true }, keyInheritInfo({}))));
 
-// ---- key 批量导入：每行一个，支持 "key" 或 "名称|key"（也兼容 "名称:key"），# 开头为注释 ----
+// ---- key 批量导入：每行一个，支持 "key"、"名称|key"（也兼容 "名称:key"、
+// "key|备注"——名称取不像 key 的那一侧），# 开头为注释 ----
 const BULK_NAME = "导入key";
+// cleanKeyText 清理复制粘贴带入的杂质：零宽字符（肉眼不可见、trim 去不掉，
+// 存进 key 后上游必然鉴权失败）、首尾成对引号（从 JSON/代码里复制）。
+function cleanKeyText(s) {
+  return s.replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "").trim()
+    .replace(/^["'`“”‘’]+/, "").replace(/["'`“”‘’]+$/, "").trim();
+}
+// keyHasJunk key 里出现即必然损坏的字符：空白（含全角空格）或非 ASCII 可打印
+// 字符。与后端 validateAPIKey 对齐，导入时拦下并在提示里指明行号。
+function keyHasJunk(s) { return /\s/.test(s) || /[^\x21-\x7E]/.test(s); }
+// looksLikeKey 粗判一段文本像不像 API key（纯 ASCII 可打印、无空白、够长）。
+// 仅用于分隔歧义时判断哪侧是 key（如 "sk-xxx|备注" 的 key 在前）。
+function looksLikeKey(s) { return /^[\x21-\x7E]{6,}$/.test(s); }
 $("#toggleBulkBtn").addEventListener("click", () => {
   const box = $("#bulkImportBox");
   box.classList.toggle("hidden");
   if (!box.classList.contains("hidden")) $("#bulkKeysInput").focus();
 });
 $("#bulkImportBtn").addEventListener("click", () => {
-  const lines = $("#bulkKeysInput").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  const rawLines = $("#bulkKeysInput").value.split("\n");
   let imported = 0;
-  for (const line of lines) {
-    if (line.startsWith("#")) continue;
-    let name = "", key = line;
-    // 用分隔符切分名称与 key（允许分隔符两侧空白；key 本身不含 | 或 :）
-    const m = line.match(/^(.+?)\s*[|:]\s*(\S+)$/);
-    if (m) { name = m[1].trim(); key = m[2].trim(); }
-    if (!key) continue;
+  const bad = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = cleanKeyText(rawLines[i]);
+    if (!line || line.startsWith("#")) continue;
+    // 全角分隔符与 Excel 复制的制表符归一成 "|" 再切名称
+    const norm = line.replace(/：/g, ":").replace(/｜/g, "|").replace(/\t+/g, "|");
+    let name = "", key = norm;
+    const pipe = norm.indexOf("|");
+    const colonSp = norm.match(/^(.+?)\s*:\s+(\S+)$/); // "名称: key"（冒号后必须跟空白）
+    if (pipe >= 0) {
+      name = norm.slice(0, pipe).trim();
+      key = norm.slice(pipe + 1).trim();
+      // "sk-xxx|备注"：名称写在 key 后面时，两侧交换
+      if (looksLikeKey(name) && !looksLikeKey(key)) { const t = name; name = key; key = t; }
+    } else if (colonSp) {
+      name = colonSp[1].trim();
+      key = colonSp[2].trim();
+    } else {
+      const c = norm.lastIndexOf(":");
+      if (c > 0) {
+        const left = norm.slice(0, c).trim(), right = norm.slice(c + 1).trim();
+        // key 本身可能含 ":"（如 id:secret）：仅当左像名称、右像 key 才切，
+        // 否则整行视为 key——宁可保守不误切
+        if (!looksLikeKey(left) && looksLikeKey(right)) { name = left; key = right; }
+      }
+    }
+    // 尾随/开头残留的分隔符（"key：" 这类粘贴）不是 key 的一部分
+    key = cleanKeyText(key).replace(/^[|:]+|[|:]+$/g, "");
+    if (!key) { bad.push(`第 ${i + 1} 行没解析出 key`); continue; }
+    if (keyHasJunk(key)) { bad.push(`第 ${i + 1} 行 key 含空白或非 ASCII 字符（复制带入？）`); continue; }
     $("#chKeys").appendChild(keyBlock({
-      name: name || `${BULK_NAME}${imported + 1}`,
+      name: cleanKeyText(name) || `${BULK_NAME}${imported + 1}`,
       api_key: key,
       enabled: true,
     }));
     imported++;
   }
-  if (!imported) { toast("没有可导入的 key（每行一个，# 开头为注释）", true); return; }
+  const badMsg = bad.slice(0, 3).join("；") + (bad.length > 3 ? ` 等共 ${bad.length} 行` : "");
+  if (!imported) {
+    toast(bad.length ? `没有可导入的 key：${badMsg}` : "没有可导入的 key（每行一个，# 开头为注释）", true);
+    return;
+  }
   $("#bulkKeysInput").value = "";
   $("#bulkImportBox").classList.add("hidden");
-  toast(`已导入 ${imported} 个 key，请点「保存」写入配置`);
+  if (bad.length) toast(`已导入 ${imported} 个 key；${bad.length} 行有问题已跳过：${badMsg}`, true);
+  else toast(`已导入 ${imported} 个 key，请点「保存」写入配置`);
 });
 
 // 从上游拉取模型列表（用渠道 key 鉴权）：dry-run 只取候选清单，
@@ -700,7 +741,7 @@ function collectKeyForm(div) {
   const k = {
     id: div.dataset.keyId || "",
     name: div.querySelector(".kb-name").value.trim(),
-    api_key: div.querySelector(".kb-key").value.trim(),
+    api_key: cleanKeyText(div.querySelector(".kb-key").value),
     enabled: div.querySelector(".kb-enabled").checked,
     proxy: null,
   };
@@ -823,19 +864,26 @@ function renderLogRows(tbodySel, recs, emptyTip) {
     tbody.innerHTML = `<tr><td colspan="11" class="muted">${emptyTip}</td></tr>`;
     return;
   }
-  tbody.innerHTML = recs.map((r) => `<tr>
-      <td class="muted">${esc((r.time || "").replace("T", " ").slice(2, 19))}</td>
-      <td class="muted">${esc(r.path || "")}</td>
+  tbody.innerHTML = recs.map((r) => {
+    // 错误列：列内限高滚动（超长失败轨迹不撑高整行），悬停 title 看全文
+    const err = r.error || "";
+    const errCell = err
+      ? `<td class="err" title="${esc(err)}"><div class="errwrap">${esc(err)}</div></td>`
+      : `<td class="err"></td>`;
+    return `<tr>
+      <td class="muted" title="${esc(r.time || "")}">${esc((r.time || "").replace("T", " ").slice(2, 19))}</td>
+      <td class="muted" title="${esc(r.path || "")}">${esc(r.path || "")}</td>
       <td><span class="badge ${r.status && r.status < 400 ? "on" : "off"}">${r.status || "ERR"}</span></td>
       <td>${r.duration_ms}ms</td>
-      <td>${esc(r.channel || "")}</td>
-      <td>${esc(r.key || "")}</td>
-      <td>${esc(r.model || "")}</td>
+      <td title="${esc(r.channel || "")}">${esc(r.channel || "")}</td>
+      <td class="muted" title="${esc(r.key || "")}">${esc(r.key || "")}</td>
+      <td title="${esc(r.model || "")}">${esc(r.model || "")}</td>
       <td class="muted">${r.prompt_tokens || 0} / ${r.completion_tokens || 0}</td>
-      <td>${esc(r.user || "")}</td>
-      <td>${esc(r.client_ip || "")}</td>
-      <td class="err" style="white-space:pre-wrap;word-break:break-all;max-width:480px">${esc(r.error || "")}</td>
-    </tr>`).join("");
+      <td title="${esc(r.user || "")}">${esc(r.user || "")}</td>
+      <td title="${esc(r.client_ip || "")}">${esc(r.client_ip || "")}</td>
+      ${errCell}
+    </tr>`;
+  }).join("");
 }
 
 // fetchLogPage 拉取一页；当前页超出总页数时回退到最后一页重取一次
@@ -897,6 +945,19 @@ async function refreshErrors() {
   syncPagerBtns("errors", errsState);
 }
 wirePager("errors", errsState, refreshErrors);
+
+// 清空日志：只清内存环形缓冲，不影响用量统计
+async function clearLogs(scope, st, refresh, label) {
+  if (!confirm(`确定清空${label}？清空后不可恢复。`)) return;
+  try {
+    await api("POST", "/admin/api/logs/clear", { scope });
+    st.page = 1;
+    await refresh();
+    toast(`${label}已清空`);
+  } catch (e) { toast(e.message, true); }
+}
+$("#logsClear").addEventListener("click", () => clearLogs("requests", logsState, refreshLogs, "请求日志"));
+$("#errorsClear").addEventListener("click", () => clearLogs("errors", errsState, refreshErrors, "错误日志"));
 
 // ---- 渠道测试 ----
 // 对指定渠道按模型逐个发起真实对话请求（后端按渠道 key 顺序故障转移），

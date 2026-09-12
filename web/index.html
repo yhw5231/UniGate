@@ -110,6 +110,7 @@
         <div class="spacer"></div>
         <label class="inline"><input type="checkbox" id="logsAuto"> 自动刷新</label>
         <button id="logsRefresh" class="btn">刷新</button>
+        <button id="logsClear" class="btn danger" title="清空全部请求日志（不可恢复）">清空</button>
       </div>
       <div class="row" style="margin:8px 0">
         <span class="muted" id="logsPagerInfo">—</span>
@@ -120,10 +121,17 @@
         <button id="logsPrev" class="btn small">← 上一页</button>
         <button id="logsNext" class="btn small">下一页 →</button>
       </div>
-      <table class="tbl" id="logTable">
+      <div class="tbl-scroll">
+      <table class="tbl logtbl" id="logTable">
+        <colgroup>
+          <col class="c-time"><col class="c-path"><col class="c-status"><col class="c-dur">
+          <col class="c-chan"><col class="c-key"><col class="c-model"><col class="c-tok">
+          <col class="c-user"><col class="c-ip"><col>
+        </colgroup>
         <thead><tr><th>时间</th><th>接口</th><th>状态</th><th>耗时</th><th>渠道</th><th>key</th><th>模型</th><th>Tokens (入/出)</th><th>下游</th><th>出口</th><th>错误</th></tr></thead>
         <tbody></tbody>
       </table>
+      </div>
     </section>
 
     <!-- 错误日志 -->
@@ -133,6 +141,7 @@
         <div class="spacer"></div>
         <label class="inline"><input type="checkbox" id="errorsAuto"> 自动刷新</label>
         <button id="errorsRefresh" class="btn">刷新</button>
+        <button id="errorsClear" class="btn danger" title="清空全部错误日志（不可恢复）">清空</button>
       </div>
       <p class="muted" style="margin:4px 0 8px">只收录失败请求（状态 ≥400 或带失败原因），独立保存、不会被成功请求挤出；错误信息含逐 key 失败轨迹，可回答「为什么 502」。</p>
       <div class="row" style="margin:8px 0">
@@ -144,10 +153,17 @@
         <button id="errorsPrev" class="btn small">← 上一页</button>
         <button id="errorsNext" class="btn small">下一页 →</button>
       </div>
-      <table class="tbl" id="errTable">
+      <div class="tbl-scroll">
+      <table class="tbl logtbl" id="errTable">
+        <colgroup>
+          <col class="c-time"><col class="c-path"><col class="c-status"><col class="c-dur">
+          <col class="c-chan"><col class="c-key"><col class="c-model"><col class="c-tok">
+          <col class="c-user"><col class="c-ip"><col>
+        </colgroup>
         <thead><tr><th>时间</th><th>接口</th><th>状态</th><th>耗时</th><th>渠道</th><th>key</th><th>模型</th><th>Tokens (入/出)</th><th>下游</th><th>出口</th><th>错误</th></tr></thead>
         <tbody></tbody>
       </table>
+      </div>
     </section>
 
     <!-- 代理池 -->
@@ -293,7 +309,7 @@
         <button class="btn small" id="toggleBulkBtn">⇊ 批量导入</button>
       </div>
       <div id="bulkImportBox" class="keyblock hidden" style="margin-top:8px">
-        <textarea id="bulkKeysInput" rows="6" placeholder="每行一个，支持两种格式：&#10;sk-xxxx（名称自动生成）&#10;名称|sk-xxxx（自定义名称，也支持 名称:sk-xxxx）&#10;# 开头的行视为注释跳过"></textarea>
+        <textarea id="bulkKeysInput" rows="6" placeholder="每行一个，支持：&#10;sk-xxxx（名称自动生成）&#10;名称|sk-xxxx（自定义名称，也支持 名称:sk-xxxx）&#10;sk-xxxx|备注（key 在前、名称在后的写法也可识别）&#10;# 开头的行视为注释跳过；key 中的引号/零宽字符会自动清理"></textarea>
         <div class="row" style="margin:8px 0 0">
           <span class="muted" style="font-size:12px">导入的 key 默认启用、直连，代理可在下方各 key 块中单独设置。</span>
           <span class="spacer"></span>

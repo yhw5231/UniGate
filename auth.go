@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -97,7 +98,7 @@ func secret() string {
 	return defaultTokenSecret
 }
 
-// handleLogin 处理 POST /login。
+// handleLogin 处理 POST /login。连续失败达阈值后按用户名/IP 锁定（429）。
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -111,10 +112,19 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body: "+err.Error(), "bad_request")
 		return
 	}
+	ip := clientIP(r)
+	if locked, retryIn := loginBlocked(body.Username, ip); locked {
+		log.Printf("login throttled: user=%q ip=%s retry_in=%s", body.Username, ip, retryIn.Round(time.Second))
+		writeLoginThrottled(w, retryIn)
+		return
+	}
 	if !verifyLogin(body.Username, body.Password) {
+		loginFailed(body.Username, ip)
+		log.Printf("login failed: user=%q ip=%s", body.Username, ip)
 		writeJSONError(w, http.StatusUnauthorized, "invalid username or password", "unauthorized")
 		return
 	}
+	loginSucceeded(body.Username, ip)
 	token, err := issueToken(body.Username)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "token issue failed", "internal_error")

@@ -13,6 +13,12 @@
 //     重试一次（坏出口自愈），仍失败再继续下一个 key
 //   - 401/403              → 只换 key，不冷却、不换出口
 //   - 其他（含上游 400）   → 原样透传给下游（上游的业务语义不动）
+//
+// 流式保活：上游排队首包慢或流中途静默时，每 KEEPALIVE_INTERVAL（默认 15s）
+// 向下游写一帧 SSE 注释心跳，保证下游反代/客户端不因空闲超时掐断连接
+// （否则表现为「渠道测试可用、下游挂满 60s 记 client canceled」）。首帧心跳
+// 会提前提交 200+event-stream 响应头，之后路由失败改用流内 data: {"error":...}
+// 帧表达；快速失败（429/5xx 秒级返回）通常发生在首帧心跳之前，JSON 语义不变。
 package main
 
 import (
@@ -191,6 +197,20 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 		cooled      int
 		trace       []attemptTrace
 	)
+	// 流式保活：等待上游/故障转移期间持续给下游发心跳，下游空闲超时不触发，
+	// 网关就能安心等上游出包（keepalive.go）。非流式无法在 JSON 前面垫注释帧，
+	// 不启用。
+	var (
+		sink http.ResponseWriter = w
+		keep *streamKeeper
+	)
+	if stream {
+		if keep = newStreamKeeper(w, pol.KeepaliveInterval); keep != nil {
+			keep.start()
+			defer keep.stop()
+			sink = keep
+		}
+	}
 	recordTrace := func(cand *candidate, event, detail string) {
 		trace = append(trace, attemptTrace{
 			Key:   maskKey(cand.k.Name + "@" + cand.ch.Name),
@@ -319,12 +339,21 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 		// 成功拿到可透传的响应：改写（可选）后回给下游
 		leaseMgr.RecordUse(cand.k.effectiveProxy(cand.ch), cand.k.ID)
 		if resp.StatusCode >= 400 {
+			if keep != nil && keep.committedResponse() {
+				// 心跳已把 200 SSE 响应头提交给下游：错误状态码/JSON 错误体
+				// 都发不出去了，只能把这个候选当失败继续转移（心跳不停）
+				lastErr = "upstream " + rejectReason(resp)
+				recordTrace(&cand, "rejected_after_commit", lastErr)
+				resp.Body.Close()
+				i++
+				continue
+			}
 			// 上游 4xx/5xx 业务错误原样透传，但把响应体片段记入请求日志：
 			// 不记的话错误日志只有 "Bad Request" 状态文本，回答不了
 			//「上游为什么 400/404」（无效 key、模型不存在等具体原因）。
 			peekUpstreamError(r, resp)
 		}
-		serveUpstreamResponse(w, resp, stream, cand.ch.Rewrite, cand.ch.EndpointType)
+		serveUpstreamResponse(sink, resp, stream, cand.ch.Rewrite, cand.ch.EndpointType)
 		served = &cand
 		break
 	}
@@ -336,24 +365,33 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 	// 无候选成功：把诊断信息写进请求日志（渠道/key/逐 key 原因），再回给下游
 	msg := describeRouteFailure(model, len(cands), attempts, cooled, lastErr, trace)
 	// 429 余波（全部冷却或本轮撞过 429）：附上最早可重试时间，下游可据此退避
+	var retryAfter int64
 	if attempts == 0 || rateLimited {
 		pairs := make([]cooldownPair, 0, len(cands))
 		for _, c := range cands {
 			pairs = append(pairs, cooldownPair{c.k.ID, c.cooldownModel(model)})
 		}
 		if d, ok := cool.EarliestRetry(pairs); ok {
-			secs := int64(d.Seconds()) + 1
-			w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
-			msg += fmt.Sprintf("; earliest retry in %ds", secs)
+			retryAfter = int64(d.Seconds()) + 1
+			msg += fmt.Sprintf("; earliest retry in %ds", retryAfter)
 		}
 	}
 	setReqErrMsg(r, msg)
 
+	status, code := http.StatusBadGateway, "upstream_error"
 	if rateLimited {
-		writeJSONError(w, http.StatusTooManyRequests, msg, "rate_limited")
+		status, code = http.StatusTooManyRequests, "rate_limited"
+	}
+	if keep != nil {
+		// 心跳可能已把 200+event-stream 头提交给下游：由 keeper 在锁内二选一
+		// ——JSON 错误（含 Retry-After）或流内 error 帧，绝不与心跳撕裂
+		keep.finish(msg, code, status, retryAfter)
 		return nil
 	}
-	writeJSONError(w, http.StatusBadGateway, msg, "upstream_error")
+	if retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+	}
+	writeJSONError(w, status, msg, code)
 	return nil
 }
 

@@ -70,28 +70,33 @@ textarea { resize: vertical; }
 .tbl th { color: var(--muted); font-weight: 600; background: var(--panel2); }
 .tbl tr:last-child td { border-bottom: none; }
 
-/* 请求/错误日志表：固定列布局——窄列固定宽度并单行截断（悬停 title 看全文），
-   错误列占满剩余宽度，内容限高滚动，避免长错误轨迹把行撑得异常高；
-   窗口过窄时表格横向滚动，不压缩列宽 */
+/* 请求/错误日志表：内容自适应列宽（不截断、全部可见），长文本折行展示；
+   窗口过窄时表格横向滚动，不压缩列宽。短列（时间/状态/耗时/Tokens/下游/出口）
+   不折行保持整齐，长文本（接口/渠道/key/模型/错误）按内容换行。 */
 .tbl-scroll { overflow-x: auto; }
-.tbl.logtbl { table-layout: fixed; min-width: 1020px; }
-.tbl.logtbl th, .tbl.logtbl td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tbl.logtbl col.c-time { width: 100px; }
-.tbl.logtbl col.c-path { width: 128px; }
-.tbl.logtbl col.c-status { width: 52px; }
-.tbl.logtbl col.c-dur { width: 60px; }
-.tbl.logtbl col.c-chan { width: 92px; }
-.tbl.logtbl col.c-key { width: 92px; }
-.tbl.logtbl col.c-model { width: 132px; }
-.tbl.logtbl col.c-tok { width: 100px; }
-.tbl.logtbl col.c-user { width: 80px; }
-.tbl.logtbl col.c-ip { width: 100px; }
+.tbl.logtbl { table-layout: auto; min-width: 1320px; }
+.tbl.logtbl th, .tbl.logtbl td { white-space: normal; word-break: break-all; overflow-wrap: anywhere; }
+.tbl.logtbl th.tw, .tbl.logtbl td.tw { width: 34px; white-space: nowrap; }
+.tbl.logtbl .nowrap { white-space: nowrap; word-break: keep-all; }
+.tbl.logtbl th { position: sticky; top: 0; z-index: 2; }
+/* 覆盖渠道测试页 td.err 的限宽截断样式（style.css .t-snippet 规则），
+   日志表错误列必须完整换行展示，不得限宽/省略 */
 .tbl.logtbl td.err {
-  display: table-cell; max-width: none;
-  white-space: pre-wrap; word-break: break-all; text-overflow: clip;
+  display: table-cell; max-width: none; overflow: visible;
+  text-overflow: clip; white-space: pre-wrap;
 }
-.tbl.logtbl .errwrap { max-height: 88px; overflow-y: auto; }
-.tbl.logtbl td[colspan] { white-space: normal; text-overflow: clip; }
+/* 展开详情 */
+.log-detail {
+  display: block; background: var(--panel2); border-top: 1px solid var(--border);
+  padding: 10px 12px; font-size: 13px;
+}
+.log-detail .g { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 4px 18px; margin-bottom: 6px; }
+.log-detail .f { display: flex; gap: 6px; min-width: 0; }
+.log-detail .k { color: var(--muted); flex: 0 0 auto; }
+.log-detail .v { word-break: break-all; min-width: 0; }
+.log-detail .e { white-space: pre-wrap; word-break: break-all; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+.tr-toggle { cursor: pointer; user-select: none; color: var(--muted); }
+tr.tog-open .tr-toggle { color: var(--accent); }
 
 /* 登录 */
 .login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
@@ -129,6 +134,8 @@ textarea { resize: vertical; }
 }
 .chip.clickable { cursor: pointer; }
 .chip.clickable:hover { border-color: var(--accent); color: var(--accent); }
+/* 测试清单中已选中的模型 chip：高亮并标记可移除 */
+.chip-on { border-color: var(--accent); color: var(--accent); background: rgba(79,140,255,.12); }
 
 /* 渠道测试 */
 .panel {
@@ -139,6 +146,19 @@ textarea { resize: vertical; }
 .t-snippet .err, td.err { display: inline-block; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 .key-line { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
 .key-line .pname { color: var(--muted); font-size: 12px; }
+
+/* 设置页：紧凑双列布局 */
+.settings-panel { max-width: 860px; }
+.settings-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+.settings-head h3 { margin: 0; font-size: 16px; }
+.settings-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px;
+}
+.settings-grid .fld { margin: 0; display: flex; flex-direction: column; gap: 2px; }
+.settings-grid .fld input { width: 100%; padding: 5px 9px; font-size: 13px; }
+.settings-grid .hint { color: var(--muted); font-size: 11px; }
+.settings-now { font-size: 12px; margin: 10px 0 0; }
+@media (max-width: 800px) { .settings-grid { grid-template-columns: 1fr; } }
 
 /* 拉取模型候选勾选面板 */
 .fetch-panel {
@@ -163,13 +183,22 @@ textarea { resize: vertical; }
   background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
   width: 640px; margin: 40px 16px; padding: 0 0 16px;
 }
-.modal-card.wide { width: 860px; }
+.modal-card.wide { width: 1040px; } /* 渠道编辑：宽度调高，容纳双列字段与滚动 key 列表 */
 .modal-head, .modal-foot { display: flex; align-items: center; gap: 10px; padding: 12px 18px; }
 .modal-head { border-bottom: 1px solid var(--border); }
 .modal-head h3 { margin: 0; }
 .modal-body { padding: 4px 18px; }
 .modal-foot { border-top: 1px solid var(--border); margin-top: 10px; }
 .modal-foot .spacer { flex: 1; }
+/* 弹窗标题栏固定：modal 是滚动容器，标题栏 sticky 到其顶部，
+   内容滚动时标题/关闭按钮始终可见 */
+.modal-head {
+  position: sticky; top: 0; z-index: 3; background: var(--panel);
+  border-radius: 10px 10px 0 0;
+}
+/* 渠道编辑器多 KEY 滚动列表：key 多时列表内部滚动，弹窗整体不再无限变高 */
+.keys-scroll { max-height: 46vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-top: 4px; }
+.keys-scroll .keyblock { margin: 6px 0; }
 
 /* 渠道编辑器中的 key 块 */
 .keyblock {

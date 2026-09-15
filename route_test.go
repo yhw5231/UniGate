@@ -298,6 +298,161 @@ func TestNetworkErrorFailover(t *testing.T) {
 	}
 }
 
+// ---- 流式保活（heartbeat）----
+
+func setKeepalive(t *testing.T, d time.Duration) {
+	t.Helper()
+	p := currentPolicy()
+	p.KeepaliveInterval = d
+	policy.Store(p)
+}
+
+// slowSSEUpstream 延迟 delay 后才回首包并写一帧 SSE 的上游（模拟模型排队）。
+func slowSSEUpstream(t *testing.T, delay time.Duration, content string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(delay)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\""+content+"\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestStreamKeepaliveDuringSlowUpstream：上游首包慢于心跳间隔时，下游先持续
+// 收到 ": keepalive" 注释帧（空闲超时不触发），上游出包后真实内容照常透传。
+// 这正是「测试可用但下游 60s 超时」场景的修复。
+func TestStreamKeepaliveDuringSlowUpstream(t *testing.T) {
+	setupGateway(t)
+	slow := slowSSEUpstream(t, 500*time.Millisecond, "slow ok")
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: slow.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	setKeepalive(t, 100*time.Millisecond)
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, true, "m1")
+	body := rr.Body.String()
+	if !strings.Contains(body, ": keepalive") {
+		t.Fatalf("expected heartbeat frames, body=%q", body)
+	}
+	if ka, data := strings.Index(body, ": keepalive"), strings.Index(body, "slow ok"); data < 0 || ka > data {
+		t.Fatalf("keepalive must precede content: ka=%d data=%d body=%q", ka, data, body)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, body)
+	}
+}
+
+// TestStreamKeepaliveFailoverAfterCommit：心跳提交 200 流之后上游才报错
+// （500），网关继续把剩余 key 试完；健康 key 的响应经同一条已提交的流透传，
+// 下游只看到 keepalive 注释 + 正常内容。
+func TestStreamKeepaliveFailoverAfterCommit(t *testing.T) {
+	setupGateway(t)
+	slow500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(400 * time.Millisecond)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"boom"}`)
+	}))
+	t.Cleanup(slow500.Close)
+	up2 := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok2"}}]}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: slow500.URL, Enabled: true,
+		Keys: []*UpKey{
+			{Name: "k1", APIKey: "sk-1", Enabled: true},
+			{Name: "k2", APIKey: "sk-2", Enabled: true, BaseURL: up2.srv.URL},
+		}})
+	setKeepalive(t, 100*time.Millisecond)
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, true, "m1")
+	body := rr.Body.String()
+	if !strings.Contains(body, ": keepalive") || !strings.Contains(body, "ok2") {
+		t.Fatalf("expected keepalive + failover content, body=%q", body)
+	}
+	if up2.count() != 1 {
+		t.Fatalf("healthy key should serve after commit, calls=%d", up2.count())
+	}
+}
+
+// TestStreamKeepaliveAllFailErrorFrame：心跳提交后所有候选都失败——失败不能
+// 再用 JSON 错误体表达（200 头已发出），须以流内 error 帧 + [DONE] 收尾。
+func TestStreamKeepaliveAllFailErrorFrame(t *testing.T) {
+	setupGateway(t)
+	slow500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"boom"}`)
+	}))
+	t.Cleanup(slow500.Close)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: slow500.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	setKeepalive(t, 80*time.Millisecond)
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, true, "m1")
+	body := rr.Body.String()
+	if !strings.Contains(body, ": keepalive") {
+		t.Fatalf("expected heartbeat frames, body=%q", body)
+	}
+	if !strings.Contains(body, `data: {"error"`) || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected in-stream error frame + [DONE], body=%q", body)
+	}
+}
+
+// TestKeepaliveSkippedForNonStream：非流式请求不启用心跳（JSON 前垫注释帧会
+// 破坏响应体），失败路径保持原 JSON 502 语义。
+func TestKeepaliveSkippedForNonStream(t *testing.T) {
+	setupGateway(t)
+	slow500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(slow500.Close)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: slow500.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	setKeepalive(t, 40*time.Millisecond)
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), ": keepalive") {
+		t.Fatalf("non-stream must not receive heartbeats: %q", rr.Body.String())
+	}
+}
+
+// TestKeepaliveZeroDisables：间隔 0（WebUI/环境关闭）时流式请求不写任何心跳。
+func TestKeepaliveZeroDisables(t *testing.T) {
+	setupGateway(t)
+	slow := slowSSEUpstream(t, 150*time.Millisecond, "plain")
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: slow.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	setKeepalive(t, 0)
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, true, "m1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), ": keepalive") {
+		t.Fatalf("keepalive must be off: %q", rr.Body.String())
+	}
+}
+
+// TestKeepaliveSettingsWiring：WebUI 设置 keepalive_sec → RoutePolicy 生效。
+func TestKeepaliveSettingsWiring(t *testing.T) {
+	setupGateway(t)
+	n := 8
+	if err := store.PutSettings(&GatewaySettings{KeepaliveSec: &n}); err != nil {
+		t.Fatalf("PutSettings: %v", err)
+	}
+	applySettings(store.Settings())
+	if got := currentPolicy().KeepaliveInterval; got != 8*time.Second {
+		t.Fatalf("policy KeepaliveInterval=%s, want 8s", got)
+	}
+}
+
 func TestModelFilterSkipsChannel(t *testing.T) {
 	setupGateway(t)
 	up := newUpstream(t, http.StatusOK, `{}`)

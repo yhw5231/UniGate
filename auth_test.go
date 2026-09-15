@@ -92,6 +92,8 @@ func TestVerifyTokenExpired(t *testing.T) {
 }
 
 func TestHandleLogin(t *testing.T) {
+	resetLoginThrottle()
+	defer resetLoginThrottle()
 	tests := []struct {
 		name       string
 		method     string
@@ -131,6 +133,67 @@ func TestHandleLogin(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestLoginThrottleLocksAfterFailures：连续失败达阈值后锁定（429 + Retry-After）；
+// 锁定期间即使密码正确也拒绝；成功登录会清零计数。
+func TestLoginThrottleLocksAfterFailures(t *testing.T) {
+	t.Setenv("LOGIN_FAIL_LOCKOUT", "3")
+	t.Setenv("LOGIN_FAIL_WINDOW", "1m")
+	resetCfgForTest()
+	defer resetCfgForTest()
+
+	login := func(password string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/login",
+			strings.NewReader(`{"username":"admin","password":"`+password+`"}`))
+		req.RemoteAddr = "10.0.0.9:1234"
+		rr := httptest.NewRecorder()
+		handleLogin(rr, req)
+		return rr
+	}
+
+	// 前 2 次失败仅 401（阈值 3）
+	for i := 0; i < 2; i++ {
+		if rr := login("wrong"); rr.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status=%d want 401", i+1, rr.Code)
+		}
+	}
+	// 第 3 次失败触发锁定，本次仍是 401（锁定从下一次请求生效）
+	if rr := login("wrong"); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("3rd failure status=%d want 401", rr.Code)
+	}
+	// 第 4 次：已锁定 → 429，且正确密码也拒绝
+	rr := login("admin")
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("locked status=%d want 429; body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header")
+	}
+
+	// 解锁（模拟窗口过期）后可用正确密码登录
+	resetLoginThrottle()
+	if rr := login("admin"); rr.Code != http.StatusOK {
+		t.Fatalf("after unlock status=%d want 200; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestLoginThrottleDisabledByZero：LOGIN_FAIL_LOCKOUT=0 关闭防爆破。
+func TestLoginThrottleDisabledByZero(t *testing.T) {
+	t.Setenv("LOGIN_FAIL_LOCKOUT", "0")
+	resetCfgForTest()
+	defer resetCfgForTest()
+
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/login",
+			strings.NewReader(`{"username":"admin","password":"wrong"}`))
+		req.RemoteAddr = "10.0.0.10:1234"
+		rr := httptest.NewRecorder()
+		handleLogin(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status=%d want 401 (throttle disabled)", i+1, rr.Code)
+		}
 	}
 }
 

@@ -202,3 +202,134 @@ func TestUsageDBEmptyPath(t *testing.T) {
 		t.Fatalf("res = %+v", res)
 	}
 }
+
+// TestUsageDBRequestLogTables：请求/错误日志持久化（Add/Query/Clear + 重启不丢）。
+func TestUsageDBRequestLogTables(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.db")
+	db := newUsageDB(path, 30, 1000)
+	if !db.Available() {
+		t.Fatal("db should be available")
+	}
+
+	db.LogAppend(logTableRequest, RequestRecord{ID: "r1", Time: time.Now(), Status: 200, Path: "/v1/chat/completions"}, 0)
+	db.LogAppend(logTableRequest, RequestRecord{ID: "r2", Time: time.Now(), Status: 502,
+		Path: "/v1/chat/completions", ErrMsg: "all keys cooling"}, 0)
+	db.LogAppend(logTableError, RequestRecord{ID: "e1", Time: time.Now(), Status: 502, ErrMsg: "boom"}, 0)
+	db.Close()
+
+	// 重新打开：日志仍在（这是相对内存环形缓冲的关键改进）
+	db2 := newUsageDB(path, 30, 1000)
+	defer db2.Close()
+	recs, total := db2.LogQuery(logTableRequest, 1, 10)
+	if total != 2 || len(recs) != 2 {
+		t.Fatalf("request_log total=%d len=%d", total, len(recs))
+	}
+	// 最新在前
+	if recs[0].ID != "r2" {
+		t.Fatalf("order wrong, newest first expected: %+v", recs)
+	}
+	if recs[0].ErrMsg != "all keys cooling" {
+		t.Fatalf("error text lost: %+v", recs[0])
+	}
+	errs, etotal := db2.LogQuery(logTableError, 1, 10)
+	if etotal != 1 || len(errs) != 1 || errs[0].ID != "e1" {
+		t.Fatalf("error_log = %+v", errs)
+	}
+
+	// 分页
+	if page2, _ := db2.LogQuery(logTableRequest, 2, 1); len(page2) != 1 || page2[0].ID != "r1" {
+		t.Fatalf("page2 = %+v", page2)
+	}
+
+	// 清空
+	if n := db2.LogClear(logTableRequest); n != 2 {
+		t.Fatalf("cleared = %d, want 2", n)
+	}
+	if _, total := db2.LogQuery(logTableRequest, 1, 10); total != 0 {
+		t.Fatalf("request_log should be empty, total=%d", total)
+	}
+}
+
+// TestUsageDBLogPrune：logPrune 只保留最新 keep 条。
+func TestUsageDBLogPrune(t *testing.T) {
+	db := newUsageDB("", 30, 1000)
+	defer db.Close()
+	for i := 0; i < 20; i++ {
+		db.LogAppend(logTableRequest, RequestRecord{ID: fmt.Sprintf("r%02d", i), Time: time.Now(), Status: 200}, 0)
+	}
+	db.logPrune(logTableRequest, 5)
+	recs, total := db.LogQuery(logTableRequest, 1, 100)
+	if total != 5 || len(recs) != 5 {
+		t.Fatalf("after prune total=%d len=%d", total, len(recs))
+	}
+	// 保留的是最新的 5 条
+	if recs[0].ID != "r19" || recs[4].ID != "r15" {
+		t.Fatalf("kept wrong rows: %v .. %v", recs[0].ID, recs[4].ID)
+	}
+}
+
+// TestUsageDBInvalidLogTable：表名白名单之外的调用一律拒绝（防 SQL 注入）。
+func TestUsageDBInvalidLogTable(t *testing.T) {
+	db := newUsageDB("", 30, 1000)
+	defer db.Close()
+	db.LogAppend("usage_events; DROP TABLE usage_events", RequestRecord{ID: "x"}, 0)
+	if _, total := db.LogQuery("evil", 1, 10); total != 0 {
+		t.Fatalf("invalid table should return empty, total=%d", total)
+	}
+	if n := db.LogClear("evil"); n != 0 {
+		t.Fatalf("invalid table clear = %d", n)
+	}
+}
+
+// TestUsageDBMaskStoredKeys：历史明文 key 就地脱敏，且幂等（再跑一次不改动）。
+func TestUsageDBMaskStoredKeys(t *testing.T) {
+	db := newUsageDB("", 30, 1000)
+	defer db.Close()
+	now := time.Now()
+	db.Append(UsageEvent{Time: now, User: "a", Model: "m", Key: "sk-plaintextkey12345", Status: 200})
+	db.Append(UsageEvent{Time: now, User: "a", Model: "m", Key: "sk-plaintextkey12345", Status: 200})
+	db.Append(UsageEvent{Time: now, User: "b", Model: "m", Key: "alread****masked", Status: 200})
+
+	if n := db.MaskStoredKeys(); n != 2 {
+		t.Fatalf("masked rows = %d, want 2", n)
+	}
+	if n := db.MaskStoredKeys(); n != 0 {
+		t.Fatalf("second run should be a no-op, got %d", n)
+	}
+
+	// 明文已消失，且 by_key 维度仍可用（掩码值分组）
+	var plain int
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM usage_events WHERE key = ?`, "sk-plaintextkey12345").Scan(&plain); err != nil {
+		t.Fatal(err)
+	}
+	if plain != 0 {
+		t.Fatalf("plaintext key still present: %d rows", plain)
+	}
+	res := db.Query(UsageFilter{Window: "all"})
+	found := false
+	for _, b := range res.ByKey {
+		if b.Name == maskKey("sk-plaintextkey12345") && b.Requests == 2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("masked key group missing from by_key: %+v", res.ByKey)
+	}
+}
+
+// TestUsageDBAvailable：空路径（内存库）也应可用。
+func TestUsageDBAvailable(t *testing.T) {
+	db := newUsageDB("", 30, 100)
+	defer db.Close()
+	if !db.Available() {
+		t.Fatal("in-memory db should be available")
+	}
+	var nilDB *UsageDB
+	if nilDB.Available() {
+		t.Fatal("nil db should not be available")
+	}
+	if _, total := nilDB.LogQuery(logTableRequest, 1, 10); total != 0 {
+		t.Fatalf("nil db query total=%d", total)
+	}
+}

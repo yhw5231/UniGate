@@ -14,3 +14,6 @@
 /backups/
 *.db
 *.db.tmp
+
+# ZCode 会话内部状态（计划记录等）
+/.zcode/

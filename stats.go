@@ -1,5 +1,6 @@
-// 可观察性：请求记录（环形缓冲）与用量统计（按用户 / 模型 / key 聚合）。
-// 通过 GET /admin/stats 与 GET /admin/requests 查询（需管理员登录）。
+// 可观察性：请求/错误记录日志（SQLite 持久化，无数据库时退化为内存环形缓冲）。
+// 通过 GET /admin/api/requests 与 GET /admin/api/errors 查询（需管理员登录）；
+// 窗口化聚合统计见 usage_db.go 的 GET /admin/api/usage。
 package main
 
 import (
@@ -9,7 +10,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,13 +39,20 @@ type RequestRecord struct {
 	ErrMsg           string        `json:"error,omitempty"`
 }
 
-// RequestLog 固定容量环形缓冲，新记录覆盖最旧。
+// RequestLog 请求日志：固定容量，保留最新 capacity 条。挂上 SQLite 表名后
+// 以数据库为存储（重启不丢），内存环形缓冲退化为无数据库时的兜底
+// （单元测试 / USAGE_DB_PATH 打开失败时的降级路径）。
 type RequestLog struct {
 	mu   sync.Mutex
 	recs []RequestRecord
 	next int // 下一个写入位置
 	cap  int
 	n    int // 已写条数（含被覆盖的）
+
+	// table 由 initStats 在开始服务前设置一次，之后只读（不参与 mu 保护，
+	// 避免与 Add/Query 的自有锁嵌套）。
+	table     string
+	dbAppends int // 距上次裁剪的写入计数（由 mu 保护）
 }
 
 func newRequestLog(capacity int) *RequestLog {
@@ -55,17 +62,63 @@ func newRequestLog(capacity int) *RequestLog {
 	return &RequestLog{recs: make([]RequestRecord, capacity), cap: capacity}
 }
 
-// Add 写入一条记录（环形覆盖）。
-func (l *RequestLog) Add(rec RequestRecord) {
+// attachTable 把日志挂到 SQLite 表（logTableRequest / logTableError），并立即
+// 裁一次（重启/挂载时表内可能积存上次运行的过量记录）。只应在启动初始化
+// 阶段调用。
+func (l *RequestLog) attachTable(table string) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.recs[l.next] = rec
-	l.next = (l.next + 1) % l.cap
-	l.n++
+	l.table = table
+	keep := l.cap
+	hasDB := usageDB != nil
+	l.mu.Unlock()
+	if hasDB && keep > 0 {
+		usageDB.logPrune(table, keep)
+	}
+}
+
+// dbLog 返回挂载的日志表（未挂载或用量库不可用时为空串）。
+func (l *RequestLog) dbLog() string {
+	if l.table == "" || usageDB == nil {
+		return ""
+	}
+	if !validLogTable(l.table) {
+		return ""
+	}
+	return l.table
+}
+
+// logPruneEvery 每写入这么多条裁剪一次（而非每条都裁剪）：环形上限仍然生效，
+// 允许瞬时超出若干条以摊薄 DELETE 的成本。
+const logPruneEvery = 256
+
+// Add 写入一条记录（有数据库时持久化，否则写入内存环形缓冲）。
+func (l *RequestLog) Add(rec RequestRecord) {
+	table := l.dbLog()
+	if table == "" {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.recs[l.next] = rec
+		l.next = (l.next + 1) % l.cap
+		l.n++
+		return
+	}
+	l.mu.Lock()
+	l.dbAppends++
+	prune := l.dbAppends%logPruneEvery == 0
+	keep := l.cap
+	l.mu.Unlock()
+	usageDB.LogAppend(table, rec, 0)
+	if prune {
+		usageDB.logPrune(table, keep)
+	}
 }
 
 // Snapshot 返回现有记录，最新在前。
 func (l *RequestLog) Snapshot() []RequestRecord {
+	if table := l.dbLog(); table != "" {
+		recs, _ := usageDB.LogQuery(table, 1, l.cap)
+		return recs
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := make([]RequestRecord, 0, l.count())
@@ -86,6 +139,13 @@ func (l *RequestLog) count() int {
 // Clear 清空全部记录（管理员在 WebUI 手动清空日志用）。重新分配底层数组，
 // 顺带释放已存错误信息（单条可达 8KB）的内存引用。
 func (l *RequestLog) Clear() {
+	if table := l.dbLog(); table != "" {
+		l.mu.Lock()
+		l.dbAppends = 0
+		l.mu.Unlock()
+		usageDB.LogClear(table)
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.recs = make([]RequestRecord, l.cap)
@@ -94,6 +154,9 @@ func (l *RequestLog) Clear() {
 
 // Query 分页返回记录（最新在前；page 从 1 起，越界返回空页）。
 func (l *RequestLog) Query(page, pageSize int) ([]RequestRecord, int) {
+	if table := l.dbLog(); table != "" {
+		return usageDB.LogQuery(table, page, pageSize)
+	}
 	all := l.Snapshot()
 	if page < 1 {
 		page = 1
@@ -112,115 +175,26 @@ func (l *RequestLog) Query(page, pageSize int) ([]RequestRecord, int) {
 	return all[start:end], len(all)
 }
 
-// ---- 用量统计 ----
-
-type UsageTotals struct {
-	Requests   int64 `json:"requests"`
-	Errors     int64 `json:"errors"`
-	BytesOut   int64 `json:"bytes_out"`
-	DurationMs int64 `json:"duration_ms"`
-}
-
-type UserUsage struct {
-	Requests   int64     `json:"requests"`
-	Errors     int64     `json:"errors"`
-	BytesOut   int64     `json:"bytes_out"`
-	LastActive time.Time `json:"last_active"`
-}
-
-type ModelUsage struct {
-	Requests int64 `json:"requests"`
-	Errors   int64 `json:"errors"`
-}
-
-type KeyUsage struct {
-	Requests int64 `json:"requests"`
-	Errors   int64 `json:"errors"`
-}
-
-// UsageStats 用量聚合。
-type UsageStats struct {
-	mu        sync.Mutex
-	StartedAt time.Time
-	Totals    UsageTotals
-	ByUser    map[string]*UserUsage
-	ByModel   map[string]*ModelUsage
-	ByKey     map[string]*KeyUsage
-}
-
-func newUsageStats() *UsageStats {
-	return &UsageStats{
-		StartedAt: time.Now(),
-		ByUser:    make(map[string]*UserUsage),
-		ByModel:   make(map[string]*ModelUsage),
-		ByKey:     make(map[string]*KeyUsage),
-	}
-}
-
-// Record 把一条请求记录计入聚合。
-func (s *UsageStats) Record(rec RequestRecord) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Totals.Requests++
-	s.Totals.BytesOut += rec.BytesOut
-	s.Totals.DurationMs += rec.DurationMs
-	isErr := rec.Status >= 400
-	if isErr {
-		s.Totals.Errors++
-	}
-	if rec.User != "" {
-		u := s.ByUser[rec.User]
-		if u == nil {
-			u = &UserUsage{}
-			s.ByUser[rec.User] = u
-		}
-		u.Requests++
-		u.BytesOut += rec.BytesOut
-		if isErr {
-			u.Errors++
-		}
-		u.LastActive = rec.Time
-	}
-	if rec.Model != "" {
-		m := s.ByModel[rec.Model]
-		if m == nil {
-			m = &ModelUsage{}
-			s.ByModel[rec.Model] = m
-		}
-		m.Requests++
-		if isErr {
-			m.Errors++
-		}
-	}
-	if rec.Key != "" {
-		k := s.ByKey[rec.Key]
-		if k == nil {
-			k = &KeyUsage{}
-			s.ByKey[rec.Key] = k
-		}
-		k.Requests++
-		if isErr {
-			k.Errors++
-		}
-	}
-}
-
 // ---- 全局实例 ----
 
 var (
-	reqLog    *RequestLog // 全部请求（环形缓冲，新记录覆盖最旧）
-	errLog    *RequestLog // 错误记录（独立环形缓冲，不被成功请求挤出）
-	usageStat *UsageStats
+	reqLog *RequestLog // 全部请求（环形缓冲，新记录覆盖最旧）
+	errLog *RequestLog // 错误记录（独立环形缓冲，不被成功请求挤出）
 )
 
 // errMsgMax 请求记录错误信息的最大长度（逐 key 失败轨迹完整保留，仅设上限防膨胀）。
 const errMsgMax = 8192
 
-// initStats 用配置初始化（幂等，reloadConfig 时调用）。
+// initStats 用配置初始化（幂等，reloadConfig 时调用）。用量库已就绪时把
+// 请求/错误日志挂到 SQLite 表（重启不丢），否则退化为内存环形缓冲。
+// 必须先 initUsageDB 再调用本函数。
 func initStats() {
 	reqLog = newRequestLog(cfg.ReqLogSize)
 	errLog = newRequestLog(cfg.ErrLogSize)
-	usageStat = newUsageStats()
+	if usageDB != nil && usageDB.Available() {
+		reqLog.attachTable(logTableRequest)
+		errLog.attachTable(logTableError)
+	}
 }
 
 // isErrorRecord 判定错误记录：状态码 >=400，或带失败诊断信息
@@ -406,16 +380,17 @@ func statsServe(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 		rec.Key = maskKey(rec.Key)
 	}
 	recordRequest(rec)
-	usageStat.Record(rec)
 
-	// 用量库记账（含输入/输出 token）
+	// 用量库记账（含输入/输出 token）。key 同样脱敏后入库：用量库是长期
+	// 持久化数据，明文上游 key 落盘会随备份/迁移扩散；by_key 维度仍是
+	// 「一个 key 一行」，聚合语义不变。
 	if usageDB != nil {
 		usageDB.Append(UsageEvent{
 			Time:             start,
 			User:             rs.user,
 			Channel:          rs.channel,
 			Model:            rs.model,
-			Key:              rs.key,
+			Key:              maskUsageKey(rs.key),
 			PromptTokens:     rs.promptTokens,
 			CompletionTokens: rs.completionTokens,
 			Status:           status,
@@ -424,62 +399,19 @@ func statsServe(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 	}
 }
 
+// maskUsageKey 用量库的 key 脱敏：空值保持空（by_key 会归入 unknown）。
+func maskUsageKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	return maskKey(key)
+}
+
 // ---- admin 端点 ----
 
 // isAdmin 判断登录用户是否为管理员。
 func isAdmin(user string) bool {
 	return cfg.LoginRequired && user != "" && user == cfg.AdminUser
-}
-
-// handleAdminStats 返回用量统计 JSON。
-func handleAdminStats(w http.ResponseWriter) {
-	usageStat.mu.Lock()
-	defer usageStat.mu.Unlock()
-
-	type userRow struct {
-		User       string    `json:"user"`
-		Requests   int64     `json:"requests"`
-		Errors     int64     `json:"errors"`
-		BytesOut   int64     `json:"bytes_out"`
-		LastActive time.Time `json:"last_active"`
-	}
-	type modelRow struct {
-		Model    string `json:"model"`
-		Requests int64  `json:"requests"`
-		Errors   int64  `json:"errors"`
-	}
-	type keyRow struct {
-		Key      string `json:"key"`
-		Requests int64  `json:"requests"`
-		Errors   int64  `json:"errors"`
-	}
-
-	users := make([]userRow, 0, len(usageStat.ByUser))
-	for u, v := range usageStat.ByUser {
-		users = append(users, userRow{u, v.Requests, v.Errors, v.BytesOut, v.LastActive})
-	}
-	sort.Slice(users, func(i, j int) bool { return users[i].Requests > users[j].Requests })
-
-	models := make([]modelRow, 0, len(usageStat.ByModel))
-	for m, v := range usageStat.ByModel {
-		models = append(models, modelRow{m, v.Requests, v.Errors})
-	}
-	sort.Slice(models, func(i, j int) bool { return models[i].Requests > models[j].Requests })
-
-	keys := make([]keyRow, 0, len(usageStat.ByKey))
-	for k, v := range usageStat.ByKey {
-		keys = append(keys, keyRow{k, v.Requests, v.Errors})
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i].Requests > keys[j].Requests })
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"started_at":     usageStat.StartedAt,
-		"uptime_seconds": int64(time.Since(usageStat.StartedAt).Seconds()),
-		"totals":         usageStat.Totals,
-		"by_user":        users,
-		"by_model":       models,
-		"by_key":         keys,
-	})
 }
 
 // parsePageArgs 解析分页参数：page（从 1 起）、page_size（默认 50，上限 500）。

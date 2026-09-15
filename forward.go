@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -56,13 +57,27 @@ func parseUsageFromFrame(frame []byte) (int64, int64, bool) {
 }
 
 // recordUsageToRecorder 把 token 用量写回 responseRecorder 的 reqStats。
+// w 可能是 streamKeeper（流式保活）包装，先解包到底层 recorder。
+// 解包链路里找不到 recorder 说明中间件被绕过（handler 未挂在 statsMiddleware
+// 下），用量会静默丢失——记一条日志便于定位，不静默吞掉。
 func recordUsageToRecorder(w http.ResponseWriter, prompt, completion int64) {
 	if prompt <= 0 && completion <= 0 {
 		return
 	}
-	if rr, ok := w.(*responseRecorder); ok && rr.rs != nil {
-		rr.rs.promptTokens += prompt
-		rr.rs.completionTokens += completion
+	for {
+		switch t := w.(type) {
+		case *responseRecorder:
+			if t.rs != nil {
+				t.rs.promptTokens += prompt
+				t.rs.completionTokens += completion
+			}
+			return
+		case *streamKeeper:
+			w = t.w
+		default:
+			log.Printf("usage: response writer %T is not wrapped by statsMiddleware; token usage dropped", w)
+			return
+		}
 	}
 }
 

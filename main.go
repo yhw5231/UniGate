@@ -48,8 +48,13 @@ func main() {
 	streaks = newStreaks()
 	policy.Store(defaultPolicy())   // 环境变量默认
 	applySettings(store.Settings()) // WebUI 设置覆盖（gateway.json）
+	initUsageDB()                   // 先建库：请求/错误日志持久化需要它
 	initStats()
-	initUsageDB()
+	if usageDB != nil {
+		if n := usageDB.MaskStoredKeys(); n > 0 {
+			log.Printf("usage db: masked %d row(s) carrying plaintext upstream key", n)
+		}
+	}
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -58,8 +63,8 @@ func main() {
 	}
 	if webUIMerged() {
 		srv.Handler = statsMiddleware(rootHandler)
-		log.Printf("unigate v%s listening on :%s (gateway+webui, admin default %s/%s)",
-			displayVersion(), cfg.Port, cfg.AdminUser, cfg.AdminPass)
+		log.Printf("unigate v%s listening on :%s (gateway+webui, admin default %s/password hidden)",
+			displayVersion(), cfg.Port, cfg.AdminUser)
 		log.Fatal(srv.ListenAndServe())
 	}
 
@@ -73,8 +78,8 @@ func main() {
 			log.Fatalf("webui server :%s: %v", cfg.WebUIPort, err)
 		}
 	}()
-	log.Printf("unigate v%s listening: gateway on :%s, webui on :%s (admin default %s/%s)",
-		displayVersion(), cfg.Port, cfg.WebUIPort, cfg.AdminUser, cfg.AdminPass)
+	log.Printf("unigate v%s listening: gateway on :%s, webui on :%s (admin default %s/password hidden)",
+		displayVersion(), cfg.Port, cfg.WebUIPort, cfg.AdminUser)
 	log.Fatal(srv.ListenAndServe())
 }
 

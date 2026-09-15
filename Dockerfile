@@ -26,9 +26,8 @@ RUN git config --global --add safe.directory '*' && \
 
 FROM alpine:3.22
 # su-exec：entrypoint 修正 /data 属主后降权运行（避免 bind mount 属主不匹配导致启动失败）
-# 不强制 app 的 uid/gid（显式 -u 100 在部分 alpine 版本会与既有 ID 冲突构建失败），
-# entrypoint 默认动态取 app 的实际 uid/gid
-RUN apk add --no-cache ca-certificates su-exec && addgroup -S app && adduser -S -G app app
+# tzdata：容器默认 UTC，安装时区库并配合下方 TZ 环境变量让服务日志显示北京时间
+RUN apk add --no-cache ca-certificates su-exec tzdata && addgroup -S app && adduser -S -G app app
 WORKDIR /app
 COPY --from=builder /out/unigate /usr/local/bin/unigate
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -36,7 +35,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /data && chown app:app /data
 # 以 root 启动 entrypoint（chown /data 需 root），进程随后降权为 app
 # 默认单端口：网关与 WebUI 同在 10010；如需分离管理面，加 WEBUI_PORT（如 10070）
-ENV PORT=10010 DATA_DIR=/data
+ENV PORT=10010 DATA_DIR=/data TZ=Asia/Shanghai
 VOLUME ["/data"]
 EXPOSE 10010
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

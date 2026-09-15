@@ -2,10 +2,10 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 )
 
 func TestRequestLogAddSnapshot(t *testing.T) {
@@ -105,24 +105,62 @@ func TestRequestLogClear(t *testing.T) {
 	}
 }
 
-func TestUsageStatsRecord(t *testing.T) {
-	s := newUsageStats()
-	now := time.Now()
-	s.Record(RequestRecord{Status: 200, BytesOut: 100, DurationMs: 5, Time: now, User: "alice", Model: "m1", Key: "sk-a"})
-	s.Record(RequestRecord{Status: 500, BytesOut: 20, DurationMs: 3, Time: now, User: "alice", Model: "m1", Key: "sk-a"})
-	s.Record(RequestRecord{Status: 200, BytesOut: 50, DurationMs: 2, Time: now, User: "bob", Model: "m2", Key: "sk-b"})
+// TestRequestLogSQLBacked：日志挂上 SQLite 表后，Add/Query/Clear 走数据库。
+// USAGE_DB_PATH 为空（内存库）时同样可验证：结果与内存环形缓冲一致。
+func TestRequestLogSQLBacked(t *testing.T) {
+	setupGateway(t)
+	initUsageDB()
+	initStats()
 
-	if s.Totals.Requests != 3 || s.Totals.Errors != 1 || s.Totals.BytesOut != 170 {
-		t.Fatalf("totals = %+v", s.Totals)
+	reqLog.attachTable(logTableRequest)
+	errLog.attachTable(logTableError)
+
+	recordRequest(RequestRecord{ID: "a1", Status: 200})
+	recordRequest(RequestRecord{ID: "e1", Status: 502, ErrMsg: "boom"})
+	recordRequest(RequestRecord{ID: "a2", Status: 200})
+
+	// 全部 + 错误分离
+	all, total := reqLog.Query(1, 10)
+	if total != 3 || len(all) != 3 {
+		t.Fatalf("reqLog query: total=%d len=%d", total, len(all))
 	}
-	if u := s.ByUser["alice"]; u == nil || u.Requests != 2 || u.Errors != 1 {
-		t.Fatalf("alice = %+v", u)
+	errs, etotal := errLog.Query(1, 10)
+	if etotal != 1 || len(errs) != 1 || errs[0].ErrMsg != "boom" {
+		t.Fatalf("errLog query: total=%d recs=%+v", etotal, errs)
 	}
-	if m := s.ByModel["m1"]; m == nil || m.Requests != 2 || m.Errors != 1 {
-		t.Fatalf("m1 = %+v", m)
+
+	// 清空后归一
+	reqLog.Clear()
+	errLog.Clear()
+	if _, total := reqLog.Query(1, 10); total != 0 {
+		t.Fatalf("after clear reqLog total=%d", total)
 	}
-	if k := s.ByKey["sk-b"]; k == nil || k.Requests != 1 {
-		t.Fatalf("sk-b = %+v", k)
+	if _, total := errLog.Query(1, 10); total != 0 {
+		t.Fatalf("after clear errLog total=%d", total)
+	}
+}
+
+// TestRequestLogSQLClip：超出容量后裁剪到环形上限附近。裁剪按每 logPruneEvery
+// 条摊销（避免每条 DELETE），瞬时允许超出约 logPruneEvery 条；attach 时立刻
+// 裁一次，保证重启/日志挂载后不累积过量。
+func TestRequestLogSQLClip(t *testing.T) {
+	setupGateway(t)
+	initUsageDB()
+	initStats()
+
+	for i := 0; i < 500; i++ {
+		reqLog.Add(RequestRecord{ID: fmt.Sprintf("r%d", i), Status: 200})
+	}
+	_, total := reqLog.Query(1, 10000)
+	if total > 100+logPruneEvery || total < 100 {
+		t.Fatalf("wanted clipped within [100, %d), got %d", 100+logPruneEvery, total)
+	}
+
+	// attach 时立即裁剪：重挂载后不应超过容量
+	reqLog.attachTable(logTableRequest)
+	_, total = reqLog.Query(1, 10000)
+	if total != 100 {
+		t.Fatalf("after attach wanted exactly 100, got %d", total)
 	}
 }
 

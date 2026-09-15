@@ -38,17 +38,22 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
   key 全部继承——同一渠道共用同一套池设置，但**每个 key 仍是独立租约/出口 IP**
   （同设置不同 IP）；key 块内可选择「跟随渠道」（默认）或单独覆盖为直连/固定代理/其它池。
 - **请求日志**：仅记录**大模型网关接口**请求（`/v1/*`，如 chat/completions、models、
-  responses；Admin/WebUI 等系统后台请求不记），环形缓冲保留最近 N 条，含接口/渠道/
-  key/模型/token 数/状态/耗时/错误，WebUI 分页展示。**渠道测试请求例外**：无论成败都会
-  写入请求记录留痕，`user` 为发起测试的管理员，`path` 为实际上游路径。
-- **错误日志**：失败请求（状态 ≥400 或带失败原因）单独存入独立的环形缓冲，不会被
-  海量成功请求挤出，便于事后排查；错误信息含**逐 key 失败轨迹**（哪个 key 因什么失败、
+  responses；Admin/WebUI 等系统后台请求不记），**持久化在 `usage.db` 中**（重启不丢），
+  每张表保留最近 `REQ_LOG_SIZE` 条，含接口/渠道/key/模型/token 数/状态/耗时/错误，
+  WebUI 分页展示并支持**关键字过滤当前页**与**点击行展开全部字段**。**渠道测试请求例外**：
+  无论成败都会写入请求记录留痕，`user` 为发起测试的管理员，`path` 为实际上游路径。
+- **错误日志**：失败请求（状态 ≥400 或带失败原因）**单独存一张表**，不会被海量成功
+  请求挤出，便于事后排查；错误信息含**逐 key 失败轨迹**（哪个 key 因什么失败、
   冷却跳过/穿透试探），同样的轨迹也会写进下游 502/429 错误体。
 - **用量统计**：SQLite 逐条记录输入/输出 token，支持 今日/24h/7d/30d/全部 窗口，
-  按下游 key、渠道、模型、上游 key 聚合。
-- **WebUI**：渠道与 key 管理（支持关键字搜索 + 分组过滤）、通用密钥签发、日志、
+  按下游 key、渠道、模型、上游 key 聚合（上游 key 落盘前脱敏，见下）。
+- **WebUI**：渠道与 key 管理（支持关键字搜索 + 分组过滤）、通用密钥签发、日志
+  （列宽自适应、行内展开详情、当前页关键字过滤、自动刷新、默认每页 50 条）、
   用量、代理池租约搜索、连通性测试、手动换 IP / 释放租约、单 key 连通性测试，
-  以及**「渠道测试」独立页面**（按渠道/模型批量测试，逐项返回结果）。
+  以及**「渠道测试」独立页面**（按渠道/模型批量测试，模型清单可点击切换加入/移除，
+  逐项返回结果）；弹窗支持 Esc 与点击遮罩关闭，标题栏滚动时固定；**WebUI 内所有
+  时间统一显示北京时间**（与浏览器/服务器时区无关）。渠道编辑弹窗宽度调高，
+  多 key 列表内部滚动，便于大量 key 时的编辑操作。
 - **版本标识**：后台登录页与顶栏显示构建版本号（`GET /api/version`），构建时自动
   从 `.git` 推导——有 tag 显示 tag（如 `v1.2.3`），无 tag 显示短提交哈希（如 `6a53e28`），
   可用构建参数 `VERSION=xxx` 强制覆盖；本地 `go build` 在 git 仓库内同样显示短提交
@@ -228,7 +233,7 @@ journalctl -u unigate -f             # 跟踪日志
 | `gateway.json` | 渠道、上游 key 与代理配置、下游通用 key（WebUI 管理，原子写入） |
 | `accounts.json` | 管理员与额外用户账号的持久化文件（可选；启动时读取，环境变量优先级更高，手动编辑可固定账号） |
 | `token-secret` | 登录 token 签名密钥（首次启动自动生成；固定后重启不影响已登录状态） |
-| `usage.db` | 用量统计 SQLite 数据库 |
+| `usage.db` | 用量统计 + 请求/错误日志 SQLite 数据库（请求/错误日志持久化，重启不丢） |
 | `lease-assignments.json` | 代理池「key→租约」分配表（保证重启后一号一 IP 不变） |
 
 备份即备份该目录；迁移到新机器：停服 → 拷贝整个目录 → 启动，配置自动加载。
@@ -304,6 +309,12 @@ healthcheck:
 - **`EXTRA_USERS` 仅用于预留多用户登录**：额外用户可登录换取 token，但 WebUI 数据均经
   Admin API 拉取（仅主管理员可见），额外用户目前登录后看不到内容；
 - 上游 key、代理凭证均明文存于 `gateway.json`，请确保数据目录权限（`chmod 600` 各文件或目录 `700`）。
+- **用量库与日志中的上游 key 已脱敏**：`usage.db` 的 `usage_events.key` 与请求/错误日志
+  只存掩码值（`sk-12****abcd`），升级时会自动把历史明文行就地脱敏（幂等）。上游 key 本身
+  仍只在 `gateway.json` 中明文保存。
+- **登录防爆破默认开启**：连续 `LOGIN_FAIL_LOCKOUT`（默认 5）次失败后，按用户名与来源 IP
+  分别锁定（指数退避，封顶 1h）；即使密码正确，锁定期间也返回 429 + `Retry-After`。
+  失败与限流均记入服务日志（不含密码）。
 
 ### 升级
 
@@ -395,9 +406,12 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 | `PORT` | `10010` | 监听端口（网关 `/v1/*` 与 WebUI/Admin 同端口） |
 | `WEBUI_PORT` | 空（同 `PORT`） | 可选：为 WebUI/Admin API 设独立监听端口（如 10070），网关与管理面分离 |
 | `DATA_DIR` | `data`（容器内 `/data`） | 数据目录，**容器部署必须挂载** |
+| `TZ` | 镜像内 `Asia/Shanghai` | 服务进程时区（影响启动/运行日志时间戳）；容器已装 tzdata，改为 `UTC` 等即可。WebUI 显示的时间不受此影响，始终按北京时间渲染 |
 | `GATEWAY_CONFIG_PATH` | `${DATA_DIR}/gateway.json` | 渠道/密钥配置文件（WebUI 管理） |
 | `LEASE_ASSIGN_PATH` | `${DATA_DIR}/lease-assignments.json` | 代理池「key→租约」分配表（跨渠道复用，持久化保证 IP 稳定） |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `admin` | WebUI 管理员账号；Admin API 仅此账号可用 |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `admin` | WebUI 管理员账号；Admin API 仅此账号可用。启动日志只打印用户名，不打印密码 |
+| `LOGIN_FAIL_LOCKOUT` | `5` | 连续登录失败达到该次数后按「用户名」与「来源 IP」分别锁定（指数退避，封顶 1h）。0 = 关闭防爆破 |
+| `LOGIN_FAIL_WINDOW` | `5m` | 登录失败计数窗口，同时是锁定基础时长（超过阈值后每多失败一次翻倍） |
 | `EXTRA_USERS` | 空 | 额外 WebUI 登录用户，`user:pass,user2:pass2`（仅登录 WebUI，无 Admin API 权限） |
 | `TOKEN_TTL` | `24h` | 登录 token 有效期 |
 | `TOKEN_SECRET` | 空 | 登录 token 签名密钥（缺省自动持久化到 data/token-secret） |
@@ -406,9 +420,10 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 | `RATE_LIMIT_COOLDOWN` | `1h` | 429 冷却（无 `Retry-After` 时；有则优先。其余故障不冷却，只换 key；也可在 WebUI「设置」页修改） |
 | `ROTATE_AFTER_5XX` | `3` | 同一 key 连续 5xx 超过该次数自动换出口 IP（0 = 关闭；仅 ipv6pool key 生效；也可在 WebUI「设置」页修改） |
 | `UPSTREAM_HEADER_TIMEOUT` | `10m` | 等待上游响应头超时（LLM 非流式可能较慢，勿设过小） |
+| `KEEPALIVE_INTERVAL` | `15s` | 流式转发心跳：等待上游首包/流静默期间，每该间隔向下游写一帧 SSE 注释（`: keepalive`），防下游反代按空闲超时（常见 60s）掐连接；0 = 关闭。首帧心跳会提前提交 200 + event-stream 头，此后路由彻底失败改用流内 `data: {"error":...}` 帧表达（也可在 WebUI「设置」页修改） |
 | `TEST_TIMEOUT` | `45s` | WebUI 渠道/key 测试的整体超时（默认低于常见反代 60s，避免测试被反代掐断成 504） |
-| `REQ_LOG_SIZE` | `1000` | 请求日志环形缓冲容量（全部请求） |
-| `ERR_LOG_SIZE` | `1000` | 错误日志环形缓冲容量（独立存储，不被成功请求挤出） |
+| `REQ_LOG_SIZE` | `1000` | 请求日志保留条数（持久化在 `usage.db`，重启不丢） |
+| `ERR_LOG_SIZE` | `1000` | 错误日志保留条数（独立表存储，不被成功请求挤出） |
 | `USAGE_DB_PATH` | `${DATA_DIR}/usage.db` | 用量 SQLite 路径（空 = 纯内存） |
 | `USAGE_RETENTION_DAYS` | `30` | 用量保留天数 |
 | `USAGE_MAX_RECORDS` | `100000` | 用量最大条数 |
@@ -433,7 +448,7 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 | `GET /admin/api/pool/leases` | 网关持有的租约列表 |
 | `POST /admin/api/testkey` | 用指定 key 发一条测试请求 `{channel_id, key_id, model?}` |
 | `POST /admin/api/channels/{id}/test-model` | 渠道级批量测试 `{key_id?, first_only?, models?}`（models 每行/逗号分隔，空 = 渠道已启用模型）；逐 key × 逐模型执行，HTTP 层不报错，成败均通过结果项的 `ok` 表达，且每次测试（含失败）都写入请求记录 |
-| `GET /admin/api/requests?page=&page_size=` | 请求日志（分页，兼容旧 `?limit=`） |
+| `GET /admin/api/requests?page=&page_size=` | 请求日志（分页，兼容旧 `?limit=`；数据持久化在 `usage.db`，重启不丢） |
 | `GET /admin/api/errors?page=&page_size=` | 错误日志（失败请求独立存储，分页） |
 | `POST /admin/api/cooling/clear` | 手动解除 key 冷却 `{key_id, channel_id?}`（key 级与按模型冷却全部清除） |
 | `GET /admin/api/usage?window=today\|24h\|7d\|30d\|all` | 用量统计（支持 `?user=&channel=&model=&key=`） |
@@ -463,8 +478,9 @@ go test ./...
 
 覆盖：配置存储、池客户端（申请幂等/换IP/释放/两种 SOCKS 模式/跨渠道复用分配约束
 [同组互斥、跨组共享、最优装填]、分配持久化与 Reconcile 回收）、路由故障转移
-（429/401/网络错误/冷却/模型过滤）、ipv6pool 端到端（真实 SOCKS5 stub 隧道 +
-状态码触发换 IP）、下游鉴权、模型聚合、Admin API、用量库。
+（429/401/网络错误/冷却/模型过滤）、流式保活（心跳、提交后错误帧、JSON 错误二选一、
+非流式跳过）、ipv6pool 端到端（真实 SOCKS5 stub 隧道 + 状态码触发换 IP）、下游鉴权、
+模型聚合、Admin API、用量库（含日志持久化与 key 脱敏迁移）、登录防爆破。
 
 ## 与原 cline2api 的差异（破坏性变更）
 

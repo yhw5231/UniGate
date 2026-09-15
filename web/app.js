@@ -122,9 +122,13 @@ function fillSettingsForm() {
   $("#setRateLimitCooldown").value = s.rate_limit_cooldown_sec ?? "";
   $("#setRotateAfter5xx").value = s.rotate_after_5xx ?? "";
   $("#setMaxRouteTries").value = s.max_route_tries ?? "";
-  const tries = (p.max_route_tries || 0) === 0 ? "全部" : p.max_route_tries;
+  $("#setKeepaliveSec").value = s.keepalive_sec ?? "";
+  // RoutePolicy 无 json tag：生效值按 Go 字段名下发，Duration 序列化为纳秒
+  const ns = (v) => Math.round((v || 0) / 1e9);
+  const tries = (p.MaxRouteTries || 0) === 0 ? "全部" : p.MaxRouteTries;
+  const ka = ns(p.KeepaliveInterval);
   $("#policyNow").textContent =
-    `429 冷却 ${p.rate_limit_cooldown_sec ?? 3600}s · 连续 5xx 超过 ${p.rotate_after_5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key`;
+    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"}`;
 }
 
 $("#settingsSaveBtn").addEventListener("click", async () => {
@@ -140,6 +144,7 @@ $("#settingsSaveBtn").addEventListener("click", async () => {
     num("#setRateLimitCooldown", "rate_limit_cooldown_sec");
     num("#setRotateAfter5xx", "rotate_after_5xx");
     num("#setMaxRouteTries", "max_route_tries");
+    num("#setKeepaliveSec", "keepalive_sec");
     await api("PUT", "/admin/api/settings", body);
     toast("设置已保存并生效");
     await loadState();
@@ -450,6 +455,17 @@ function renderModelChips() {
 }
 $("#chModels").addEventListener("input", () => { renderModelChips(); freeModelSet = new Set(); });
 
+// ---- 弹窗通用交互：Esc 关闭、点击遮罩关闭 ----
+// 模态框统一由 .modal 容器承载；除内容卡片外的区域即遮罩。
+function closeModal(el) { if (el) el.classList.add("hidden"); }
+$$(".modal").forEach((m) => {
+  m.addEventListener("click", (e) => { if (e.target === m) closeModal(m); });
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const open = $$(".modal").filter((m) => !m.classList.contains("hidden"));
+  if (open.length) closeModal(open[open.length - 1]); // 只关最上层
+});
 $$('[data-close="channelModal"]').forEach((b) => b.addEventListener("click", () => $("#channelModal").classList.add("hidden")));
 
 // 自定义请求头
@@ -816,7 +832,7 @@ function renderGWKeys() {
     <td>${esc(k.name)}</td>
     <td><code class="gwkey">${esc(k.key)}</code> <button class="btn small" data-act="copy">复制</button></td>
     <td><label class="inline"><input type="checkbox" data-act="toggle" ${k.enabled ? "checked" : ""}> ${k.enabled ? "启用" : "停用"}</label></td>
-    <td class="muted">${esc((k.created_at || "").replace("T", " ").slice(0, 19))}</td>
+    <td class="muted">${esc(fmtTimeShort(k.created_at))}</td>
     <td><button class="btn small danger" data-act="del">删除</button></td>
   </tr>`).join("");
 
@@ -847,56 +863,129 @@ $("#addGWKeyBtn").addEventListener("click", async () => {
   } catch (e) { toast(e.message, true); }
 });
 
-// ---- 请求日志 / 错误日志（分页） ----
-// 分页状态；页码、每页条数由后端 page/page_size 控制，自动刷新保持当前页
-const logsState = { page: 1, size: 100, pages: 1, total: 0 };
-const errsState = { page: 1, size: 100, pages: 1, total: 0 };
+// ---- 请求日志 / 错误日志（分页 + 行展开 + 客户端过滤） ----
+// 分页状态；页码、每页条数由后端 page/page_size 控制，自动刷新保持当前页。
+// 每行可点击展开全部字段详情（记录 id 上的展开状态内存记忆，翻页/自动刷新保持）。
+const logsState = { page: 1, size: 50, pages: 1, total: 0, recs: [], expanded: {}, q: "" };
+const errsState = { page: 1, size: 50, pages: 1, total: 0, recs: [], expanded: {}, q: "" };
 let errorsTimer = null;
+const LOGS_EMPTY = "暂无请求记录（记录 /v1/* 网关接口请求，以及后台渠道测试发出的上游请求）。";
+const ERRS_EMPTY = "暂无错误记录（失败请求单独记录在此，正常请求不会挤占）。";
 
 function pagerInfo(st) {
   if (!st.total) return "共 0 条";
   return `第 ${st.page} / ${st.pages} 页 · 共 ${st.total} 条`;
 }
 
-function renderLogRows(tbodySel, recs, emptyTip) {
+// toBeijing 把 RFC3339 时间转成北京时间（UTC+8）的 ISO 字符串展示：
+// 无论服务器/浏览器位于哪个时区，WebUI 里的时间一律显示北京时间。
+// 后端下发带偏移的时间戳，先转瞬间再 +8h，用 UTC getter 输出，不依赖
+// 浏览器本地时区与 Intl/ICU 支持。
+function toBeijing(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const b = new Date(d.getTime() + 8 * 3600 * 1000);
+  return b.toISOString(); // 2026-09-15T17:37:14.688Z
+}
+// fmtTimeFull 完整北京时间（含毫秒）。
+function fmtTimeFull(t) { return toBeijing(t).replace("T", " ").replace(/\.\d+Z$/, ""); }
+// fmtTimeShort 北京时间 YYYY-MM-DD HH:MM:SS（表格列内）。
+function fmtTimeShort(t) { return toBeijing(t).replace("T", " ").slice(0, 19); }
+
+// logSearchText 把一条记录的全部字段拍平成搜索文本（当前页全字段不区分大小写过滤）。
+function logSearchText(r) {
+  return [
+    r.time, r.method, r.path, r.status, r.duration_ms, r.channel, r.key,
+    r.model, r.prompt_tokens, r.completion_tokens, r.user, r.client_ip, r.error, r.id,
+  ].filter((v) => v != null && v !== "").join(" ").toLowerCase();
+}
+
+// renderLogRows 渲染日志行（请求/错误两张表共用）。每行首列是展开开关：
+// 点击行展开该条记录的全部字段详情。q 非空时对当前页做客户端过滤。
+function renderLogRows(tbodySel, st, emptyTip) {
   const tbody = $(tbodySel);
+  const q = (st.q || "").trim().toLowerCase();
+  const all = st.recs || [];
+  const recs = q ? all.filter((r) => logSearchText(r).includes(q)) : all;
+  if (!all.length) {
+    tbody.innerHTML = `<tr><td colspan="12" class="muted">${emptyTip}</td></tr>`;
+    return;
+  }
   if (!recs.length) {
-    tbody.innerHTML = `<tr><td colspan="11" class="muted">${emptyTip}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12" class="muted">当前页没有匹配过滤条件的日志（本页共 ${all.length} 条）。</td></tr>`;
     return;
   }
   tbody.innerHTML = recs.map((r) => {
-    // 错误列：列内限高滚动（超长失败轨迹不撑高整行），悬停 title 看全文
+    const id = r.id || "";
+    const open = !!(id && st.expanded[id]);
     const err = r.error || "";
     const errCell = err
-      ? `<td class="err" title="${esc(err)}"><div class="errwrap">${esc(err)}</div></td>`
+      ? `<td class="err" title="${esc(err)}">${esc(err)}</td>`
       : `<td class="err"></td>`;
-    return `<tr>
-      <td class="muted" title="${esc(r.time || "")}">${esc((r.time || "").replace("T", " ").slice(2, 19))}</td>
+    return `<tr class="${open ? "tog-open" : ""}" data-id="${esc(id)}">
+      <td class="tw tr-toggle" title="点击展开/收起全部字段">${open ? "▾" : "▸"}</td>
+      <td class="muted nowrap" title="${esc(r.time || "")}">${esc(fmtTimeShort(r.time))}</td>
       <td class="muted" title="${esc(r.path || "")}">${esc(r.path || "")}</td>
       <td><span class="badge ${r.status && r.status < 400 ? "on" : "off"}">${r.status || "ERR"}</span></td>
-      <td>${r.duration_ms}ms</td>
+      <td class="nowrap">${r.duration_ms}ms</td>
       <td title="${esc(r.channel || "")}">${esc(r.channel || "")}</td>
       <td class="muted" title="${esc(r.key || "")}">${esc(r.key || "")}</td>
       <td title="${esc(r.model || "")}">${esc(r.model || "")}</td>
-      <td class="muted">${r.prompt_tokens || 0} / ${r.completion_tokens || 0}</td>
+      <td class="muted nowrap">${r.prompt_tokens || 0} / ${r.completion_tokens || 0}</td>
       <td title="${esc(r.user || "")}">${esc(r.user || "")}</td>
-      <td title="${esc(r.client_ip || "")}">${esc(r.client_ip || "")}</td>
+      <td class="nowrap" title="${esc(r.client_ip || "")}">${esc(r.client_ip || "")}</td>
       ${errCell}
-    </tr>`;
+    </tr>
+    ${open ? logDetailRow(id, r) : ""}`;
   }).join("");
+  // 展开/收起：点击行任意处切换（展开区是独立行，选中复制不受影响）
+  tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const id = tr.dataset.id;
+      if (st.expanded[id]) delete st.expanded[id]; else st.expanded[id] = true;
+      renderLogRows(tbodySel, st, emptyTip);
+    });
+  });
 }
 
-// fetchLogPage 拉取一页；当前页超出总页数时回退到最后一页重取一次
+// logDetailRow 展开区：该记录全字段（含 Method/BytesOut/完整时间/完整错误），
+// 行内标题即列名，与摘要列一一对应，方便对照查看。
+function logDetailRow(id, r) {
+  const f = (k, v) => `<div class="f"><span class="k">${k}</span><span class="v">${esc(v ?? "")}</span></div>`;
+  return `<tr class="log-detail-row"><td colspan="12"><div class="log-detail">
+    <div class="g">
+      ${f("ID", id)}
+      ${f("时间", fmtTimeFull(r.time))}
+      ${f("方法", r.method)}
+      ${f("接口", r.path)}
+      ${f("状态", r.status != null ? r.status : "")}
+      ${f("耗时", r.duration_ms != null ? r.duration_ms + "ms" : "")}
+      ${f("输出字节", r.bytes_out != null ? r.bytes_out + " B" : "")}
+      ${f("渠道", r.channel)}
+      ${f("key", r.key)}
+      ${f("模型", r.model)}
+      ${f("Tokens 入/出", (r.prompt_tokens || 0) + " / " + (r.completion_tokens || 0))}
+      ${f("下游", r.user)}
+      ${f("出口", r.client_ip)}
+    </div>
+    ${r.error ? `<div class="e">${esc(r.error)}</div>` : ""}
+  </div></td></tr>`;
+}
+
+// fetchLogPage 拉取一页；当前页超出总页数时回退到最后一页重取一次。
+// 记录缓存到状态对象（st.recs），过滤/展开/自动刷新共用。
 async function fetchLogPage(url, st, pagerSel, tbodySel, emptyTip) {
   try {
     const data = await api("GET", `${url}?page=${st.page}&page_size=${st.size}`);
     st.total = data.total || 0;
     st.pages = Math.max(1, data.total_pages || 1);
+    st.recs = data.records || [];
     if (st.page > st.pages) {
       st.page = st.pages;
       return fetchLogPage(url, st, pagerSel, tbodySel, emptyTip);
     }
-    renderLogRows(tbodySel, data.records || [], emptyTip);
+    renderLogRows(tbodySel, st, emptyTip);
     $(pagerSel).textContent = pagerInfo(st);
     return true;
   } catch (e) { toast(e.message, true); return false; }
@@ -908,8 +997,7 @@ function syncPagerBtns(prefix, st) {
 }
 
 async function refreshLogs() {
-  await fetchLogPage("/admin/api/requests", logsState, "#logsPagerInfo", "#logTable tbody",
-    "暂无请求记录（记录 /v1/* 网关接口请求，以及后台渠道测试发出的上游请求）。");
+  await fetchLogPage("/admin/api/requests", logsState, "#logsPagerInfo", "#logTable tbody", LOGS_EMPTY);
   syncPagerBtns("logs", logsState);
 }
 
@@ -940,11 +1028,14 @@ function wirePager(prefix, st, refresh) {
 wirePager("logs", logsState, refreshLogs);
 
 async function refreshErrors() {
-  await fetchLogPage("/admin/api/errors", errsState, "#errorsPagerInfo", "#errTable tbody",
-    "暂无错误记录（失败请求单独记录在此，正常请求不会挤占）。");
+  await fetchLogPage("/admin/api/errors", errsState, "#errorsPagerInfo", "#errTable tbody", ERRS_EMPTY);
   syncPagerBtns("errors", errsState);
 }
 wirePager("errors", errsState, refreshErrors);
+
+// 客户端过滤：输入即时过滤当前页已加载的记录；自动刷新只重新拉页、不清空搜索。
+$("#logsSearch").addEventListener("input", () => { logsState.q = $("#logsSearch").value; renderLogRows("#logTable tbody", logsState, LOGS_EMPTY); });
+$("#errorsSearch").addEventListener("input", () => { errsState.q = $("#errorsSearch").value; renderLogRows("#errTable tbody", errsState, ERRS_EMPTY); });
 
 // 清空日志：只清内存环形缓冲，不影响用量统计
 async function clearLogs(scope, st, refresh, label) {
@@ -975,22 +1066,32 @@ function testChannelSel() {
   if (chans.some((c) => c.id === cur)) sel.value = cur;
 }
 
+// testModelChips 渲染「已启用模型」chips：已在测试清单中的高亮（✓）并可点击移除，
+// 未在清单中的点击加入——同一 chip 点击即切换加入/移除。
 function testModelChips() {
   const wrap = $("#testModelChips");
   const ch = ((STATE && STATE.channels) || []).find((c) => c.id === $("#testChannel").value);
   const models = (ch && ch.models) || [];
+  const chosen = new Set($("#testModels").value.split("\n").map((s) => s.trim()).filter(Boolean));
   wrap.innerHTML = models.length
-    ? models.map((m) => `<span class="chip clickable" data-model="${esc(m)}" title="点击加入测试清单">+ ${esc(m)}</span>`).join("")
+    ? models.map((m) => {
+        const has = chosen.has(m);
+        return `<span class="chip clickable ${has ? "chip-on" : ""}" data-model="${esc(m)}"
+          title="${has ? "点击从测试清单移除" : "点击加入测试清单"}">${has ? "✓" : "+"} ${esc(m)}</span>`;
+      }).join("")
     : '<span class="muted" style="font-size:12px">渠道未配置启用模型</span>';
   wrap.querySelectorAll(".chip").forEach((chip) => chip.addEventListener("click", () => {
     const m = chip.dataset.model;
     const lines = $("#testModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
-    if (!lines.includes(m)) {
-      lines.push(m);
-      $("#testModels").value = lines.join("\n");
-    }
+    $("#testModels").value = lines.includes(m)
+      ? lines.filter((l) => l !== m).join("\n")  // 再点一次：从清单移除
+      : [...lines, m].join("\n");                // 首次点击：加入清单
+    testModelChips(); // 刷新 ✓/移除态
   }));
 }
+
+// 手工编辑测试清单文本框时同步 chips 的选中态（避免高亮与内容不一致）
+$("#testModels").addEventListener("input", testModelChips);
 
 function refreshTestTab() {
   testChannelSel();
@@ -1170,7 +1271,7 @@ async function refreshLeases() {
       <td>${l.multiplex ? "复用基础端口" : esc(l.port)}</td>
       <td>${l.multiplex ? "multiplex" : "per_ipv6"}</td>
       <td>${l.requests}</td>
-      <td class="muted">${esc((l.last_rotate || "").replace("T", " ").slice(0, 19))}</td>
+      <td class="muted">${esc(fmtTimeShort(l.last_rotate))}</td>
       <td>
         <button class="btn small" data-act="lrotate">换IP</button>
         <button class="btn small danger" data-act="lrelease">释放</button>

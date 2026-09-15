@@ -31,6 +31,10 @@ type Config struct {
 	ExtraUsers    map[string]string
 	TokenTTL      time.Duration
 
+	// 登录防爆破：连续失败达到阈值后锁定（指数退避，内存态重启清零）
+	LoginFailLockout int           // 连续失败锁定阈值（默认 5，0 = 关闭）
+	LoginFailWindow  time.Duration // 失败计数窗口与基础锁定时长（默认 5m）
+
 	// 下游网关
 	GWKeyAuth bool // 是否校验下游通用 key
 
@@ -41,6 +45,10 @@ type Config struct {
 
 	// 上游传输
 	UpstreamHeaderTimeout time.Duration
+
+	// 流式保活：等待上游首包/流静默期间向下游发 SSE 注释心跳的间隔
+	// （默认 15s，0 = 关闭）。须低于下游反代/客户端的空闲超时（常见 60s）
+	KeepaliveInterval time.Duration
 
 	// 测试
 	TestTimeout time.Duration // 渠道/key 测试端点的整体超时（默认 45s，低于常见反代 60s）
@@ -123,6 +131,9 @@ func loadConfig() Config {
 		ExtraUsers:    extra,
 		TokenTTL:      durationEnv("TOKEN_TTL", 24*time.Hour),
 
+		LoginFailLockout: intEnv("LOGIN_FAIL_LOCKOUT", 5),
+		LoginFailWindow:  durationEnv("LOGIN_FAIL_WINDOW", 5*time.Minute),
+
 		GWKeyAuth: gwKeyAuth,
 
 		MaxRouteTries:     intEnv("MAX_ROUTE_TRIES", 0),
@@ -130,6 +141,8 @@ func loadConfig() Config {
 		RotateAfter5xx:    intEnv("ROTATE_AFTER_5XX", 3),
 
 		UpstreamHeaderTimeout: durationEnv("UPSTREAM_HEADER_TIMEOUT", 10*time.Minute),
+
+		KeepaliveInterval: durationEnv("KEEPALIVE_INTERVAL", 15*time.Second),
 
 		TestTimeout: durationEnv("TEST_TIMEOUT", 45*time.Second),
 
@@ -149,8 +162,9 @@ func resetCfgForTest() {
 	policy.Store(defaultPolicy())
 	leaseMgr = newLeaseManager()
 	globalTransportCache = &transportCache{trs: map[string]*http.Transport{}}
-	initStats()
+	resetLoginThrottle()
 	initUsageDB()
+	initStats()
 }
 
 const defaultPort = "10010"
@@ -199,6 +213,7 @@ type RoutePolicy struct {
 	RateLimitCooldown time.Duration // 429 冷却（无 Retry-After 时）
 	RotateAfter5xx    int           // 连续 5xx 换出口阈值（0 = 关闭）
 	MaxRouteTries     int           // 单请求最多尝试 key 数（0 = 全部）
+	KeepaliveInterval time.Duration // 流式心跳间隔（0 = 关闭）
 }
 
 var policy atomic.Pointer[RoutePolicy]
@@ -209,6 +224,7 @@ func defaultPolicy() *RoutePolicy {
 		RateLimitCooldown: cfg.RateLimitCooldown,
 		RotateAfter5xx:    cfg.RotateAfter5xx,
 		MaxRouteTries:     cfg.MaxRouteTries,
+		KeepaliveInterval: cfg.KeepaliveInterval,
 	}
 }
 
@@ -232,6 +248,9 @@ func applySettings(set GatewaySettings) {
 	}
 	if set.MaxRouteTries != nil {
 		p.MaxRouteTries = *set.MaxRouteTries
+	}
+	if set.KeepaliveSec != nil {
+		p.KeepaliveInterval = time.Duration(*set.KeepaliveSec) * time.Second
 	}
 	policy.Store(p)
 }

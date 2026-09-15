@@ -5,6 +5,7 @@ package main
 
 import (
 	"database/sql"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -38,6 +39,8 @@ type UsageDB struct {
 	appendCount   int
 }
 
+// usageSchema 用量库 + 请求/错误日志表。日志表与用量事件分离：用量库是
+// 聚合账本（可按维度分组），日志表保存逐条请求明细（含失败诊断），重启不丢。
 const usageSchema = `
 CREATE TABLE IF NOT EXISTS usage_events (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,7 +59,57 @@ CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_events(user);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_events(model);
 CREATE INDEX IF NOT EXISTS idx_usage_key ON usage_events(key);
 CREATE INDEX IF NOT EXISTS idx_usage_channel ON usage_events(channel);
+
+CREATE TABLE IF NOT EXISTS request_log (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	rid TEXT NOT NULL DEFAULT '',
+	time INTEGER NOT NULL,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	method TEXT NOT NULL DEFAULT '',
+	path TEXT NOT NULL DEFAULT '',
+	status INTEGER NOT NULL DEFAULT 0,
+	bytes_out INTEGER NOT NULL DEFAULT 0,
+	client_ip TEXT NOT NULL DEFAULT '',
+	user TEXT NOT NULL DEFAULT '',
+	channel TEXT NOT NULL DEFAULT '',
+	model TEXT NOT NULL DEFAULT '',
+	key TEXT NOT NULL DEFAULT '',
+	prompt_tokens INTEGER NOT NULL DEFAULT 0,
+	completion_tokens INTEGER NOT NULL DEFAULT 0,
+	error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_request_log_time ON request_log(time);
+
+CREATE TABLE IF NOT EXISTS error_log (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	rid TEXT NOT NULL DEFAULT '',
+	time INTEGER NOT NULL,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	method TEXT NOT NULL DEFAULT '',
+	path TEXT NOT NULL DEFAULT '',
+	status INTEGER NOT NULL DEFAULT 0,
+	bytes_out INTEGER NOT NULL DEFAULT 0,
+	client_ip TEXT NOT NULL DEFAULT '',
+	user TEXT NOT NULL DEFAULT '',
+	channel TEXT NOT NULL DEFAULT '',
+	model TEXT NOT NULL DEFAULT '',
+	key TEXT NOT NULL DEFAULT '',
+	prompt_tokens INTEGER NOT NULL DEFAULT 0,
+	completion_tokens INTEGER NOT NULL DEFAULT 0,
+	error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_error_log_time ON error_log(time);
 `
+
+// logTableRequest / logTableError 允许的日志表名（SQL 表名白名单，杜绝拼接注入）。
+const (
+	logTableRequest = "request_log"
+	logTableError   = "error_log"
+)
+
+func validLogTable(table string) bool {
+	return table == logTableRequest || table == logTableError
+}
 
 // usageMigrations 老库补列（ALTER TABLE 幂等性由检查保证）。
 var usageMigrations = []string{
@@ -150,6 +203,16 @@ func (db *UsageDB) cleanupLocked() {
 		_, _ = db.db.Exec(`DELETE FROM usage_events WHERE id NOT IN (
 			SELECT id FROM usage_events ORDER BY time DESC, id DESC LIMIT ?)`, db.maxRecords)
 	}
+}
+
+// Available 报告底层数据库是否可用（打开失败时为 false，全部读写降级为空操作）。
+func (db *UsageDB) Available() bool {
+	if db == nil {
+		return false
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.db != nil
 }
 
 // Count 返回当前事件总数。
@@ -329,12 +392,158 @@ func (db *UsageDB) queryBreakdown(where string, args []any, col string) []UsageB
 	return out
 }
 
+// ---- 请求/错误日志（持久化环形缓冲） ----
+
+// LogAppend 追加一条日志记录，并把表裁剪到 keep 条以内（保留最新）。
+// keep <= 0 时仅追加不裁剪。
+func (db *UsageDB) LogAppend(table string, rec RequestRecord, keep int) {
+	if db == nil || !validLogTable(table) {
+		return
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.db == nil {
+		return
+	}
+	_, err := db.db.Exec(`INSERT INTO `+table+`
+		(rid, time, duration_ms, method, path, status, bytes_out, client_ip, user, channel, model, key, prompt_tokens, completion_tokens, error)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		rec.ID, rec.Time.UnixNano(), rec.DurationMs, rec.Method, rec.Path, rec.Status,
+		rec.BytesOut, rec.ClientIP, rec.User, rec.Channel, rec.Model, rec.Key,
+		rec.PromptTokens, rec.CompletionTokens, rec.ErrMsg)
+	if err != nil {
+		log.Printf("usage db: append %s: %v", table, err)
+		return
+	}
+	if keep > 0 {
+		// 环形缓冲语义：只保留最新 keep 条
+		_, _ = db.db.Exec(`DELETE FROM `+table+` WHERE id NOT IN (
+			SELECT id FROM `+table+` ORDER BY id DESC LIMIT ?)`, keep)
+	}
+}
+
+// LogQuery 分页返回日志（最新在前）。返回 (记录, 总数)。
+func (db *UsageDB) LogQuery(table string, page, pageSize int) ([]RequestRecord, int) {
+	if db == nil || !validLogTable(table) {
+		return []RequestRecord{}, 0
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.db == nil {
+		return []RequestRecord{}, 0
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	var total int
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&total); err != nil {
+		return []RequestRecord{}, 0
+	}
+	rows, err := db.db.Query(`SELECT rid, time, duration_ms, method, path, status, bytes_out,
+		client_ip, user, channel, model, key, prompt_tokens, completion_tokens, error
+		FROM `+table+` ORDER BY id DESC LIMIT ? OFFSET ?`, pageSize, (page-1)*pageSize)
+	if err != nil {
+		return []RequestRecord{}, total
+	}
+	defer rows.Close()
+	out := make([]RequestRecord, 0, pageSize)
+	for rows.Next() {
+		var (
+			rec  RequestRecord
+			unix int64
+		)
+		if err := rows.Scan(&rec.ID, &unix, &rec.DurationMs, &rec.Method, &rec.Path, &rec.Status,
+			&rec.BytesOut, &rec.ClientIP, &rec.User, &rec.Channel, &rec.Model, &rec.Key,
+			&rec.PromptTokens, &rec.CompletionTokens, &rec.ErrMsg); err != nil {
+			continue
+		}
+		rec.Time = time.Unix(0, unix)
+		rec.Duration = time.Duration(rec.DurationMs) * time.Millisecond
+		out = append(out, rec)
+	}
+	return out, total
+}
+
+// logPrune 把日志表裁剪到最新 keep 条（环形上限）。
+func (db *UsageDB) logPrune(table string, keep int) {
+	if db == nil || !validLogTable(table) || keep <= 0 {
+		return
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.db == nil {
+		return
+	}
+	_, _ = db.db.Exec(`DELETE FROM `+table+` WHERE id NOT IN (
+		SELECT id FROM `+table+` ORDER BY id DESC LIMIT ?)`, keep)
+}
+
+// LogClear 清空日志表，返回删除条数。
+func (db *UsageDB) LogClear(table string) int64 {
+	if db == nil || !validLogTable(table) {
+		return 0
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.db == nil {
+		return 0
+	}
+	res, err := db.db.Exec(`DELETE FROM ` + table)
+	if err != nil {
+		log.Printf("usage db: clear %s: %v", table, err)
+		return 0
+	}
+	n, _ := res.RowsAffected()
+	return n
+}
+
+// MaskStoredKeys 把历史遗留的明文上游 key 就地脱敏（升级迁移，幂等：
+// 已含 **** 掩码的行不再匹配）。返回更新的行数。上游 key 属于凭证，长期
+// 落盘在用量库里会随备份/迁移扩散，故升级时就地收敛为脱敏值。
+func (db *UsageDB) MaskStoredKeys() int64 {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.db == nil {
+		return 0
+	}
+	rows, err := db.db.Query(`SELECT DISTINCT key FROM usage_events
+		WHERE key <> '' AND key NOT LIKE '%****%'`)
+	if err != nil {
+		return 0
+	}
+	var plain []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err == nil && k != "" {
+			plain = append(plain, k)
+		}
+	}
+	rows.Close()
+	var n int64
+	for _, k := range plain {
+		res, err := db.db.Exec(`UPDATE usage_events SET key = ? WHERE key = ?`, maskKey(k), k)
+		if err != nil {
+			continue
+		}
+		if c, err := res.RowsAffected(); err == nil {
+			n += c
+		}
+	}
+	return n
+}
+
 // ---- 全局实例 ----
 
 var usageDB *UsageDB
 
 // initUsageDB 用配置初始化用量库（幂等，reloadConfig 时调用）。
 func initUsageDB() {
+	if usageDB != nil {
+		_ = usageDB.Close() // 释放旧连接，避免 reload 泄漏
+	}
 	usageDB = newUsageDB(cfg.UsageDBPath, cfg.UsageRetentionDays, cfg.UsageMaxRecords)
 }
 

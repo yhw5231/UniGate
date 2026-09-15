@@ -5,7 +5,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -340,48 +339,6 @@ func readSocksAddr(c io.Reader, atyp byte) (string, error) {
 		return net.IP(b).String(), nil
 	}
 	return "", fmt.Errorf("unsupported ATYP %d", atyp)
-}
-
-// ---- HTTP 代理 CONNECT 隧道 ----
-
-// dialViaHTTPProxy 通过 HTTP 正向代理建立到目标的 TCP 连接（CONNECT 隧道）。
-func dialViaHTTPProxy(ctx context.Context, route *ProxyRoute, target string) (net.Conn, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", route.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("connect to proxy %s: %w", route.Addr, err)
-	}
-	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
-	if route.User != "" {
-		cred := base64.StdEncoding.EncodeToString([]byte(route.User + ":" + route.Pass))
-		req += "Proxy-Authorization: Basic " + cred + "\r\n"
-	}
-	req += "\r\n"
-	if _, err := conn.Write([]byte(req)); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("write CONNECT: %w", err)
-	}
-	br := bufio.NewReader(conn)
-	statusLine, err := br.ReadString('\n')
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("read CONNECT response: %w", err)
-	}
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("read CONNECT headers: %w", err)
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
-	}
-	if !strings.Contains(statusLine, " 200 ") {
-		conn.Close()
-		return nil, fmt.Errorf("CONNECT to %s returned: %s", target, strings.TrimSpace(statusLine))
-	}
-	return &bufferedConn{Conn: conn, reader: br}, nil
 }
 
 // bufferedConn 包装 net.Conn，提供一个 bufio.Reader 用于读取已缓冲的数据。

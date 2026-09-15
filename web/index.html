@@ -107,6 +107,7 @@
     <section id="tab-logs" class="tabpane hidden">
       <div class="row">
         <h2>请求日志</h2>
+        <input id="logsSearch" placeholder="搜索时间/接口/状态/渠道/key/模型/下游/错误…（当前页）" style="max-width:320px">
         <div class="spacer"></div>
         <label class="inline"><input type="checkbox" id="logsAuto"> 自动刷新</label>
         <button id="logsRefresh" class="btn">刷新</button>
@@ -116,19 +117,14 @@
         <span class="muted" id="logsPagerInfo">—</span>
         <span class="spacer"></span>
         <label class="inline">每页
-          <select id="logsPageSize"><option>50</option><option selected>100</option><option>200</option><option>500</option></select>
+          <select id="logsPageSize"><option selected>50</option><option>100</option><option>200</option><option>500</option></select>
         </label>
         <button id="logsPrev" class="btn small">← 上一页</button>
         <button id="logsNext" class="btn small">下一页 →</button>
       </div>
       <div class="tbl-scroll">
       <table class="tbl logtbl" id="logTable">
-        <colgroup>
-          <col class="c-time"><col class="c-path"><col class="c-status"><col class="c-dur">
-          <col class="c-chan"><col class="c-key"><col class="c-model"><col class="c-tok">
-          <col class="c-user"><col class="c-ip"><col>
-        </colgroup>
-        <thead><tr><th>时间</th><th>接口</th><th>状态</th><th>耗时</th><th>渠道</th><th>key</th><th>模型</th><th>Tokens (入/出)</th><th>下游</th><th>出口</th><th>错误</th></tr></thead>
+        <thead><tr><th class="tw" title="点击行展开/收起详情"></th><th>时间</th><th>接口</th><th>状态</th><th>耗时</th><th>渠道</th><th>key</th><th>模型</th><th>Tokens (入/出)</th><th>下游</th><th>出口</th><th>错误</th></tr></thead>
         <tbody></tbody>
       </table>
       </div>
@@ -138,6 +134,7 @@
     <section id="tab-errors" class="tabpane hidden">
       <div class="row">
         <h2>错误日志</h2>
+        <input id="errorsSearch" placeholder="搜索时间/接口/状态/渠道/key/模型/下游/错误…（当前页）" style="max-width:320px">
         <div class="spacer"></div>
         <label class="inline"><input type="checkbox" id="errorsAuto"> 自动刷新</label>
         <button id="errorsRefresh" class="btn">刷新</button>
@@ -148,19 +145,14 @@
         <span class="muted" id="errorsPagerInfo">—</span>
         <span class="spacer"></span>
         <label class="inline">每页
-          <select id="errorsPageSize"><option>50</option><option selected>100</option><option>200</option><option>500</option></select>
+          <select id="errorsPageSize"><option selected>50</option><option>100</option><option>200</option><option>500</option></select>
         </label>
         <button id="errorsPrev" class="btn small">← 上一页</button>
         <button id="errorsNext" class="btn small">下一页 →</button>
       </div>
       <div class="tbl-scroll">
       <table class="tbl logtbl" id="errTable">
-        <colgroup>
-          <col class="c-time"><col class="c-path"><col class="c-status"><col class="c-dur">
-          <col class="c-chan"><col class="c-key"><col class="c-model"><col class="c-tok">
-          <col class="c-user"><col class="c-ip"><col>
-        </colgroup>
-        <thead><tr><th>时间</th><th>接口</th><th>状态</th><th>耗时</th><th>渠道</th><th>key</th><th>模型</th><th>Tokens (入/出)</th><th>下游</th><th>出口</th><th>错误</th></tr></thead>
+        <thead><tr><th class="tw" title="点击行展开/收起详情"></th><th>时间</th><th>接口</th><th>状态</th><th>耗时</th><th>渠道</th><th>key</th><th>模型</th><th>Tokens (入/出)</th><th>下游</th><th>出口</th><th>错误</th></tr></thead>
         <tbody></tbody>
       </table>
       </div>
@@ -216,22 +208,31 @@
         <div class="spacer"></div>
         <button id="settingsSaveBtn" class="btn primary">保存设置</button>
       </div>
-      <div class="panel" style="max-width:720px">
-        <h3 style="margin:0 0 4px">路由策略</h3>
-        <p class="muted" style="font-size:12px;margin:0 0 12px">保存后立即生效（持久化，无需重启）。留空 = 使用环境变量默认值。</p>
-        <div class="grid2">
-          <label title="上游返回 429 且无 Retry-After 头时的冷却时长；429 是唯一会冷却 key 的故障">429 冷却秒数（无 Retry-After 时）
-            <input id="setRateLimitCooldown" type="number" min="0" placeholder="环境变量 RATE_LIMIT_COOLDOWN（默认 3600）">
+      <div class="panel settings-panel">
+        <div class="settings-head">
+          <h3>路由策略</h3>
+          <span class="muted" style="font-size:12px">保存后立即生效（持久化，无需重启）。留空 = 使用环境变量默认值。</span>
+        </div>
+        <div class="settings-grid">
+          <label class="fld" title="上游返回 429 且无 Retry-After 头时的冷却时长；429 是唯一会冷却 key 的故障">429 冷却秒数
+            <input id="setRateLimitCooldown" type="number" min="0" placeholder="默认 3600">
+            <span class="hint">无 Retry-After 时（秒）</span>
           </label>
-          <label title="同一 key 连续 5xx 超过该次数自动换出口 IP（第 N+1 次触发）；0 = 关闭。正常请求会清零计数">连续 5xx 换出口阈值
-            <input id="setRotateAfter5xx" type="number" min="0" placeholder="环境变量 ROTATE_AFTER_5XX（默认 3）">
+          <label class="fld" title="同一 key 连续 5xx 超过该次数自动换出口 IP（第 N+1 次触发）；0 = 关闭。正常请求会清零计数">连续 5xx 换出口阈值
+            <input id="setRotateAfter5xx" type="number" min="0" placeholder="默认 3">
+            <span class="hint">0 = 关闭</span>
           </label>
-          <label title="单次下游请求最多尝试的 (渠道,key) 候选数；0 = 全部尝试">单请求最多尝试 key 数
-            <input id="setMaxRouteTries" type="number" min="0" placeholder="环境变量 MAX_ROUTE_TRIES（默认 0 = 全部）">
+          <label class="fld" title="单次下游请求最多尝试的 (渠道,key) 候选数；0 = 全部尝试">单请求最多尝试 key 数
+            <input id="setMaxRouteTries" type="number" min="0" placeholder="默认 0">
+            <span class="hint">0 = 全部尝试</span>
+          </label>
+          <label class="fld" title="流式请求等待上游首包/流静默期间向下游发 SSE 注释心跳的间隔，保证反代/客户端不因空闲超时掐断连接（须低于其空闲超时，常见 60s）。首帧心跳会提前提交 200+event-stream 头，此后路由失败改用流内 error 帧表达；非流式不受影响。0 = 关闭">流式心跳间隔
+            <input id="setKeepaliveSec" type="number" min="0" placeholder="默认 15">
+            <span class="hint">秒，0 = 关闭</span>
           </label>
         </div>
-        <p class="muted" style="font-size:12px;margin:10px 0 0">
-          当前生效：<span id="policyNow" class="muted"></span>
+        <p class="muted settings-now">
+          当前生效：<span id="policyNow"></span>
         </p>
       </div>
     </section>
@@ -303,7 +304,9 @@
       <p class="muted" style="font-size:12px;margin:0 0 8px">为整个渠道统一设置代理（如代理池）：未单独配置代理的 key 全部继承此设置——同一渠道内每个 key 仍是独立租约/出口 IP（同设置不同 IP）。key 块内仍可单独覆盖。</p>
 
       <h4>上游 Key（按顺序故障转移）</h4>
-      <div id="chKeys"></div>
+      <div id="chKeysWrap" class="keys-scroll">
+        <div id="chKeys"></div>
+      </div>
       <div class="row" style="margin-top:6px">
         <button class="btn small" id="addKeyBtn">+ 添加 Key</button>
         <button class="btn small" id="toggleBulkBtn">⇊ 批量导入</button>

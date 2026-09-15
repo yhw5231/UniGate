@@ -35,7 +35,9 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
 }
 .tab.active { background: var(--panel2); color: var(--text); }
 .spacer { flex: 1; }
-main { max-width: 1200px; margin: 0 auto; padding: 20px; }
+/* main 占满视口宽度：日志等表格页充分利用两侧空间，不在宽屏下留白。
+   卡片型内容（渠道列表）另行限宽，避免超宽屏下横向拉得过长。 */
+main { width: 100%; margin: 0 auto; padding: 20px 24px; }
 .row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .row h2 { margin: 0; font-size: 18px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -70,21 +72,23 @@ textarea { resize: vertical; }
 .tbl th { color: var(--muted); font-weight: 600; background: var(--panel2); }
 .tbl tr:last-child td { border-bottom: none; }
 
-/* 请求/错误日志表：内容自适应列宽（不截断、全部可见），长文本折行展示；
-   窗口过窄时表格横向滚动，不压缩列宽。短列（时间/状态/耗时/Tokens/下游/出口）
-   不折行保持整齐，长文本（接口/渠道/key/模型/错误）按内容换行。 */
+/* 请求/错误日志表：表格铺满容器、列宽按内容自适应；内容默认单行完整显示
+   （不换行、不压缩，宁可在窄窗口下整表横向滚动也不挤换行），
+   仅错误列限宽换行（超长失败轨迹需要可读）。 */
 .tbl-scroll { overflow-x: auto; }
-.tbl.logtbl { table-layout: auto; min-width: 1320px; }
-.tbl.logtbl th, .tbl.logtbl td { white-space: normal; word-break: break-all; overflow-wrap: anywhere; }
-.tbl.logtbl th.tw, .tbl.logtbl td.tw { width: 34px; white-space: nowrap; }
-.tbl.logtbl .nowrap { white-space: nowrap; word-break: keep-all; }
+.tbl.logtbl { table-layout: auto; width: 100%; }
+.tbl.logtbl th, .tbl.logtbl td { white-space: nowrap; }
+.tbl.logtbl th.tw, .tbl.logtbl td.tw { width: 34px; }
 .tbl.logtbl th { position: sticky; top: 0; z-index: 2; }
 /* 覆盖渠道测试页 td.err 的限宽截断样式（style.css .t-snippet 规则），
-   日志表错误列必须完整换行展示，不得限宽/省略 */
+   日志表错误列限宽换行完整展示，不省略 */
 .tbl.logtbl td.err {
-  display: table-cell; max-width: none; overflow: visible;
-  text-overflow: clip; white-space: pre-wrap;
+  display: table-cell; overflow: visible;
+  text-overflow: clip; white-space: pre-wrap; word-break: break-all;
+  width: 30%; min-width: 240px;
 }
+/* 展开详情行：跨列单元格保持正常换行，不受上方 nowrap 影响 */
+.tbl.logtbl td[colspan] { white-space: normal; word-break: break-all; }
 /* 展开详情 */
 .log-detail {
   display: block; background: var(--panel2); border-top: 1px solid var(--border);
@@ -109,7 +113,7 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 
 /* 渠道卡片 */
 .channel-list { display: flex; flex-direction: column; gap: 10px; }
-.channel-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.channel-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; max-width: 1320px; }
 .channel-card .head { display: flex; align-items: center; gap: 10px; }
 .channel-card .head .name { font-weight: 700; font-size: 15px; }
 .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; }

@@ -43,6 +43,9 @@ type Config struct {
 	RateLimitCooldown time.Duration // 429 冷却（无 Retry-After 时；其余故障不冷却，只换 key）
 	RotateAfter5xx    int           // 连续 5xx 超过该次数自动换出口 IP（默认 3，0 = 关闭）
 
+	// 账号调度默认模式（渠道未显式配置时使用）：failover / round_robin
+	DefaultSchedule string
+
 	// 上游传输
 	UpstreamHeaderTimeout time.Duration
 
@@ -139,6 +142,7 @@ func loadConfig() Config {
 		MaxRouteTries:     intEnv("MAX_ROUTE_TRIES", 0),
 		RateLimitCooldown: durationEnv("RATE_LIMIT_COOLDOWN", time.Hour),
 		RotateAfter5xx:    intEnv("ROTATE_AFTER_5XX", 3),
+		DefaultSchedule:   normalizeScheduleDefault(getenv("DEFAULT_SCHEDULE", "")),
 
 		UpstreamHeaderTimeout: durationEnv("UPSTREAM_HEADER_TIMEOUT", 10*time.Minute),
 
@@ -214,6 +218,7 @@ type RoutePolicy struct {
 	RotateAfter5xx    int           // 连续 5xx 换出口阈值（0 = 关闭）
 	MaxRouteTries     int           // 单请求最多尝试 key 数（0 = 全部）
 	KeepaliveInterval time.Duration // 流式心跳间隔（0 = 关闭）
+	DefaultSchedule   string        // 默认账号调度：failover / round_robin（渠道未显式配置时使用）
 }
 
 var policy atomic.Pointer[RoutePolicy]
@@ -225,6 +230,7 @@ func defaultPolicy() *RoutePolicy {
 		RotateAfter5xx:    cfg.RotateAfter5xx,
 		MaxRouteTries:     cfg.MaxRouteTries,
 		KeepaliveInterval: cfg.KeepaliveInterval,
+		DefaultSchedule:   cfg.DefaultSchedule,
 	}
 }
 
@@ -251,6 +257,9 @@ func applySettings(set GatewaySettings) {
 	}
 	if set.KeepaliveSec != nil {
 		p.KeepaliveInterval = time.Duration(*set.KeepaliveSec) * time.Second
+	}
+	if set.DefaultSchedule != nil {
+		p.DefaultSchedule = normalizeScheduleDefault(*set.DefaultSchedule)
 	}
 	policy.Store(p)
 }

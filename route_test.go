@@ -1231,3 +1231,197 @@ var (
 	_ = os.Getenv
 	_ = json.Marshal
 )
+
+// TestRoundRobinSchedule 顺序轮询调度：每次请求从下一个 key 开始轮流分配，
+// 3 个 key 各服务一次；显式 failover 渠道仍固定从第一个 key 开始。
+func TestRoundRobinSchedule(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	mustPutChannel(t, &Channel{Name: "rr", BaseURL: up.srv.URL, Enabled: true, Schedule: scheduleRoundRobin,
+		Models: []string{"m1"},
+		Keys: []*UpKey{
+			{Name: "k1", APIKey: "sk-1", Enabled: true},
+			{Name: "k2", APIKey: "sk-2", Enabled: true},
+			{Name: "k3", APIKey: "sk-3", Enabled: true},
+		}})
+
+	served := func() string {
+		rr := httptest.NewRecorder()
+		cand := forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+		if cand == nil {
+			t.Fatalf("no candidate served: status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		return cand.k.Name
+	}
+	var got []string
+	for i := 0; i < 3; i++ {
+		got = append(got, served())
+	}
+	if len(got) != 3 || got[0] == got[1] || got[1] == got[2] || got[0] == got[2] {
+		t.Fatalf("round robin must rotate across all keys, got %v", got)
+	}
+
+	// 显式故障转移：始终用第一个 key
+	mustPutChannel(t, &Channel{Name: "fo", BaseURL: up.srv.URL, Enabled: true, Schedule: scheduleFailover,
+		Models: []string{"m2"},
+		Keys: []*UpKey{
+			{Name: "f1", APIKey: "sk-f1", Enabled: true},
+			{Name: "f2", APIKey: "sk-f2", Enabled: true},
+		}})
+	for i := 0; i < 2; i++ {
+		rr := httptest.NewRecorder()
+		cand := forwardChat(rr, chatRequest("m2"), nil, false, "m2")
+		if cand == nil || cand.k.Name != "f1" {
+			t.Fatalf("failover must always pick first key, got %+v", cand)
+		}
+	}
+}
+
+// TestRoundRobinFollowsGlobalDefault 渠道未显式配置调度时跟随全局默认：
+// 默认设置改为 round_robin 后开始轮询；渠道显式 failover 可覆盖回固定顺序。
+func TestRoundRobinFollowsGlobalDefault(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	mustPutChannel(t, &Channel{Name: "def", BaseURL: up.srv.URL, Enabled: true, // 未显式配置调度
+		Models: []string{"m1"},
+		Keys: []*UpKey{
+			{Name: "k1", APIKey: "sk-1", Enabled: true},
+			{Name: "k2", APIKey: "sk-2", Enabled: true},
+		}})
+	mustPutChannel(t, &Channel{Name: "fix", BaseURL: up.srv.URL, Enabled: true, Schedule: scheduleFailover,
+		Models: []string{"m2"},
+		Keys: []*UpKey{
+			{Name: "x1", APIKey: "sk-x1", Enabled: true},
+			{Name: "x2", APIKey: "sk-x2", Enabled: true},
+		}})
+
+	// 全局默认 round_robin
+	rrMode := scheduleRoundRobin
+	if err := store.PutSettings(&GatewaySettings{DefaultSchedule: &rrMode}); err != nil {
+		t.Fatalf("PutSettings: %v", err)
+	}
+	applySettings(store.Settings())
+
+	// 未配置调度的渠道开始轮询（两次请求命中两个不同 key）
+	seen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		rr := httptest.NewRecorder()
+		cand := forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+		if cand == nil {
+			t.Fatalf("no candidate: status=%d", rr.Code)
+		}
+		seen[cand.k.Name] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("default schedule round_robin should rotate channel keys, got %v", seen)
+	}
+
+	// 渠道级显式 failover 覆盖全局轮询：固定第一个 key
+	for i := 0; i < 2; i++ {
+		rr := httptest.NewRecorder()
+		cand := forwardChat(rr, chatRequest("m2"), nil, false, "m2")
+		if cand == nil || cand.k.Name != "x1" {
+			t.Fatalf("channel override failover must always pick first key, got %+v", cand)
+		}
+	}
+}
+
+// TestRouteStatusData 路由视图：按模型聚合候选 key，标注 可用/冷却中/停用，
+// 未声明模型列表的渠道对每个模型放行；候选顺序与配置顺序一致。
+func TestRouteStatusData(t *testing.T) {
+	setupGateway(t)
+	mustPutChannel(t, &Channel{Name: "a", BaseURL: "http://up-a", Enabled: true, CooldownScope: cooldownScopeKeyModel,
+		Models: []string{"m1", "m2"},
+		Keys: []*UpKey{
+			{Name: "a1", APIKey: "sk-1", Enabled: true},
+			{Name: "a2", APIKey: "sk-2", Enabled: false},
+		}})
+	mustPutChannel(t, &Channel{Name: "b", BaseURL: "http://up-b", Enabled: false,
+		Models: []string{"m1"},
+		Keys:   []*UpKey{{Name: "b1", APIKey: "sk-3", Enabled: true}}})
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: "http://up-c", Enabled: true, // 未声明模型：对全部模型放行
+		Keys: []*UpKey{{Name: "c1", APIKey: "sk-4", Enabled: true}}})
+
+	snap := store.Snapshot()
+	a1 := snap.Channels[0].Keys[0].ID
+	a2 := snap.Channels[0].Keys[1].ID
+	cool.Mark(a1, "m2", time.Hour) // key_model 渠道：只冷却 (a1, m2)
+
+	view := routeStatusData("")
+	if view.DefaultSchedule != scheduleFailover {
+		t.Fatalf("default schedule = %q", view.DefaultSchedule)
+	}
+	var names []string
+	for _, g := range view.Models {
+		names = append(names, g.Model)
+	}
+	if len(names) != 2 || names[0] != "m1" || names[1] != "m2" {
+		t.Fatalf("model groups = %v, want [m1 m2]", names)
+	}
+
+	byModel := map[string]RouteModelGroup{}
+	for _, g := range view.Models {
+		byModel[g.Model] = g
+	}
+	m1 := byModel["m1"]
+	if m1.Available != 2 || m1.Cooling != 0 || m1.Total != 4 {
+		t.Fatalf("m1 group: available=%d cooling=%d total=%d, want 2/0/4 (%+v)", m1.Available, m1.Cooling, m1.Total, m1.Keys)
+	}
+	m2 := byModel["m2"]
+	if m2.Available != 1 || m2.Cooling != 1 || m2.Total != 3 {
+		t.Fatalf("m2 group: available=%d cooling=%d total=%d, want 1/1/3 (%+v)", m2.Available, m2.Cooling, m2.Total, m2.Keys)
+	}
+	// a1 在 m2 上冷却，在 m1 上可用
+	statusOf := func(g RouteModelGroup, keyID string) string {
+		for _, k := range g.Keys {
+			if k.KeyID == keyID {
+				return k.Status
+			}
+		}
+		return ""
+	}
+	if statusOf(m1, a1) != routeStatusOK || statusOf(m2, a1) != routeStatusCooling {
+		t.Fatalf("a1 status: m1=%q m2=%q", statusOf(m1, a1), statusOf(m2, a1))
+	}
+	if statusOf(m1, a2) != routeStatusDisabled || statusOf(m1, snap.Channels[1].Keys[0].ID) != routeStatusDisabled {
+		t.Fatal("disabled key/channel must be marked disabled")
+	}
+	if m2.Keys[0].Channel != "a" || m2.Keys[0].Key != "a1" {
+		t.Fatalf("candidate order must follow config order, got %+v", m2.Keys[0])
+	}
+
+	// 指定模型过滤：只返回该模型分组
+	only := routeStatusData("m2")
+	if len(only.Models) != 1 || only.Models[0].Model != "m2" || only.Models[0].Cooling != 1 {
+		t.Fatalf("model filter: %+v", only.Models)
+	}
+}
+
+// TestCooldownsClearModelAndMap 冷却表的按模型清除/快照/全清。
+func TestCooldownsClearModelAndMap(t *testing.T) {
+	c := newCooldowns()
+	c.Mark("k", "m1", time.Hour)
+	c.Mark("k", "m2", time.Hour)
+	c.Mark("k", "", time.Hour)
+	if got := len(c.CoolingMap("k")); got != 3 {
+		t.Fatalf("CoolingMap = %d entries, want 3", got)
+	}
+	if got := len(c.CoolingMap("other")); got != 0 {
+		t.Fatalf("CoolingMap(other) = %d entries, want 0", got)
+	}
+	if !c.ClearModel("k", "m1") {
+		t.Fatal("ClearModel(m1) should clear an active entry")
+	}
+	if c.ClearModel("k", "m1") {
+		t.Fatal("ClearModel(m1) twice should report false")
+	}
+	if c.IsCooling("k", "m1") || !c.IsCooling("k", "m2") || !c.IsCooling("k", "") {
+		t.Fatal("ClearModel must only remove the (key, model) pair")
+	}
+	if n := c.ClearAll(); n != 2 {
+		t.Fatalf("ClearAll = %d, want 2", n)
+	}
+	if c.IsCooling("k", "m2") || len(c.CoolingMap("k")) != 0 {
+		t.Fatal("ClearAll must empty the table")
+	}
+}

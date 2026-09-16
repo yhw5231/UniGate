@@ -30,6 +30,11 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
     配置**，渠道 key 只**选择池**并设置租约行为；支持自动申请/绑定/释放/换 IP
     （详见下文）
 - **下游通用 key**：`sk-gw-...`，客户端用它调用本网关；启用/停用即生效。
+- **账号调度**：按渠道可选**故障转移**（默认，按 key 顺序靠前的用满才换）或**顺序轮询**
+  （每次请求从下一个 key 开始轮流分配，均摊账号用量）；未显式配置的渠道跟随全局默认
+  （WebUI「设置」/「路由」页或 `DEFAULT_SCHEDULE` 环境变量）。**「路由」页按模型展示
+  每个候选 key 的实时状态**（可用 / 冷却中剩多久 / 停用），支持逐 (key, 模型) 精确解除
+  冷却与一键清空全部冷却。
 - **故障转移**：单请求内自动换下一个 key/渠道；按渠道冷却粒度（默认按 key，可选按
   (key, model)）跳过故障 key。
 - **reasoning 改写**（渠道可选）：把上游 `reasoning` 复制为 `reasoning_content`，
@@ -395,8 +400,16 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 冷却粒度按渠道配置（`cooldown_scope`）：默认**按 key 跨模型共享**——某模型触发 429 即冷却
 该 key 的全部模型（适合 key 配额共享的上游）；渠道可选 `key_model` 按 `(key, model)`
 独立记录——同一账号不同模型的额度互不影响。渠道测试成功会自动解除该 key 的存量冷却。
+渠道卡片按粒度展示明细：`key_model` 渠道逐模型显示「冷却模型 / 可用模型」，key 粒度
+显示整体冷却；「路由」页按模型列出每个候选 key 的状态，可逐条或一键解除冷却。
 
-429 冷却时长、5xx 换出口阈值、单请求最大尝试数均可在 WebUI「**设置**」页调整
+账号调度按渠道配置（`schedule`）：默认**故障转移**——按 key 顺序，靠前的用满/失败才换
+下一个；可选**顺序轮询**（`round_robin`）——每次请求从下一个 key 开始轮流分配（配置顺序
+不变、保序轮转，冷却 key 依旧跳过），均摊账号用量。渠道未显式配置时跟随全局默认：
+WebUI「设置」页「默认账号调度」或「路由」页顶部下拉（保存立即生效），环境变量
+`DEFAULT_SCHEDULE` 提供默认值。
+
+429 冷却时长、5xx 换出口阈值、单请求最大尝试数、默认账号调度均可在 WebUI「**设置**」页调整
 （保存到 `gateway.json`，保存后立即生效）；环境变量仅提供默认值，前端显式设置优先。
 
 ## 配置项（环境变量）
@@ -419,6 +432,7 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 | `MAX_ROUTE_TRIES` | 0（全部） | 单请求最多尝试的 key 数（也可在 WebUI「设置」页修改） |
 | `RATE_LIMIT_COOLDOWN` | `1h` | 429 冷却（无 `Retry-After` 时；有则优先。其余故障不冷却，只换 key；也可在 WebUI「设置」页修改） |
 | `ROTATE_AFTER_5XX` | `3` | 同一 key 连续 5xx 超过该次数自动换出口 IP（0 = 关闭；仅 ipv6pool key 生效；也可在 WebUI「设置」页修改） |
+| `DEFAULT_SCHEDULE` | `failover` | 默认账号调度（渠道未显式配置时使用）：`failover` 故障转移 / `round_robin` 顺序轮询；也可在 WebUI「设置」/「路由」页修改 |
 | `UPSTREAM_HEADER_TIMEOUT` | `10m` | 等待上游响应头超时（LLM 非流式可能较慢，勿设过小） |
 | `KEEPALIVE_INTERVAL` | `15s` | 流式转发心跳：等待上游首包/流静默期间，每该间隔向下游写一帧 SSE 注释（`: keepalive`），防下游反代按空闲超时（常见 60s）掐连接；0 = 关闭。首帧心跳会提前提交 200 + event-stream 头，此后路由彻底失败改用流内 `data: {"error":...}` 帧表达（也可在 WebUI「设置」页修改） |
 | `TEST_TIMEOUT` | `45s` | WebUI 渠道/key 测试的整体超时（默认低于常见反代 60s，避免测试被反代掐断成 504） |
@@ -451,6 +465,9 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 | `GET /admin/api/requests?page=&page_size=` | 请求日志（分页，兼容旧 `?limit=`；数据持久化在 `usage.db`，重启不丢） |
 | `GET /admin/api/errors?page=&page_size=` | 错误日志（失败请求独立存储，分页） |
 | `POST /admin/api/cooling/clear` | 手动解除 key 冷却 `{key_id, channel_id?}`（key 级与按模型冷却全部清除） |
+| `POST /admin/api/cooling/clear-model` | 按 (key, 模型) 精确解除一条冷却 `{key_id, model}` |
+| `POST /admin/api/cooling/clear-all` | 一键清空全部冷却（所有 key、所有模型粒度） |
+| `GET /admin/api/route?model=` | 路由视图：按模型聚合候选 (渠道, key) 与实时状态（`ok`/`cooling`/`disabled`，含剩余冷却毫秒），候选顺序即网关转发顺序 |
 | `GET /admin/api/usage?window=today\|24h\|7d\|30d\|all` | 用量统计（支持 `?user=&channel=&model=&key=`） |
 
 ## 渠道自定义请求头示例（Cline 渠道）

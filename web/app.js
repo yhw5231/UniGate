@@ -65,6 +65,7 @@ function logout() {
   TOKEN = "";
   if (logsTimer) clearInterval(logsTimer);
   if (errorsTimer) clearInterval(errorsTimer);
+  if (routeTimer) clearInterval(routeTimer);
   showLogin();
 }
 
@@ -98,6 +99,7 @@ $$(".tab").forEach((btn) => btn.addEventListener("click", () => {
   $("#tab-" + btn.dataset.tab).classList.remove("hidden");
   if (btn.dataset.tab === "logs") refreshLogs();
   if (btn.dataset.tab === "errors") refreshErrors();
+  if (btn.dataset.tab === "route") refreshRoute();
   if (btn.dataset.tab === "test") refreshTestTab();
   if (btn.dataset.tab === "usage") refreshUsage();
   if (btn.dataset.tab === "leases") { renderPools(); refreshLeases(); }
@@ -123,12 +125,14 @@ function fillSettingsForm() {
   $("#setRotateAfter5xx").value = s.rotate_after_5xx ?? "";
   $("#setMaxRouteTries").value = s.max_route_tries ?? "";
   $("#setKeepaliveSec").value = s.keepalive_sec ?? "";
+  $("#setDefaultSchedule").value = s.default_schedule || "";
   // RoutePolicy 无 json tag：生效值按 Go 字段名下发，Duration 序列化为纳秒
   const ns = (v) => Math.round((v || 0) / 1e9);
   const tries = (p.MaxRouteTries || 0) === 0 ? "全部" : p.MaxRouteTries;
   const ka = ns(p.KeepaliveInterval);
+  const sched = p.DefaultSchedule === "round_robin" ? "顺序轮询" : "故障转移";
   $("#policyNow").textContent =
-    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"}`;
+    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"} · 默认账号调度 ${sched}`;
 }
 
 $("#settingsSaveBtn").addEventListener("click", async () => {
@@ -145,10 +149,124 @@ $("#settingsSaveBtn").addEventListener("click", async () => {
     num("#setRotateAfter5xx", "rotate_after_5xx");
     num("#setMaxRouteTries", "max_route_tries");
     num("#setKeepaliveSec", "keepalive_sec");
+    const sched = $("#setDefaultSchedule").value;
+    if (sched !== "") body.default_schedule = sched; // 留空 = 恢复环境变量默认
     await api("PUT", "/admin/api/settings", body);
     toast("设置已保存并生效");
     await loadState();
   } catch (e) { toast(e.message, true); }
+});
+
+// ---- 路由页：按模型展示候选 key 与实时状态（可用/冷却中/停用），支持
+// 逐 (key, 模型) 精确解除冷却、一键清空全部冷却、切换全局默认账号调度 ----
+let routeTimer = null;
+let routeState = null;
+
+async function refreshRoute() {
+  try {
+    routeState = await api("GET", "/admin/api/route");
+    renderRoute();
+  } catch (e) { toast(e.message, true); }
+}
+
+function renderRoute() {
+  if (!routeState) return;
+  const p = routeState;
+  // 调度下拉始终反映当前生效值（渠道级覆盖在本页各 key 行以「轮询」徽标提示）
+  $("#routeDefaultSchedule").value = p.default_schedule === "round_robin" ? "round_robin" : "failover";
+  $("#routeSummary").innerHTML =
+    `模型 <b>${p.models.length}</b> 个 · 候选 key ${p.total} · 可用 <b>${p.available}</b> · 冷却中 ${p.cooling}` +
+    ` · 默认调度 ${p.default_schedule === "round_robin" ? "顺序轮询" : "故障转移"}`;
+
+  const q = ($("#routeModelFilter").value || "").trim().toLowerCase();
+  const showOff = $("#routeShowOff").checked;
+  const groups = (p.models || []).filter((g) => !q || (g.model || "").toLowerCase().includes(q));
+  const el = $("#routeModels");
+  if (!groups.length) {
+    el.innerHTML = `<p class="muted">${(p.models || []).length ? "没有匹配过滤条件的模型。" : "暂无候选。先在渠道中配置或从上游拉取模型列表。"}</p>`;
+    return;
+  }
+  el.innerHTML = groups.map((g) => routeModelHTML(g, showOff)).join("");
+  el.querySelectorAll('[data-act="clearcoolmodel"]').forEach((b) => b.addEventListener("click", async () => {
+    try {
+      const r = await api("POST", "/admin/api/cooling/clear-model", { key_id: b.dataset.key, model: b.dataset.model });
+      toast(r.cleared > 0 ? "已解除该模型冷却" : "该冷却已过期");
+      await refreshRoute();
+      await loadState(); // 同步渠道页的冷却明细
+    } catch (e) { toast(e.message, true); }
+  }));
+}
+
+// routeModelHTML 单个模型分组的候选行。候选顺序 = 网关实际转发顺序
+//（渠道配置序 + key 配置序），可直接当作「下一个请求会用谁」的预览。
+function routeModelHTML(g, showOff) {
+  const keys = (g.keys || []).filter((k) => showOff || k.status !== "disabled");
+  const rows = keys.map((k) => {
+    let badge, extra = "";
+    if (k.status === "ok") {
+      badge = '<span class="badge on">可用</span>';
+    } else if (k.status === "cooling") {
+      const left = k.left_ms > 0 ? Math.round(k.left_ms / 1000) : 0;
+      badge = `<span class="badge warn" title="冷却到期后自动恢复；点「解除」立即恢复">冷却中 · 剩 ${fmtLeft(left)}</span>`;
+      extra = `<button class="btn small" data-act="clearcoolmodel" data-key="${esc(k.key_id)}" data-model="${esc(g.model)}" title="只解除该 (key, 模型) 的冷却">解除</button>`;
+    } else {
+      badge = `<span class="badge off">${k.channel_enabled ? "key 停用" : "渠道停用"}</span>`;
+    }
+    return `<div class="route-key ${k.status}">
+      ${badge}
+      <span class="rk-name">${esc(k.key || "(未命名)")}</span>
+      <span class="muted">@ ${esc(k.channel)}</span>
+      ${k.schedule === "round_robin" ? '<span class="badge info" title="该渠道为顺序轮询调度">轮询</span>' : ""}
+      ${extra}
+    </div>`;
+  }).join("");
+  const zero = g.available === 0 ? '<span class="badge off" title="该模型当前没有可路由的 key，请求会失败（全部冷却时网关会穿透最早到期的候选试探）">无可用 key</span>' : "";
+  return `<div class="route-model">
+    <div class="route-model-head">
+      <span class="rk-model" title="${esc(g.model)}">${esc(g.model || "（未声明模型列表 · 对全部模型放行）")}</span>
+      ${zero}
+      <span class="badge on">可用 ${g.available}</span>
+      ${g.cooling ? `<span class="badge warn">冷却 ${g.cooling}</span>` : ""}
+      <span class="muted">候选 ${g.total}</span>
+    </div>
+    ${rows ? `<div class="route-keys">${rows}</div>` : '<div class="key-line muted">该模型没有候选渠道/key（渠道未启用或模型未声明）</div>'}
+  </div>`;
+}
+
+$("#routeRefreshBtn").addEventListener("click", refreshRoute);
+$("#routeModelFilter").addEventListener("input", renderRoute);
+$("#routeShowOff").addEventListener("change", renderRoute);
+$("#routeAuto").addEventListener("change", (e) => {
+  if (routeTimer) clearInterval(routeTimer);
+  if (e.target.checked) routeTimer = setInterval(refreshRoute, 5000);
+});
+
+// 一键清空全部冷却（所有 key、所有模型粒度）
+$("#routeClearAllBtn").addEventListener("click", async () => {
+  if (!confirm("清空全部冷却？所有 key、所有模型立即恢复路由。")) return;
+  try {
+    const r = await api("POST", "/admin/api/cooling/clear-all", {});
+    toast(`已清除 ${r.cleared} 条冷却`);
+    await refreshRoute();
+    await loadState();
+  } catch (e) { toast(e.message, true); }
+});
+
+// 全局默认账号调度：保存完整设置对象（PUT 为全量替换，需带上其余已设项）
+$("#routeDefaultSchedule").addEventListener("change", async (e) => {
+  const cur = (STATE && STATE.settings) || {};
+  try {
+    await api("PUT", "/admin/api/settings", {
+      rate_limit_cooldown_sec: cur.rate_limit_cooldown_sec ?? null,
+      rotate_after_5xx: cur.rotate_after_5xx ?? null,
+      max_route_tries: cur.max_route_tries ?? null,
+      keepalive_sec: cur.keepalive_sec ?? null,
+      default_schedule: e.target.value,
+    });
+    toast("默认账号调度已保存并生效");
+    await refreshRoute();
+    await loadState(); // 同步设置页显示
+  } catch (e2) { toast(e2.message, true); }
 });
 
 // ---- 渠道列表 ----
@@ -194,14 +312,13 @@ function renderChannels() {
     const coolingN = keys.filter((k) => cooling[k.id]).length;
     const keyLines = keys.map((k) => {
       const p = keyProxyDesc(k, ch);
-      const cd = coolingBadge(cooling, k.id);
       const clearBtn = cooling[k.id]
         ? `<button class="btn small" data-act="clearcool" data-key="${esc(k.id)}" title="手动解除该 key 的全部冷却（key 级与按模型冷却）">解除冷却</button>`
         : "";
       return `<div class="key-line">
         <span class="badge ${k.enabled ? "on" : "off"}">${k.enabled ? "启用" : "停用"}</span>
         <span>${esc(k.name || "(未命名)")}</span>
-        ${cd}
+        ${keyCoolHTML(ch, k.id, cooling)}
         <span class="pname">代理: ${esc(p)}</span>
         ${clearBtn}
       </div>`;
@@ -218,6 +335,7 @@ function renderChannels() {
         ${ch.endpoint_type === "responses" ? '<span class="badge info">responses</span>' : ""}
         ${ch.rewrite_reasoning ? '<span class="badge info">reasoning改写</span>' : ""}
         ${ch.cooldown_scope === "key_model" ? '<span class="badge info">按(Key,模型)冷却</span>' : ""}
+        ${ch.schedule === "round_robin" ? '<span class="badge info" title="每次请求从下一个 key 开始轮流分配">顺序轮询</span>' : ""}
         ${ch.proxy && ch.proxy.kind ? '<span class="badge info">渠道代理</span>' : ""}
         ${coolingN ? `<span class="badge warn">${coolingN} 个 key 冷却中</span>` : ""}
         <span class="spacer"></span>
@@ -248,6 +366,13 @@ function renderChannels() {
       await loadState();
     } catch (e) { toast(e.message, true); }
   }));
+  wrap.querySelectorAll('[data-act="clearcoolmodel"]').forEach((b) => b.addEventListener("click", async () => {
+    try {
+      const r = await api("POST", "/admin/api/cooling/clear-model", { key_id: b.dataset.key, model: b.dataset.model });
+      toast(r.cleared > 0 ? `已解除 ${b.dataset.model} 的冷却` : "该冷却已过期");
+      await loadState();
+    } catch (e) { toast(e.message, true); }
+  }));
 }
 $("#channelSearch").addEventListener("input", renderChannels);
 $("#channelGroupFilter").addEventListener("change", renderChannels);
@@ -270,6 +395,50 @@ function coolingBadge(cooling, keyID) {
   const left = c.left_ms > 0 ? Math.round(c.left_ms / 1000) : 0;
   const scope = c.model ? `（${esc(c.model)}）` : "";
   return `<span class="badge warn" title="该 key 因上游故障处于冷却中，网关转发会跳过它；渠道测试成功或点「解除冷却」可立即恢复">冷却中${scope} · 剩 ${fmtLeft(left)}</span>`;
+}
+
+// keyCoolDetail 某 key 的冷却明细（渠道卡片与编辑弹窗共用）：null = 无生效冷却。
+//   whole=true → 整 key 冷却（key 粒度渠道，或 key_model 渠道残留的整体条目）；
+//   否则 cooled=[{model,left}] 为逐模型冷却，available 为渠道启用模型中未冷却
+//   的部分；hasModelList 标记渠道是否声明了模型列表（未声明时无法计算可用集）。
+function keyCoolDetail(ch, keyID) {
+  const entries = ((STATE && STATE.cooling) || []).filter((c) => c.key_id === keyID && c.left_ms > 0);
+  if (!entries.length) return null;
+  const wholeEntry = entries.find((c) => !c.model);
+  if (wholeEntry || ch.cooldown_scope !== "key_model") {
+    const max = entries.reduce((a, b) => (b.left_ms > a.left_ms ? b : a));
+    return { whole: true, left: Math.max(0, Math.round(max.left_ms / 1000)), cooled: [], available: [], hasModelList: false };
+  }
+  const cooled = entries
+    .map((c) => ({ model: c.model, left: Math.max(0, Math.round(c.left_ms / 1000)) }))
+    .sort((a, b) => a.model.localeCompare(b.model));
+  const models = ch.models || [];
+  const cooledSet = new Set(cooled.map((c) => c.model));
+  return {
+    whole: false,
+    cooled,
+    available: models.filter((m) => !cooledSet.has(m)),
+    hasModelList: models.length > 0,
+  };
+}
+
+// keyCoolHTML 渠道卡片上单个 key 的冷却明细：
+//   - key 粒度渠道（或存在整体冷却条目）：沿用单个「冷却中 · 剩 X」徽标；
+//   - (key, 模型) 粒度渠道：逐模型「冷却 m · 剩 X ×」徽标（× 只解除该模型），
+//     并列出该 key 当前未被冷却、可正常路由的模型（可用模型）。
+function keyCoolHTML(ch, keyID, cooling) {
+  const d = keyCoolDetail(ch, keyID);
+  if (!d) return "";
+  if (d.whole) return coolingBadge(cooling, keyID);
+  const chips = d.cooled.map((c) =>
+    `<span class="badge warn" title="该 (key, 模型) 因上游 429 处于冷却中，转发此模型时网关会跳过该 key；其余模型不受影响">冷却 ${esc(c.model)} · 剩 ${fmtLeft(c.left)}
+      <button class="btn small" data-act="clearcoolmodel" data-key="${esc(keyID)}" data-model="${esc(c.model)}" title="只解除该 (key, 模型) 的冷却">×</button></span>`
+  ).join("");
+  let avail = "";
+  if (d.hasModelList) {
+    avail = `<span class="pname" title="该 key 当前未被冷却、可正常路由的模型">可用模型 ${d.available.length ? "：" + esc(d.available.join("、")) : "：无（全部冷却中）"}</span>`;
+  }
+  return chips + avail;
 }
 
 // fmtLeft 冷却剩余时间：秒 → 1h2m3s 样式（不足 1 小时只显示分秒）。
@@ -340,6 +509,7 @@ function openChannelEditor(ch) {
   $("#chEnabled").checked = !!ch.enabled;
   $("#chRewrite").checked = !!ch.rewrite_reasoning;
   $("#chCooldownScope").value = ch.cooldown_scope === "key_model" ? "key_model" : "key";
+  $("#chSchedule").value = ch.schedule || "";
   renderChannelProxy(ch.proxy || null);
   renderHeaderRows(ch.headers || {});
   renderKeyBlocks(ch.keys || []);
@@ -418,26 +588,33 @@ function collectChannelProxy() {
   return null;
 }
 
-// renderCoolingKeys 编辑弹窗底部：该渠道冷却中的 key 一键解除。
+// renderCoolingKeys 编辑弹窗底部：该渠道冷却中的 key / (key, 模型) 一键解除。
+// (key, 模型) 粒度渠道逐模型列出；解除时只清对应条目（整体冷却仍全清）。
 function renderCoolingKeys(ch) {
   const wrap = $("#chCoolingKeys");
-  const cooling = coolingByKeyID();
-  const items = (ch.keys || []).filter((k) => cooling[k.id]);
+  const items = [];
+  for (const k of ch.keys || []) {
+    const d = keyCoolDetail(ch, k.id);
+    if (!d) continue;
+    if (d.whole) items.push({ key: k, model: "", left: d.left });
+    else for (const c of d.cooled) items.push({ key: k, model: c.model, left: c.left });
+  }
   if (!items.length) {
     wrap.innerHTML = '<span class="muted" style="font-size:12px">（无冷却中的 key）</span>';
     return;
   }
-  wrap.innerHTML = items.map((k) => {
-    const c = cooling[k.id];
-    const left = c.left_ms > 0 ? Math.round(c.left_ms / 1000) : 0;
-    const scope = c.model ? `（${esc(c.model)}）` : "";
-    return `<span class="chip">${esc(k.name || k.id)}${scope} 剩 ${fmtLeft(left)}
-      <button class="btn small" data-clearkey="${esc(k.id)}">解除</button></span>`;
+  wrap.innerHTML = items.map((it) => {
+    const scope = it.model ? `（${esc(it.model)}）` : "";
+    return `<span class="chip">${esc(it.key.name || it.key.id)}${scope} 剩 ${fmtLeft(it.left)}
+      <button class="btn small" data-clearkey="${esc(it.key.id)}" data-clearmodel="${esc(it.model)}">解除</button></span>`;
   }).join("");
   wrap.querySelectorAll("[data-clearkey]").forEach((b) => b.addEventListener("click", async () => {
     try {
-      const r = await api("POST", "/admin/api/cooling/clear", { key_id: b.dataset.clearkey, channel_id: ch.id || "" });
-      toast(r.cleared > 0 ? `已解除 ${r.cleared} 条冷却` : "该 key 当前没有冷却");
+      const model = b.dataset.clearmodel || "";
+      const r = model
+        ? await api("POST", "/admin/api/cooling/clear-model", { key_id: b.dataset.clearkey, model })
+        : await api("POST", "/admin/api/cooling/clear", { key_id: b.dataset.clearkey, channel_id: ch.id || "" });
+      toast(r.cleared > 0 ? "已解除冷却" : "该冷却已过期");
       await loadState();
       renderCoolingKeys(STATE.channels.find((c) => c.id === ch.id) || ch);
     } catch (e) { toast(e.message, true); }
@@ -802,6 +979,7 @@ function collectChannelForm() {
     headers,
     rewrite_reasoning: $("#chRewrite").checked,
     cooldown_scope: $("#chCooldownScope").value,
+    schedule: $("#chSchedule").value,
     proxy: chProxy,
     enabled: $("#chEnabled").checked,
     keys,

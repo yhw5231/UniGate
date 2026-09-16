@@ -147,6 +147,7 @@ type Channel struct {
 	Headers       map[string]string `json:"headers,omitempty"`        // 渠道级自定义请求头
 	Rewrite       bool              `json:"rewrite_reasoning"`        // reasoning -> reasoning_content 改写（Cline 等需要）
 	CooldownScope string            `json:"cooldown_scope,omitempty"` // 冷却粒度："" / "key" 按 key 跨模型共享（默认）；"key_model" 按 (key,model)
+	Schedule      string            `json:"schedule,omitempty"`       // 账号调度："" 跟随全局默认；"failover" 故障转移；"round_robin" 顺序轮询
 	Proxy         *ProxySpec        `json:"proxy,omitempty"`          // 渠道级代理（如代理池）：未单独配置代理的 key 全部继承，每个 key 独立租约/出口 IP
 	Enabled       bool              `json:"enabled"`
 	Keys          []*UpKey          `json:"keys"`
@@ -183,6 +184,53 @@ func normalizeCooldownScope(scope string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported cooldown_scope %q (want \"key\" / \"key_model\")", scope)
 	}
+}
+
+// 账号调度模式：故障转移（默认，按 key 顺序用满一个再换下一个）与顺序轮询
+//（每次请求从下一个 key 开始轮流分配，均摊账号用量）。渠道未显式配置（""）
+// 时跟随全局默认（WebUI 设置 / DEFAULT_SCHEDULE 环境变量）。
+const (
+	scheduleFailover   = "failover"
+	scheduleRoundRobin = "round_robin"
+)
+
+// normalizeSchedule 归一化渠道调度模式（"" = 跟随全局默认，原样保留）。
+func normalizeSchedule(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return "", nil
+	case scheduleFailover, "fail-over":
+		return scheduleFailover, nil
+	case scheduleRoundRobin, "round-robin", "rr":
+		return scheduleRoundRobin, nil
+	default:
+		return "", fmt.Errorf("unsupported schedule %q (want \"failover\" / \"round_robin\")", s)
+	}
+}
+
+// normalizeScheduleDefault 归一化全局默认调度取值（非法/空值回退故障转移）。
+func normalizeScheduleDefault(s string) string {
+	if v, err := normalizeSchedule(s); err == nil && v != "" {
+		return v
+	}
+	return scheduleFailover
+}
+
+// effectiveSchedule 渠道生效的调度模式：未显式配置（""）时用全局默认 def。
+func (c *Channel) effectiveSchedule(def string) string {
+	if v, err := normalizeSchedule(c.Schedule); err == nil && v != "" {
+		return v
+	}
+	return normalizeScheduleDefault(def)
+}
+
+// cooldownModelFor 冷却键中 model 部分的取值：渠道粒度为 "key_model" 时按
+// (key, model) 独立冷却；默认（""/"key"）按 key 跨模型共享冷却（model 部分为空串）。
+func (c *Channel) cooldownModelFor(model string) string {
+	if c.CooldownScope == cooldownScopeKeyModel {
+		return model
+	}
+	return ""
 }
 
 // chatURL 返回该渠道的 chat/completions 端点。
@@ -310,10 +358,11 @@ type GWKey struct {
 // GatewaySettings 路由策略设置（WebUI「设置」页可改，持久化到 gateway.json）。
 // 指针字段：nil = 未在前端设置，沿用环境变量默认值；非 nil = 显式覆盖。
 type GatewaySettings struct {
-	RateLimitCooldownSec *int `json:"rate_limit_cooldown_sec,omitempty"` // 429 冷却秒数（默认 3600）
-	RotateAfter5xx       *int `json:"rotate_after_5xx,omitempty"`        // 连续 5xx 换出口阈值（默认 3，0 关闭）
-	MaxRouteTries        *int `json:"max_route_tries,omitempty"`         // 单请求最多尝试 key 数（默认 0 = 全部）
-	KeepaliveSec         *int `json:"keepalive_sec,omitempty"`           // 流式心跳间隔秒数（默认 15，0 关闭）
+	RateLimitCooldownSec *int    `json:"rate_limit_cooldown_sec,omitempty"` // 429 冷却秒数（默认 3600）
+	RotateAfter5xx       *int    `json:"rotate_after_5xx,omitempty"`        // 连续 5xx 换出口阈值（默认 3，0 关闭）
+	MaxRouteTries        *int    `json:"max_route_tries,omitempty"`         // 单请求最多尝试 key 数（默认 0 = 全部）
+	KeepaliveSec         *int    `json:"keepalive_sec,omitempty"`           // 流式心跳间隔秒数（默认 15，0 关闭）
+	DefaultSchedule      *string `json:"default_schedule,omitempty"`        // 默认账号调度："" 沿用环境变量；"failover" / "round_robin"
 }
 
 // normalize 校验设置值（nil 合法 = 未设置）。
@@ -330,6 +379,13 @@ func (s *GatewaySettings) normalize() error {
 		if v != nil && *v < 0 {
 			return fmt.Errorf("%s must be >= 0", name)
 		}
+	}
+	if s.DefaultSchedule != nil {
+		v, err := normalizeSchedule(*s.DefaultSchedule)
+		if err != nil {
+			return err
+		}
+		s.DefaultSchedule = &v
 	}
 	return nil
 }
@@ -531,6 +587,11 @@ func normalizeChannel(ch *Channel) error {
 		return err
 	}
 	ch.CooldownScope = scope
+	sched, err := normalizeSchedule(ch.Schedule)
+	if err != nil {
+		return err
+	}
+	ch.Schedule = sched
 	if ch.Proxy != nil && ch.Proxy.Kind == "" {
 		ch.Proxy = nil // 空代理规格 = 未设置渠道级代理
 	}

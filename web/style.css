@@ -151,6 +151,23 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 .key-line { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
 .key-line .pname { color: var(--muted); font-size: 12px; }
 
+/* 路由页：按模型分组展示候选 key */
+.route-list { display: flex; flex-direction: column; gap: 10px; max-width: 1320px; }
+.route-model {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 14px;
+}
+.route-model-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rk-model { font-weight: 700; font-size: 14px; word-break: break-all; }
+.route-keys { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.route-key {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px 10px; font-size: 13px;
+}
+.route-key .rk-name { font-weight: 600; }
+.route-key.disabled { opacity: .55; }
+
 /* 设置页：紧凑双列布局 */
 .settings-panel { max-width: 860px; }
 .settings-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }

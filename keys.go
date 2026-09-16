@@ -74,6 +74,45 @@ func (c *Cooldowns) ClearKey(keyID string) int {
 	return n
 }
 
+// ClearModel 解除 (keyID, model) 一条冷却（按 (key, 模型) 粒度精确清除，
+// 渠道页/路由页对 key_model 渠道的单模型解除使用），返回是否清除。
+func (c *Cooldowns) ClearModel(keyID, model string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := cooldownPair{keyID, model}
+	if _, ok := c.until[p]; !ok {
+		return false
+	}
+	delete(c.until, p)
+	return true
+}
+
+// CoolingMap 返回某 key 全部生效中的冷却（model 部分 → 到期时间快照）：
+// 渠道页按 (key, 模型) 明细展示「冷却模型 / 可用模型」时使用。
+func (c *Cooldowns) CoolingMap(keyID string) map[string]time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	out := map[string]time.Time{}
+	for p, until := range c.until {
+		if p.keyID != keyID || !now.Before(until) {
+			continue
+		}
+		out[p.model] = until
+	}
+	return out
+}
+
+// ClearAll 清空全部冷却，返回清除的条数。WebUI「路由」页一键清理使用；
+// 测试重置也走这里。
+func (c *Cooldowns) ClearAll() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := len(c.until)
+	c.until = map[cooldownPair]time.Time{}
+	return n
+}
+
 // CoolingKey 返回 (keyID, model) 的冷却到期时间（未冷却返回零值, false）。
 func (c *Cooldowns) CoolingKey(keyID, model string) (time.Time, bool) {
 	c.mu.Lock()
@@ -137,13 +176,6 @@ func (c *Cooldowns) EarliestRetry(pairs []cooldownPair) (time.Duration, bool) {
 		d = 0
 	}
 	return d, true
-}
-
-// ClearAll 清空（测试用）。
-func (c *Cooldowns) ClearAll() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.until = map[cooldownPair]time.Time{}
 }
 
 func (c *Cooldowns) pruneLocked() {

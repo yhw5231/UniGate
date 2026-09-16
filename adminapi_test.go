@@ -1035,3 +1035,186 @@ func TestAdminTestKeyDeadSocksFastFail(t *testing.T) {
 		t.Fatalf("upstream must not be reached via dead socks, calls=%d", up.count())
 	}
 }
+
+// TestAdminClearCoolingModelAndAll：按 (key, 模型) 精确解除与一键全清端点。
+func TestAdminClearCoolingModelAndAll(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{
+			{Name: "k1", APIKey: "sk-1", Enabled: true},
+			{Name: "k2", APIKey: "sk-2", Enabled: true},
+		}})
+	kid := store.Snapshot().Channels[0].Keys[0].ID
+	kid2 := store.Snapshot().Channels[0].Keys[1].ID
+
+	cool.Mark(kid, "m1", time.Hour)
+	cool.Mark(kid, "m2", time.Hour)
+	cool.Mark(kid2, "", time.Hour)
+
+	// 缺参 → 400
+	rrBad := httptest.NewRecorder()
+	rootHandler(rrBad, adminReq(http.MethodPost, "/admin/api/cooling/clear-model", `{"key_id":"`+kid+`"}`, tok))
+	if rrBad.Code != http.StatusBadRequest {
+		t.Fatalf("missing model: status=%d want 400", rrBad.Code)
+	}
+	// 未登录 → 401
+	rrAuth := httptest.NewRecorder()
+	rootHandler(rrAuth, adminReq(http.MethodPost, "/admin/api/cooling/clear-model", `{"key_id":"x","model":"m"}`, ""))
+	if rrAuth.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: status=%d want 401", rrAuth.Code)
+	}
+
+	// 精确解除 (kid, m1)：其余冷却保留
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/cooling/clear-model",
+		`{"key_id":"`+kid+`","model":"m1"}`, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("clear-model: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Cleared int `json:"cleared"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if out.Cleared != 1 {
+		t.Fatalf("clear-model cleared=%d want 1", out.Cleared)
+	}
+	if cool.IsCooling(kid, "m1") || !cool.IsCooling(kid, "m2") || !cool.IsCooling(kid2, "") {
+		t.Fatal("clear-model must only remove the given (key, model)")
+	}
+	// 重复解除：cleared=0（HTTP 仍 200）
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodPost, "/admin/api/cooling/clear-model",
+		`{"key_id":"`+kid+`","model":"m1"}`, tok))
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("clear-model twice: status=%d", rr2.Code)
+	}
+
+	// 一键全清
+	rr3 := httptest.NewRecorder()
+	rootHandler(rr3, adminReq(http.MethodPost, "/admin/api/cooling/clear-all", `{}`, tok))
+	if rr3.Code != http.StatusOK {
+		t.Fatalf("clear-all: status=%d body=%s", rr3.Code, rr3.Body.String())
+	}
+	var out2 struct {
+		Cleared int `json:"cleared"`
+	}
+	_ = json.Unmarshal(rr3.Body.Bytes(), &out2)
+	if out2.Cleared != 2 {
+		t.Fatalf("clear-all cleared=%d want 2", out2.Cleared)
+	}
+	if cool.IsCooling(kid, "m2") || cool.IsCooling(kid2, "") {
+		t.Fatal("clear-all must empty the cooldown table")
+	}
+}
+
+// TestAdminRouteEndpoint：路由视图端点（按模型过滤）与 state 内嵌 route 字段。
+func TestAdminRouteEndpoint(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.srv.URL, Enabled: true, CooldownScope: cooldownScopeKeyModel,
+		Models: []string{"m1", "m2"},
+		Keys: []*UpKey{
+			{Name: "k1", APIKey: "sk-1", Enabled: true},
+			{Name: "k2", APIKey: "sk-2", Enabled: false},
+		}})
+	kid := store.Snapshot().Channels[0].Keys[0].ID
+	cool.Mark(kid, "m2", time.Hour)
+
+	// 全量视图
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodGet, "/admin/api/route", "", tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("route: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var view RouteStatusData
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Models) != 2 || view.Available != 1 || view.Cooling != 1 {
+		t.Fatalf("route view: models=%d available=%d cooling=%d", len(view.Models), view.Available, view.Cooling)
+	}
+
+	// 按模型过滤
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodGet, "/admin/api/route?model=m2", "", tok))
+	var only RouteStatusData
+	if err := json.Unmarshal(rr2.Body.Bytes(), &only); err != nil {
+		t.Fatal(err)
+	}
+	if len(only.Models) != 1 || only.Models[0].Model != "m2" || only.Cooling != 1 {
+		t.Fatalf("route filter: %+v", only.Models)
+	}
+
+	// state 内嵌 route
+	rr3 := httptest.NewRecorder()
+	rootHandler(rr3, adminReq(http.MethodGet, "/admin/api/state", "", tok))
+	var st struct {
+		Route RouteStatusData `json:"route"`
+	}
+	if err := json.Unmarshal(rr3.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Route.Models) != 2 || st.Route.DefaultSchedule != scheduleFailover {
+		t.Fatalf("state route: %+v", st.Route)
+	}
+
+	// 未登录 → 401
+	rr4 := httptest.NewRecorder()
+	rootHandler(rr4, adminReq(http.MethodGet, "/admin/api/route", "", ""))
+	if rr4.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: status=%d want 401", rr4.Code)
+	}
+}
+
+// TestAdminSettingsDefaultSchedule：默认账号调度设置的生效与校验。
+func TestAdminSettingsDefaultSchedule(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPut, "/admin/api/settings", `{"default_schedule":"round_robin"}`, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if p := currentPolicy(); p.DefaultSchedule != scheduleRoundRobin {
+		t.Fatalf("policy default schedule = %q", p.DefaultSchedule)
+	}
+
+	// 非法值 → 400
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodPut, "/admin/api/settings", `{"default_schedule":"bogus"}`, tok))
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("invalid schedule: status=%d want 400", rr2.Code)
+	}
+
+	// 字段缺省 = 回退环境变量默认（failover）
+	rr3 := httptest.NewRecorder()
+	rootHandler(rr3, adminReq(http.MethodPut, "/admin/api/settings", `{}`, tok))
+	if rr3.Code != http.StatusOK {
+		t.Fatalf("reset: status=%d", rr3.Code)
+	}
+	if p := currentPolicy(); p.DefaultSchedule != scheduleFailover {
+		t.Fatalf("policy after reset = %q", p.DefaultSchedule)
+	}
+
+	// 渠道保存时归一化调度字段，非法值被拒绝
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	rrBad := httptest.NewRecorder()
+	body := `{"name":"c","base_url":"` + up.srv.URL + `","enabled":true,"schedule":"bogus","keys":[]}`
+	rootHandler(rrBad, adminReq(http.MethodPut, "/admin/api/channels", body, tok))
+	if rrBad.Code != http.StatusBadRequest {
+		t.Fatalf("channel invalid schedule: status=%d want 400", rrBad.Code)
+	}
+	rrOK := httptest.NewRecorder()
+	bodyOK := `{"name":"c","base_url":"` + up.srv.URL + `","enabled":true,"schedule":"round_robin","keys":[]}`
+	rootHandler(rrOK, adminReq(http.MethodPut, "/admin/api/channels", bodyOK, tok))
+	if rrOK.Code != http.StatusOK {
+		t.Fatalf("channel valid schedule: status=%d body=%s", rrOK.Code, rrOK.Body.String())
+	}
+	if got := store.Snapshot().Channels[0].Schedule; got != scheduleRoundRobin {
+		t.Fatalf("channel schedule = %q", got)
+	}
+}

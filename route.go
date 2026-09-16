@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -42,10 +43,7 @@ type candidate struct {
 // cooldownModel 返回冷却键中 model 部分的取值：渠道粒度为 "key_model" 时按
 // (key, model) 独立冷却；默认 "" / "key"（含旧配置空值）按 key 跨模型共享冷却。
 func (c *candidate) cooldownModel(model string) string {
-	if c.ch.CooldownScope == cooldownScopeKeyModel {
-		return model
-	}
-	return ""
+	return c.ch.cooldownModelFor(model)
 }
 
 // chatTarget 返回该候选的上游对话端点（key BaseURL 优先；按渠道端点类型
@@ -77,8 +75,13 @@ func endsWithChatCompletions(s string) bool {
 }
 
 // buildCandidates 按优先级构建候选列表（深拷贝自 store）。
+// 调度模式（渠道 schedule，未配置跟随全局默认）：
+//   - failover（默认）：按渠道顺序 + key 顺序，靠前的 key 用满才轮到后面；
+//   - round_robin：每个渠道把 key 列表从递增游标处旋转一轮（保序），
+//     请求在账号间轮流分配，均摊用量。游标按渠道 ID 记忆（内存态，重启归零）。
 func buildCandidates(model string) []candidate {
 	snap := store.Snapshot()
+	def := currentPolicy().DefaultSchedule
 	var out []candidate
 	for _, ch := range snap.Channels {
 		if !ch.Enabled {
@@ -87,12 +90,42 @@ func buildCandidates(model string) []candidate {
 		if !ch.allowsModel(model) {
 			continue
 		}
-		for _, k := range ch.Keys {
+		keys := ch.Keys
+		if ch.effectiveSchedule(def) == scheduleRoundRobin {
+			keys = rotateKeysRR(ch.ID, keys)
+		}
+		for _, k := range keys {
 			if k.Enabled {
 				out = append(out, candidate{ch: ch, k: k})
 			}
 		}
 	}
+	return out
+}
+
+// rrCursors 轮询游标：渠道 ID → 该渠道 key 列表的下一起点（内存态）。
+var rrCursors struct {
+	sync.Mutex
+	m map[string]int
+}
+
+// rotateKeysRR 把 key 列表从游标处旋转一轮（保序）并推进游标。
+// 游标按「全部 key（含停用）」的索引记忆：停用 key 只是路由时跳过，
+// 不打乱轮询节奏（避免每次请求都从同一个 key 开始）。空列表原样返回。
+func rotateKeysRR(chID string, keys []*UpKey) []*UpKey {
+	if len(keys) == 0 {
+		return keys
+	}
+	rrCursors.Lock()
+	if rrCursors.m == nil {
+		rrCursors.m = map[string]int{}
+	}
+	start := rrCursors.m[chID] % len(keys)
+	rrCursors.m[chID] = (start + 1) % len(keys)
+	rrCursors.Unlock()
+	out := make([]*UpKey, 0, len(keys))
+	out = append(out, keys[start:]...)
+	out = append(out, keys[:start]...)
 	return out
 }
 
@@ -531,4 +564,126 @@ func doUpstreamRequest(ctx context.Context, client *http.Client, cand *candidate
 	}
 	applyCustomHeaders(req, cand.ch.Headers)
 	return client.Do(req)
+}
+
+// ---- 路由视图（WebUI「路由」页：按模型展示候选 key 与实时状态）----
+
+// routeStatuses 候选状态取值。
+const (
+	routeStatusOK       = "ok"       // 渠道与 key 均启用且未冷却：可参与本轮路由
+	routeStatusCooling  = "cooling"  // 冷却中（网关转发会跳过）
+	routeStatusDisabled = "disabled" // 渠道或 key 被停用：不参与路由
+)
+
+// RouteKeyStatus 路由视图中单个 (渠道, key) 候选的状态。
+type RouteKeyStatus struct {
+	ChannelID string `json:"channel_id"`
+	Channel   string `json:"channel"`
+	ChannelOn bool   `json:"channel_enabled"`
+	KeyID     string `json:"key_id"`
+	Key       string `json:"key"`
+	KeyOn     bool   `json:"key_enabled"`
+	Schedule  string `json:"schedule"` // 渠道生效的账号调度模式
+	Status    string `json:"status"`   // ok / cooling / disabled
+	Until     int64  `json:"until_unix,omitempty"`
+	LeftMS    int64  `json:"left_ms,omitempty"`
+}
+
+// RouteModelGroup 按模型聚合的路由视图。
+type RouteModelGroup struct {
+	Model     string           `json:"model"`
+	Total     int              `json:"total"`
+	Available int              `json:"available"`
+	Cooling   int              `json:"cooling"`
+	Keys      []RouteKeyStatus `json:"keys"`
+}
+
+// RouteStatusData 路由页数据：全部模型分组 + 生效的全局默认调度。
+type RouteStatusData struct {
+	DefaultSchedule string            `json:"default_schedule"`
+	Models          []RouteModelGroup `json:"models"`
+	Total           int               `json:"total"`
+	Available       int               `json:"available"`
+	Cooling         int               `json:"cooling"`
+}
+
+// routeStatusData 构建路由页视图：候选顺序与网关实际转发顺序一致
+//（渠道配置序 + key 配置序）。model 非空时只返回该模型的分组。
+//
+// 模型枚举：取各渠道声明模型列表的并集（首次出现序）；渠道未声明模型列表
+// 时对全部模型放行，其 key 会出现在每个模型分组里。若所有渠道都未声明
+// 模型，则合并为单个空模型分组（前端标注「全部模型」）。
+func routeStatusData(model string) *RouteStatusData {
+	snap := store.Snapshot()
+	def := normalizeScheduleDefault(currentPolicy().DefaultSchedule)
+
+	var order []string
+	groups := map[string]*RouteModelGroup{}
+	get := func(m string) *RouteModelGroup {
+		if g := groups[m]; g != nil {
+			return g
+		}
+		g := &RouteModelGroup{Model: m, Keys: []RouteKeyStatus{}}
+		groups[m] = g
+		order = append(order, m)
+		return g
+	}
+
+	if model != "" {
+		get(model)
+	} else {
+		for _, ch := range snap.Channels {
+			for _, m := range ch.Models {
+				get(m)
+			}
+		}
+		if len(order) == 0 {
+			get("") // 无任何模型声明：单分组代表「对全部模型放行」的候选
+		}
+	}
+
+	for _, g := range groups {
+		for _, ch := range snap.Channels {
+			if g.Model != "" && !ch.allowsModel(g.Model) {
+				continue // 未声明模型列表的渠道 allowsModel 恒真：对每个模型放行
+			}
+			for _, k := range ch.Keys {
+				st := RouteKeyStatus{
+					ChannelID: ch.ID,
+					Channel:   ch.Name,
+					ChannelOn: ch.Enabled,
+					KeyID:     k.ID,
+					Key:       k.Name,
+					KeyOn:     k.Enabled,
+					Schedule:  ch.effectiveSchedule(def),
+				}
+				switch {
+				case !ch.Enabled || !k.Enabled:
+					st.Status = routeStatusDisabled
+				default:
+					if until, ok := cool.CoolingKey(k.ID, ch.cooldownModelFor(g.Model)); ok {
+						st.Status = routeStatusCooling
+						st.Until = until.Unix()
+						st.LeftMS = until.Sub(time.Now()).Milliseconds()
+						g.Cooling++
+					} else {
+						st.Status = routeStatusOK
+						g.Available++
+					}
+				}
+				g.Keys = append(g.Keys, st)
+				g.Total++
+			}
+		}
+	}
+
+	out := &RouteStatusData{DefaultSchedule: def, Models: []RouteModelGroup{}}
+	for _, m := range order {
+		g := groups[m]
+		out.Models = append(out.Models, *g)
+		out.Total += g.Total
+		out.Available += g.Available
+		out.Cooling += g.Cooling
+	}
+	return out
 }

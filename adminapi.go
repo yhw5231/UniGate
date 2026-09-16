@@ -31,6 +31,9 @@ func adminAPIHandler() http.Handler {
 	mux.HandleFunc("POST /admin/api/testkey", handleAdminTestKey)
 	mux.HandleFunc("POST /admin/api/channels/{id}/test-model", handleAdminTestModel)
 	mux.HandleFunc("POST /admin/api/cooling/clear", handleAdminClearCooling)
+	mux.HandleFunc("POST /admin/api/cooling/clear-model", handleAdminClearCoolingModel)
+	mux.HandleFunc("POST /admin/api/cooling/clear-all", handleAdminClearCoolingAll)
+	mux.HandleFunc("GET /admin/api/route", handleAdminRoute)
 	mux.HandleFunc("POST /admin/api/channels/{id}/fetch-models", handleAdminFetchModels)
 	mux.HandleFunc("GET /admin/api/requests", handleAdminRequests)
 	mux.HandleFunc("GET /admin/api/errors", handleAdminErrors)
@@ -111,6 +114,7 @@ func handleAdminState(w http.ResponseWriter, r *http.Request) {
 		"cooling":      cool.CoolingList(),
 		"settings":     store.Settings(),
 		"policy":       currentPolicy(),
+		"route":        routeStatusData(""),
 	})
 }
 
@@ -156,6 +160,42 @@ func handleAdminClearCooling(w http.ResponseWriter, r *http.Request) {
 	}
 	cleared := cool.ClearKey(keyID)
 	writeJSON(w, http.StatusOK, map[string]any{"key_id": keyID, "cleared": cleared})
+}
+
+// handleAdminClearCoolingModel 按 (key, model) 粒度精确解除一条冷却：
+// body {key_id, model}。路由页对 key_model 渠道的单模型解除使用。
+func handleAdminClearCoolingModel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		KeyID string `json:"key_id"`
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
+		return
+	}
+	keyID := strings.TrimSpace(body.KeyID)
+	model := strings.TrimSpace(body.Model)
+	if keyID == "" || model == "" {
+		writeJSONError(w, http.StatusBadRequest, "key_id and model required", "bad_request")
+		return
+	}
+	cleared := 0
+	if cool.ClearModel(keyID, model) {
+		cleared = 1
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"key_id": keyID, "model": model, "cleared": cleared})
+}
+
+// handleAdminClearCoolingAll 一键清空全部冷却（所有 key、所有模型粒度），
+// 返回清除条数。上游整体恢复后的快速恢复操作。
+func handleAdminClearCoolingAll(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"cleared": cool.ClearAll()})
+}
+
+// handleAdminRoute 路由页视图：按模型聚合候选 (渠道, key) 与实时状态。
+// 可带 ?model=xxx 只看单个模型。
+func handleAdminRoute(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, routeStatusData(strings.TrimSpace(r.URL.Query().Get("model"))))
 }
 
 // handleAdminPutChannel 新增/整体更新渠道（含内嵌 keys），随后按全量配置

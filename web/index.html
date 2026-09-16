@@ -25,6 +25,7 @@
     <div class="brand">UniGate <span class="muted">通用网关</span></div>
     <nav class="tabs">
       <button data-tab="channels" class="tab active">渠道</button>
+      <button data-tab="route" class="tab">路由</button>
       <button data-tab="test" class="tab">渠道测试</button>
       <button data-tab="gwkeys" class="tab">通用密钥</button>
       <button data-tab="logs" class="tab">请求日志</button>
@@ -50,6 +51,29 @@
         <button id="addChannelBtn" class="btn primary">+ 新建渠道</button>
       </div>
       <div id="channelList" class="channel-list"></div>
+    </section>
+
+    <!-- 路由 -->
+    <section id="tab-route" class="tabpane hidden">
+      <div class="row">
+        <h2>路由</h2>
+        <label class="inline" title="渠道未显式配置「账号调度」时使用的默认模式（保存后立即生效，渠道可单独覆盖）：
+故障转移：按 key 顺序，靠前的用满/失败才换下一个；
+顺序轮询：每次请求从下一个 key 开始轮流分配，均摊账号用量">账号调度
+          <select id="routeDefaultSchedule" style="max-width:230px">
+            <option value="failover">故障转移（按顺序）</option>
+            <option value="round_robin">顺序轮询（轮流均摊）</option>
+          </select>
+        </label>
+        <input id="routeModelFilter" placeholder="按模型过滤…" style="max-width:240px">
+        <label class="inline"><input type="checkbox" id="routeShowOff" checked> 显示停用</label>
+        <label class="inline"><input type="checkbox" id="routeAuto"> 自动刷新</label>
+        <span class="spacer"></span>
+        <button id="routeRefreshBtn" class="btn">刷新</button>
+        <button id="routeClearAllBtn" class="btn danger" title="清空全部冷却（所有 key、所有模型粒度），立即恢复路由">清空全部冷却</button>
+      </div>
+      <p class="muted" id="routeSummary" style="margin:0 0 12px">—</p>
+      <div id="routeModels" class="route-list"></div>
     </section>
 
     <!-- 渠道测试 -->
@@ -230,6 +254,16 @@
             <input id="setKeepaliveSec" type="number" min="0" placeholder="默认 15">
             <span class="hint">秒，0 = 关闭</span>
           </label>
+          <label class="fld" title="渠道未显式配置「账号调度」时使用的默认模式（渠道编辑弹窗可单独覆盖）。
+故障转移：按 key 顺序，靠前的用满/失败才换下一个；
+顺序轮询：每次请求从下一个 key 开始轮流分配，均摊账号用量">默认账号调度
+            <select id="setDefaultSchedule">
+              <option value="">跟随环境变量默认</option>
+              <option value="failover">故障转移（按顺序）</option>
+              <option value="round_robin">顺序轮询（轮流均摊）</option>
+            </select>
+            <span class="hint">留空 = 使用环境变量默认值</span>
+          </label>
         </div>
         <p class="muted settings-now">
           当前生效：<span id="policyNow"></span>
@@ -294,6 +328,13 @@
             <option value="key_model">按 (Key, 模型)</option>
           </select>
         </label>
+        <label class="inline" title="故障转移：按 key 顺序，靠前的用满/失败才换下一个；顺序轮询：每次请求从下一个 key 开始轮流分配，均摊账号用量。跟随全局默认时以「设置 / 路由页」的默认调度为准">账号调度
+          <select id="chSchedule">
+            <option value="">跟随全局默认</option>
+            <option value="failover">故障转移（按顺序）</option>
+            <option value="round_robin">顺序轮询</option>
+          </select>
+        </label>
       </div>
       <h4>自定义请求头</h4>
       <div id="chHeaders"></div>
@@ -320,7 +361,7 @@
         </div>
       </div>
       <div class="key-line" style="margin:10px 0 0">
-        <span class="muted" style="font-size:12px">冷却中的 key 可在此手动解除（上游已恢复时立即恢复路由，不必等冷却到期）：</span>
+        <span class="muted" style="font-size:12px">冷却中的 key / (key, 模型) 可在此手动解除（上游已恢复时立即恢复路由，不必等冷却到期）：</span>
       </div>
       <div id="chCoolingKeys" class="chips" style="margin:4px 0 0"></div>
     </div>

@@ -38,6 +38,12 @@ type Config struct {
 	// 下游网关
 	GWKeyAuth bool // 是否校验下游通用 key
 
+	// 反代部署：信任 X-Real-IP / X-Forwarded-For 取真实客户端 IP（请求记录、
+	// 登录防爆破的 IP 维度都依赖它；RemoteAddr 在反代后只是反代地址）。
+	// 网关直连暴露给不可信客户端时可关闭：关闭后一律取 TCP 对端地址，
+	// 防伪造头污染请求记录/绕过按 IP 的登录限流。
+	TrustProxyHeaders bool
+
 	// 故障转移与冷却
 	MaxRouteTries     int           // 单请求最多尝试的 key 数（0 = 全部）
 	RateLimitCooldown time.Duration // 429 冷却（上游未给明确到期时间时；其余故障不冷却，只换 key）
@@ -119,6 +125,7 @@ func loadConfig() Config {
 
 	loginReq, _ := parseBoolEnv("LOGIN_REQUIRED", true)
 	gwKeyAuth, _ := parseBoolEnv("GW_KEY_AUTH", true)
+	trustProxy, _ := parseBoolEnv("TRUST_PROXY_HEADERS", true)
 
 	return Config{
 		Port:            getenv("PORT", defaultPort),
@@ -138,6 +145,8 @@ func loadConfig() Config {
 		LoginFailWindow:  durationEnv("LOGIN_FAIL_WINDOW", 5*time.Minute),
 
 		GWKeyAuth: gwKeyAuth,
+
+		TrustProxyHeaders: trustProxy,
 
 		MaxRouteTries:     intEnv("MAX_ROUTE_TRIES", 0),
 		RateLimitCooldown: durationEnv("RATE_LIMIT_COOLDOWN", time.Hour),

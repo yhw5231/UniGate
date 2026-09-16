@@ -33,7 +33,7 @@ type RequestRecord struct {
 	User             string        `json:"user,omitempty"`
 	Channel          string        `json:"channel,omitempty"`
 	Model            string        `json:"model,omitempty"`
-	Key              string        `json:"key,omitempty"` // 脱敏后
+	Key              string        `json:"key,omitempty"` // 「key 名称@渠道」——名称是用户自定义标签而非凭证，完整显示
 	PromptTokens     int64         `json:"prompt_tokens,omitempty"`
 	CompletionTokens int64         `json:"completion_tokens,omitempty"`
 	ErrMsg           string        `json:"error,omitempty"`
@@ -276,8 +276,24 @@ func (r *responseRecorder) Flush() {
 	}
 }
 
-// clientIP 取请求来源 IP（RemoteAddr 去端口）。
+// clientIP 取请求来源 IP。TRUST_PROXY_HEADERS（默认开）时按反代部署处理：
+// RemoteAddr 只是反代地址，改取转发头——优先 X-Real-IP（反代一般用 $remote_addr
+// 覆写，客户端伪造不了），其次 X-Forwarded-For 最左合法段（单层反代即真实客户端）。
+// 转发头只接受可解析的 IP，脏值跳过，最终回退 RemoteAddr，避免伪造/脏值污染
+// 请求记录与登录防爆破的 IP 计数键。
 func clientIP(r *http.Request) string {
+	if cfg.TrustProxyHeaders {
+		if v := strings.TrimSpace(r.Header.Get("X-Real-IP")); v != "" {
+			if ip := net.ParseIP(v); ip != nil {
+				return ip.String()
+			}
+		}
+		for _, part := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
+			if ip := net.ParseIP(strings.TrimSpace(part)); ip != nil {
+				return ip.String()
+			}
+		}
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -376,35 +392,25 @@ func statsServe(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 			rec.ErrMsg = http.StatusText(status)
 		}
 	}
-	if rec.Key != "" {
-		rec.Key = maskKey(rec.Key)
-	}
+	// key 列是「名称@渠道」的用户标签而非凭证，完整显示不脱敏
 	recordRequest(rec)
 
-	// 用量库记账（含输入/输出 token）。key 同样脱敏后入库：用量库是长期
-	// 持久化数据，明文上游 key 落盘会随备份/迁移扩散；by_key 维度仍是
-	// 「一个 key 一行」，聚合语义不变。
+	// 用量库记账（含输入/输出 token）。key 列同上：存「名称@渠道」标识，
+	// 不是上游凭证，明文落盘无泄漏风险；by_key 维度仍是「一个 key 一行」，
+	// 聚合语义不变。历史上真实 key 曾直接入库，启动时由 MaskStoredKeys 收敛。
 	if usageDB != nil {
 		usageDB.Append(UsageEvent{
 			Time:             start,
 			User:             rs.user,
 			Channel:          rs.channel,
 			Model:            rs.model,
-			Key:              maskUsageKey(rs.key),
+			Key:              rs.key,
 			PromptTokens:     rs.promptTokens,
 			CompletionTokens: rs.completionTokens,
 			Status:           status,
 			BytesOut:         rw.bytes,
 		})
 	}
-}
-
-// maskUsageKey 用量库的 key 脱敏：空值保持空（by_key 会归入 unknown）。
-func maskUsageKey(key string) string {
-	if key == "" {
-		return ""
-	}
-	return maskKey(key)
 }
 
 // ---- admin 端点 ----

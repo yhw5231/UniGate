@@ -28,6 +28,10 @@ services:
       # ADMIN_PASSWORD: admin
       # 下游是否强制通用 key（默认 true）
       # GW_KEY_AUTH: "true"
+      # 反代部署取真实客户端 IP（请求记录/登录防爆破都按 IP 计数）：默认 true，
+      # 优先 X-Real-IP，其次 X-Forwarded-For 最左合法段。网关不经反代直接暴露、
+      # 且客户端不可信时改为 false，防伪造头污染日志/绕过按 IP 的登录限流
+      # TRUST_PROXY_HEADERS: "true"
       # 故障转移：仅 429 记冷却；网络错误/连续 5xx 超阈值自动换出口 IP
       # RATE_LIMIT_COOLDOWN: 1h
       # ROTATE_AFTER_5XX: 3

@@ -180,6 +180,60 @@ func TestMaskKey(t *testing.T) {
 	}
 }
 
+// TestClientIPTrustProxy：反代头取真实 IP（X-Real-IP 优先、XFF 取最左合法段、
+// 脏值跳过回退 RemoteAddr），关闭信任开关后一律取 TCP 对端。
+func TestClientIPTrustProxy(t *testing.T) {
+	orig := cfg.TrustProxyHeaders
+	defer func() { cfg.TrustProxyHeaders = orig }()
+
+	newReq := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.RemoteAddr = "203.0.113.9:443"
+		return req
+	}
+
+	cfg.TrustProxyHeaders = true
+	req := newReq()
+	req.Header.Set("X-Real-IP", "198.51.100.7")
+	req.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.2")
+	if got := clientIP(req); got != "198.51.100.7" {
+		t.Fatalf("X-Real-IP 优先: got %q", got)
+	}
+
+	req = newReq()
+	req.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.2")
+	if got := clientIP(req); got != "198.51.100.7" {
+		t.Fatalf("XFF 应取最左合法段: got %q", got)
+	}
+
+	// 脏值（伪造的非 IP / unknown 占位）跳过，回退 RemoteAddr
+	req = newReq()
+	req.Header.Set("X-Real-IP", "not-an-ip")
+	req.Header.Set("X-Forwarded-For", "unknown, also-bad")
+	if got := clientIP(req); got != "203.0.113.9" {
+		t.Fatalf("脏头应回退 RemoteAddr: got %q", got)
+	}
+
+	// IPv6 取值与规范化；带端口的 X-Real-IP 不是纯 IP，应跳过
+	req = newReq()
+	req.Header.Set("X-Real-IP", "[2001:db8::1]:0")
+	if got := clientIP(req); got != "203.0.113.9" {
+		t.Fatalf("带端口的 X-Real-IP 应跳过回退 RemoteAddr: got %q", got)
+	}
+	req = newReq()
+	req.Header.Set("X-Real-IP", "2001:db8::1")
+	if got := clientIP(req); got != "2001:db8::1" {
+		t.Fatalf("IPv6: got %q", got)
+	}
+
+	cfg.TrustProxyHeaders = false
+	req = newReq()
+	req.Header.Set("X-Real-IP", "198.51.100.7")
+	if got := clientIP(req); got != "203.0.113.9" {
+		t.Fatalf("关闭信任后应取 TCP 对端: got %q", got)
+	}
+}
+
 func TestResponseRecorder(t *testing.T) {
 	inner := httptest.NewRecorder()
 	rr := &responseRecorder{ResponseWriter: inner}

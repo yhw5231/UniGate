@@ -282,6 +282,6 @@ func TestRequestLogRecordsLLMOnly(t *testing.T) {
 		t.Fatalf("chat record fields: %+v", chatRec)
 	}
 	if chatRec.Key == "" || strings.Contains(chatRec.Key, "sk-gw-test") {
-		t.Fatalf("key should be masked: %q", chatRec.Key)
+		t.Fatalf("key 列应为「名称@渠道」而非原始 key 值: %q", chatRec.Key)
 	}
 }

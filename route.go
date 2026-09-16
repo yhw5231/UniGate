@@ -248,7 +248,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 	}
 	recordTrace := func(cand *candidate, event, detail string) {
 		trace = append(trace, attemptTrace{
-			Key:   maskKey(cand.k.Name + "@" + cand.ch.Name),
+			Key:   cand.k.Name + "@" + cand.ch.Name,
 			Model: model,
 			Event: event,
 			Err:   detail,
@@ -442,7 +442,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 	return nil
 }
 
-// attemptTrace 一次候选尝试的轨迹（key 脱敏、事件、失败原因）。
+// attemptTrace 一次候选尝试的轨迹（key「名称@渠道」、事件、失败原因）。
 type attemptTrace struct {
 	Key   string `json:"key"`
 	Model string `json:"model,omitempty"`
@@ -451,7 +451,7 @@ type attemptTrace struct {
 }
 
 // formatTrace 把逐 key 尝试轨迹压成一行紧凑文本，如
-// "sk-1****c1 rejected_429(upstream 429: rate limited); sk-2****c2 network_error(...)"。
+// "key1@ch1 rejected_429(upstream 429: rate limited); key2@ch2 network_error(...)"。
 // 事件名保留原始英文标识，与日志/测试断言一致，避免翻译漂移。
 func formatTrace(trace []attemptTrace) string {
 	var parts []string

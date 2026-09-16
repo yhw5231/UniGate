@@ -282,7 +282,8 @@ func TestUsageDBInvalidLogTable(t *testing.T) {
 	}
 }
 
-// TestUsageDBMaskStoredKeys：历史明文 key 就地脱敏，且幂等（再跑一次不改动）。
+// TestUsageDBMaskStoredKeys：历史明文 key 就地脱敏（仅精确匹配现存真实
+// api_key），幂等（再跑一次不改动）；「名称@渠道」等非凭证文本不误伤。
 func TestUsageDBMaskStoredKeys(t *testing.T) {
 	db := newUsageDB("", 30, 1000)
 	defer db.Close()
@@ -290,11 +291,13 @@ func TestUsageDBMaskStoredKeys(t *testing.T) {
 	db.Append(UsageEvent{Time: now, User: "a", Model: "m", Key: "sk-plaintextkey12345", Status: 200})
 	db.Append(UsageEvent{Time: now, User: "a", Model: "m", Key: "sk-plaintextkey12345", Status: 200})
 	db.Append(UsageEvent{Time: now, User: "b", Model: "m", Key: "alread****masked", Status: 200})
+	db.Append(UsageEvent{Time: now, User: "c", Model: "m", Key: "daphne@cline", Status: 200})
 
-	if n := db.MaskStoredKeys(); n != 2 {
+	secrets := map[string]bool{"sk-plaintextkey12345": true}
+	if n := db.MaskStoredKeys(secrets); n != 2 {
 		t.Fatalf("masked rows = %d, want 2", n)
 	}
-	if n := db.MaskStoredKeys(); n != 0 {
+	if n := db.MaskStoredKeys(secrets); n != 0 {
 		t.Fatalf("second run should be a no-op, got %d", n)
 	}
 
@@ -306,15 +309,29 @@ func TestUsageDBMaskStoredKeys(t *testing.T) {
 	if plain != 0 {
 		t.Fatalf("plaintext key still present: %d rows", plain)
 	}
+	// 「名称@渠道」不是凭证：迁移不得动它
+	var names int
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM usage_events WHERE key = ?`, "daphne@cline").Scan(&names); err != nil {
+		t.Fatal(err)
+	}
+	if names != 1 {
+		t.Fatalf("key name rows corrupted: %d", names)
+	}
 	res := db.Query(UsageFilter{Window: "all"})
-	found := false
+	found, nameFound := false, false
 	for _, b := range res.ByKey {
 		if b.Name == maskKey("sk-plaintextkey12345") && b.Requests == 2 {
 			found = true
 		}
+		if b.Name == "daphne@cline" && b.Requests == 1 {
+			nameFound = true
+		}
 	}
 	if !found {
 		t.Fatalf("masked key group missing from by_key: %+v", res.ByKey)
+	}
+	if !nameFound {
+		t.Fatalf("key name group missing from by_key: %+v", res.ByKey)
 	}
 }
 

@@ -500,10 +500,11 @@ func (db *UsageDB) LogClear(table string) int64 {
 	return n
 }
 
-// MaskStoredKeys 把历史遗留的明文上游 key 就地脱敏（升级迁移，幂等：
-// 已含 **** 掩码的行不再匹配）。返回更新的行数。上游 key 属于凭证，长期
-// 落盘在用量库里会随备份/迁移扩散，故升级时就地收敛为脱敏值。
-func (db *UsageDB) MaskStoredKeys() int64 {
+// MaskStoredKeys 把历史遗留的明文上游 key 就地脱敏（升级迁移，幂等）。
+// 仅精确匹配 secrets（store 里现存的真实 api_key）的行会被脱敏：请求记录/
+// 用量库现在写入的是「key 名称@渠道」的用户标签而非凭证，不匹配凭证的值
+// 一律不动，避免误伤正常名称。返回更新的行数。
+func (db *UsageDB) MaskStoredKeys(secrets map[string]bool) int64 {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.db == nil {
@@ -517,7 +518,7 @@ func (db *UsageDB) MaskStoredKeys() int64 {
 	var plain []string
 	for rows.Next() {
 		var k string
-		if err := rows.Scan(&k); err == nil && k != "" {
+		if err := rows.Scan(&k); err == nil && k != "" && secrets[k] {
 			plain = append(plain, k)
 		}
 	}

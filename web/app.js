@@ -800,7 +800,7 @@ function keyBlock(k, inheritInfo) {
 $("#addKeyBtn").addEventListener("click", () => $("#chKeys").appendChild(keyBlock({ name: "", api_key: "", enabled: true }, keyInheritInfo({}))));
 
 // ---- key 批量导入：每行一个，支持 "key"、"名称|key"（也兼容 "名称:key"、
-// "key|备注"——名称取不像 key 的那一侧），# 开头为注释 ----
+// "名称----key"、"key|备注"——名称取不像 key 的那一侧），# 开头为注释 ----
 const BULK_NAME = "导入key";
 // cleanKeyText 清理复制粘贴带入的杂质：零宽字符（肉眼不可见、trim 去不掉，
 // 存进 key 后上游必然鉴权失败）、首尾成对引号（从 JSON/代码里复制）。
@@ -826,8 +826,9 @@ $("#bulkImportBtn").addEventListener("click", () => {
   for (let i = 0; i < rawLines.length; i++) {
     const line = cleanKeyText(rawLines[i]);
     if (!line || line.startsWith("#")) continue;
-    // 全角分隔符与 Excel 复制的制表符归一成 "|" 再切名称
-    const norm = line.replace(/：/g, ":").replace(/｜/g, "|").replace(/\t+/g, "|");
+    // 全角分隔符与 Excel 复制的制表符归一成 "|" 再切名称；4 个以上连字符
+    // 也视作分隔符（"名称----key"）——真实 key 里"-"都是单个出现，4 连不会误切
+    const norm = line.replace(/：/g, ":").replace(/｜/g, "|").replace(/\t+/g, "|").replace(/-{4,}/g, "|");
     let name = "", key = norm;
     const pipe = norm.indexOf("|");
     const colonSp = norm.match(/^(.+?)\s*:\s+(\S+)$/); // "名称: key"（冒号后必须跟空白）

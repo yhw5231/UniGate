@@ -51,7 +51,7 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
   请求挤出，便于事后排查；错误信息含**逐 key 失败轨迹**（哪个 key 因什么失败、
   冷却跳过/穿透试探），同样的轨迹也会写进下游 502/429 错误体。
 - **用量统计**：SQLite 逐条记录输入/输出 token，支持 今日/24h/7d/30d/全部 窗口，
-  按下游 key、渠道、模型、上游 key 聚合（上游 key 落盘前脱敏，见下）。
+  按下游 key、渠道、模型、上游 key 聚合（key 列存「名称@渠道」标签，非凭证，见下）。
 - **WebUI**：渠道与 key 管理（支持关键字搜索 + 分组过滤）、通用密钥签发、日志
   （列宽自适应、行内展开详情、当前页关键字过滤、自动刷新、默认每页 50 条）、
   用量、代理池租约搜索、连通性测试、手动换 IP / 释放租约、单 key 连通性测试，
@@ -246,7 +246,10 @@ journalctl -u unigate -f             # 跟踪日志
 
 ### 反向代理与 HTTPS
 
-网关本身只提供 HTTP，生产环境建议套 Nginx / Caddy 提供 TLS。SSE 流式响应需关闭缓冲：
+网关本身只提供 HTTP，生产环境建议套 Nginx / Caddy 提供 TLS。SSE 流式响应需关闭缓冲。
+套反代后真实客户端 IP 自动生效（`TRUST_PROXY_HEADERS` 默认 `true`：优先
+`X-Real-IP`，其次 `X-Forwarded-For`），请求记录的「出口」列与登录防爆破的按 IP
+计数都取真实 IP 而非反代地址：
 
 Nginx（网关转发，反代到 10010）：
 
@@ -314,9 +317,10 @@ healthcheck:
 - **`EXTRA_USERS` 仅用于预留多用户登录**：额外用户可登录换取 token，但 WebUI 数据均经
   Admin API 拉取（仅主管理员可见），额外用户目前登录后看不到内容；
 - 上游 key、代理凭证均明文存于 `gateway.json`，请确保数据目录权限（`chmod 600` 各文件或目录 `700`）。
-- **用量库与日志中的上游 key 已脱敏**：`usage.db` 的 `usage_events.key` 与请求/错误日志
-  只存掩码值（`sk-12****abcd`），升级时会自动把历史明文行就地脱敏（幂等）。上游 key 本身
-  仍只在 `gateway.json` 中明文保存。
+- **日志与用量库不落真实上游 key**：`usage.db` 的 `usage_events.key` 与请求/错误日志的
+  key 列存的是「key 名称@渠道」用户标签（非凭证，WebUI 完整显示），不存在凭证泄漏面；
+  升级时会按现存 api_key 精确匹配，把更早版本落盘的历史明文 key 行就地脱敏（幂等）。
+  上游 key 本身仍只在 `gateway.json` 中明文保存。
 - **登录防爆破默认开启**：连续 `LOGIN_FAIL_LOCKOUT`（默认 5）次失败后，按用户名与来源 IP
   分别锁定（指数退避，封顶 1h）；即使密码正确，锁定期间也返回 429 + `Retry-After`。
   失败与限流均记入服务日志（不含密码）。
@@ -429,6 +433,7 @@ WebUI「设置」页「默认账号调度」或「路由」页顶部下拉（保
 | `TOKEN_TTL` | `24h` | 登录 token 有效期 |
 | `TOKEN_SECRET` | 空 | 登录 token 签名密钥（缺省自动持久化到 data/token-secret） |
 | `GW_KEY_AUTH` | `true` | 下游是否必须携带通用 key |
+| `TRUST_PROXY_HEADERS` | `true` | 反代部署取真实客户端 IP：优先 `X-Real-IP`，其次 `X-Forwarded-For` 最左合法段（脏值跳过，回退 TCP 对端地址）。影响请求记录的「出口/客户端 IP」列与登录防爆破的按 IP 计数。网关不经反代直接暴露给不可信客户端时改为 `false`，防伪造头污染日志/绕过按 IP 限流 |
 | `MAX_ROUTE_TRIES` | 0（全部） | 单请求最多尝试的 key 数（也可在 WebUI「设置」页修改） |
 | `RATE_LIMIT_COOLDOWN` | `1h` | 429 冷却（上游未给出明确到期时间时才用；`Retry-After` 头或错误体文本里的明确时间优先。其余故障不冷却，只换 key；也可在 WebUI「设置」页修改） |
 | `ROTATE_AFTER_5XX` | `3` | 同一 key 连续 5xx 超过该次数自动换出口 IP（0 = 关闭；仅 ipv6pool key 生效；也可在 WebUI「设置」页修改） |

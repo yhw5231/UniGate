@@ -51,7 +51,17 @@ func main() {
 	initUsageDB()                   // 先建库：请求/错误日志持久化需要它
 	initStats()
 	if usageDB != nil {
-		if n := usageDB.MaskStoredKeys(); n > 0 {
+		// 请求记录/用量库现在只写「key 名称@渠道」（非凭证），但更早版本的
+		// 库里可能残留明文真实 key：按现存 api_key 精确匹配就地脱敏一次
+		secrets := map[string]bool{}
+		for _, ch := range snap.Channels {
+			for _, k := range ch.Keys {
+				if k.APIKey != "" {
+					secrets[k.APIKey] = true
+				}
+			}
+		}
+		if n := usageDB.MaskStoredKeys(secrets); n > 0 {
 			log.Printf("usage db: masked %d row(s) carrying plaintext upstream key", n)
 		}
 	}

@@ -635,7 +635,7 @@ func recordTestRequest(start time.Time, target, user, channel, key, model string
 		User:       user,
 		Channel:    channel,
 		Model:      model,
-		Key:        maskKey(key + "@" + channel),
+		Key:        key + "@" + channel,
 	}
 	if res.Error != "" {
 		rec.ErrMsg = truncate(res.Error, errMsgMax)

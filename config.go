@@ -40,7 +40,7 @@ type Config struct {
 
 	// 故障转移与冷却
 	MaxRouteTries     int           // 单请求最多尝试的 key 数（0 = 全部）
-	RateLimitCooldown time.Duration // 429 冷却（无 Retry-After 时；其余故障不冷却，只换 key）
+	RateLimitCooldown time.Duration // 429 冷却（上游未给明确到期时间时；其余故障不冷却，只换 key）
 	RotateAfter5xx    int           // 连续 5xx 超过该次数自动换出口 IP（默认 3，0 = 关闭）
 
 	// 账号调度默认模式（渠道未显式配置时使用）：failover / round_robin
@@ -214,7 +214,7 @@ func durationEnv(key string, def time.Duration) time.Duration {
 // RoutePolicy 运行时路由策略：环境变量提供默认值，WebUI 设置（gateway.json）
 // 显式覆盖。原子持有，保存设置时与在途请求无数据竞争。
 type RoutePolicy struct {
-	RateLimitCooldown time.Duration // 429 冷却（无 Retry-After 时）
+	RateLimitCooldown time.Duration // 429 冷却（上游未给明确到期时间时）
 	RotateAfter5xx    int           // 连续 5xx 换出口阈值（0 = 关闭）
 	MaxRouteTries     int           // 单请求最多尝试 key 数（0 = 全部）
 	KeepaliveInterval time.Duration // 流式心跳间隔（0 = 关闭）

@@ -1172,6 +1172,86 @@ func TestAllCoolingPierceFailsKeepsCooldown(t *testing.T) {
 	}
 }
 
+// Test429BodyExplicitTimeBecomesCooldown：上游 429 错误体写明到期时间
+//（"Try again in 14h 23m"，如按日重置的免费额度）时，冷却时长取该明确
+// 时间而非固定 RATE_LIMIT_COOLDOWN，且逐 key 轨迹保留上游原文。
+func Test429BodyExplicitTimeBecomesCooldown(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusTooManyRequests,
+		`{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model deepseek/deepseek-v4-flash-0731. Try again in 14h 23m"}}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.srv.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	kid := store.Snapshot().Channels[0].Keys[0].ID
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d want 429 body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "Try again in 14h 23m") {
+		t.Fatalf("trace should keep upstream original text: %s", rr.Body.String())
+	}
+	until, ok := cool.CoolingKey(kid, "")
+	if !ok {
+		t.Fatal("expected cooldown to be recorded")
+	}
+	want := 14*time.Hour + 23*time.Minute
+	if left := time.Until(until); left < want-time.Minute || left > want+time.Minute {
+		t.Fatalf("cooldown left=%v, want ~%v (explicit upstream time)", left, want)
+	}
+}
+
+// Test429RetryAfterHeaderBeatsBodyTime：Retry-After 头有效时优先于错误体时间。
+func Test429RetryAfterHeaderBeatsBodyTime(t *testing.T) {
+	setupGateway(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"Try again in 14h 23m"}}`)
+	}))
+	t.Cleanup(up.Close)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	kid := store.Snapshot().Channels[0].Keys[0].ID
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d want 429 body=%s", rr.Code, rr.Body.String())
+	}
+	until, ok := cool.CoolingKey(kid, "")
+	if !ok {
+		t.Fatal("expected cooldown to be recorded")
+	}
+	if left := time.Until(until); left < 110*time.Second || left > 130*time.Second {
+		t.Fatalf("cooldown left=%v, want ~120s (Retry-After header wins)", left)
+	}
+}
+
+// Test429WithoutExplicitTimeFallsBackToConfig：头与错误体都没给明确到期时间时，
+// 回落配置 RATE_LIMIT_COOLDOWN（setupGateway 设为 60s）。
+func Test429WithoutExplicitTimeFallsBackToConfig(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusTooManyRequests, `{"error":"rate limited"}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.srv.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	kid := store.Snapshot().Channels[0].Keys[0].ID
+
+	rr := httptest.NewRecorder()
+	forwardChat(rr, chatRequest("m1"), nil, false, "m1")
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d want 429 body=%s", rr.Code, rr.Body.String())
+	}
+	until, ok := cool.CoolingKey(kid, "")
+	if !ok {
+		t.Fatal("expected cooldown to be recorded")
+	}
+	if left := time.Until(until); left < 50*time.Second || left > 70*time.Second {
+		t.Fatalf("cooldown left=%v, want ~60s (configured cooldown)", left)
+	}
+}
+
 // TestSettingsOverrideRoutePolicy：WebUI 设置（gateway.json settings）应覆盖
 // 环境变量默认值并即时生效——max_route_tries=1 时首个 key 失败即 502，
 // 恢复默认（0=全部）后故障转移到第二个 key 成功。

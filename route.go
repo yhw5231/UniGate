@@ -6,7 +6,9 @@
 // 冷却键粒度为渠道级开关 cooldown_scope："key"（默认，含旧配置空值）按 key 跨模型
 // 共享冷却；"key_model" 按 (keyID, model) 独立冷却。
 // 故障分类与处理：
-//   - 429                  → 唯一记冷却的故障：Retry-After 优先，缺省 RATE_LIMIT_COOLDOWN（默认 1h）
+//   - 429                  → 唯一记冷却的故障：冷却时长优先取上游明确的到期时间
+//     （Retry-After 头 > 响应体 "Try again in 14h 23m" 类文本/时间戳），
+//     上游没给明确时间才用 RATE_LIMIT_COOLDOWN（默认 1h）
 //   - 5xx                  → 只换 key 不冷却；按 key 记连续次数（正常请求清零），连续超过
 //     ROTATE_AFTER_5XX（默认 3）自动换出口 IP（ipv6pool key 生效）
 //   - 网络/代理错误         → 只换 key 不冷却；ipv6pool 候选换出口 IP 后同 key 立即
@@ -323,12 +325,24 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests:
-			// 429 是唯一记冷却的故障：上游明确说"额度/频率受限"，冷却等待重试
+			// 429 是唯一记冷却的故障：上游明确说"额度/频率受限"，冷却等待重试。
+			// 冷却时长优先级：上游明确的到期时间（Retry-After 头 > 错误体文本/
+			// 时间戳）> 配置的固定 CD——如免费额度按日重置的上游会在错误体写
+			// "Try again in 14h 23m"，按固定 CD 提前重试只会反复撞 429。
 			rateLimited = true
-			d := retryAfterDuration(resp.Header.Get("Retry-After"), pol.RateLimitCooldown)
+			prefix, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			d := retryAfterDuration(resp.Header.Get("Retry-After"), 0)
+			if d == 0 {
+				if d2, ok := bodyRetryAfter(string(prefix)); ok {
+					d = d2
+				}
+			}
+			if d == 0 {
+				d = pol.RateLimitCooldown
+			}
 			cool.Mark(cand.k.ID, cm, d)
 			leaseMgr.RecordUse(cand.k.effectiveProxy(cand.ch), cand.k.ID)
-			lastErr = "upstream " + rejectReason(resp)
+			lastErr = "upstream " + formatRejectReason(resp.StatusCode, prefix)
 			recordTrace(&cand, "rejected_429", lastErr)
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
@@ -509,11 +523,17 @@ func earliestCooldown(cands []candidate, model string) *candidate {
 // 调用方负责随后 drain + Close body。
 func rejectReason(resp *http.Response) string {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return formatRejectReason(resp.StatusCode, body)
+}
+
+// formatRejectReason 由状态码 + 已读响应体前缀拼失败原因（429 分支已预读
+// 4KB 响应体用于解析到期时间，复用前缀避免二次读）。
+func formatRejectReason(status int, body []byte) string {
 	s := strings.TrimSpace(string(body))
 	if s == "" {
-		return strconv.Itoa(resp.StatusCode)
+		return strconv.Itoa(status)
 	}
-	return fmt.Sprintf("%d: %s", resp.StatusCode, truncate(s, 200))
+	return fmt.Sprintf("%d: %s", status, truncate(s, 200))
 }
 
 // peekUpstreamError 预读上游错误响应（透传分支）开头一段响应体，作为失败

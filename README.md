@@ -387,7 +387,7 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 
 | 故障 | 处理 |
 |---|---|
-| 上游 429 | **唯一记冷却的故障**：`Retry-After` 优先，否则 `RATE_LIMIT_COOLDOWN`（默认 1h） |
+| 上游 429 | **唯一记冷却的故障**：冷却时长优先取上游明确给出的到期时间（`Retry-After` 头，或错误体里的 "Try again in 14h 23m" 类文本/时间戳），上游没给明确时间才用 `RATE_LIMIT_COOLDOWN`（默认 1h） |
 | 上游 5xx | 只切换到下一个 key，不冷却；按 key 记连续次数（正常请求清零），**连续超过 `ROTATE_AFTER_5XX`（默认 3）自动换出口 IP** |
 | 网络/代理错误 | 不冷却；ipv6pool key **立即自动换出口 IP 并同 key 重试一次**（出口被拒/瞬断常只影响单个 IP，新出口可立即恢复），仍失败再切到下一个 key |
 | 上游 401/403 | 只切换到下一个 key，不冷却、不换出口 |
@@ -430,7 +430,7 @@ WebUI「设置」页「默认账号调度」或「路由」页顶部下拉（保
 | `TOKEN_SECRET` | 空 | 登录 token 签名密钥（缺省自动持久化到 data/token-secret） |
 | `GW_KEY_AUTH` | `true` | 下游是否必须携带通用 key |
 | `MAX_ROUTE_TRIES` | 0（全部） | 单请求最多尝试的 key 数（也可在 WebUI「设置」页修改） |
-| `RATE_LIMIT_COOLDOWN` | `1h` | 429 冷却（无 `Retry-After` 时；有则优先。其余故障不冷却，只换 key；也可在 WebUI「设置」页修改） |
+| `RATE_LIMIT_COOLDOWN` | `1h` | 429 冷却（上游未给出明确到期时间时才用；`Retry-After` 头或错误体文本里的明确时间优先。其余故障不冷却，只换 key；也可在 WebUI「设置」页修改） |
 | `ROTATE_AFTER_5XX` | `3` | 同一 key 连续 5xx 超过该次数自动换出口 IP（0 = 关闭；仅 ipv6pool key 生效；也可在 WebUI「设置」页修改） |
 | `DEFAULT_SCHEDULE` | `failover` | 默认账号调度（渠道未显式配置时使用）：`failover` 故障转移 / `round_robin` 顺序轮询；也可在 WebUI「设置」/「路由」页修改 |
 | `UPSTREAM_HEADER_TIMEOUT` | `10m` | 等待上游响应头超时（LLM 非流式可能较慢，勿设过小） |

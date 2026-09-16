@@ -600,6 +600,7 @@ func testOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user strin
 	}
 	res.Proxy = route.describe()
 	client := newUpstreamClient(route)
+	noteKeyCall(cand.k.ID, model) // 管理员测试也是一次真实调用：刷新 key 空闲计时
 	start := time.Now()
 	resp, err := doUpstreamRequest(ctx, client, &cand, reqBody, false, nil)
 	res.LatencyMS = time.Since(start).Milliseconds()

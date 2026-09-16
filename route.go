@@ -297,6 +297,8 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 		}
 
 		client := newUpstreamClient(route)
+		// 记录 key 活动（空闲探测的计时依据）：任何真实发出的上游请求都算调用
+		noteKeyCall(cand.k.ID, model)
 		resp, err := doUpstreamRequest(r.Context(), client, &cand, rawBody, stream, r.Header)
 		if err != nil {
 			// 下游已断开（超时/取消）导致上游请求被中止：不是上游故障，

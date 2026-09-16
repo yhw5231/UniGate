@@ -59,6 +59,10 @@ type Config struct {
 	// （默认 15s，0 = 关闭）。须低于下游反代/客户端的空闲超时（常见 60s）
 	KeepaliveInterval time.Duration
 
+	// 账号自动探测：空闲探测间隔（正常状态 key 连续无调用该时长后发探测题，
+	// 默认 8h，0 = 关闭空闲探测；冷却恢复探测不受影响）
+	ProbeIdleSec int
+
 	// 测试
 	TestTimeout time.Duration // 渠道/key 测试端点的整体超时（默认 45s，低于常见反代 60s）
 
@@ -157,6 +161,8 @@ func loadConfig() Config {
 
 		KeepaliveInterval: durationEnv("KEEPALIVE_INTERVAL", 15*time.Second),
 
+		ProbeIdleSec: intEnv("PROBE_IDLE_SEC", 8*3600),
+
 		TestTimeout: durationEnv("TEST_TIMEOUT", 45*time.Second),
 
 		ReqLogSize:         intEnv("REQ_LOG_SIZE", 1000),
@@ -176,6 +182,8 @@ func resetCfgForTest() {
 	leaseMgr = newLeaseManager()
 	globalTransportCache = &transportCache{trs: map[string]*http.Transport{}}
 	resetLoginThrottle()
+	activity = newKeyActivity()
+	probes = newProbeScheduler()
 	initUsageDB()
 	initStats()
 }
@@ -227,6 +235,7 @@ type RoutePolicy struct {
 	RotateAfter5xx    int           // 连续 5xx 换出口阈值（0 = 关闭）
 	MaxRouteTries     int           // 单请求最多尝试 key 数（0 = 全部）
 	KeepaliveInterval time.Duration // 流式心跳间隔（0 = 关闭）
+	ProbeIdleInterval time.Duration // 自动探测的空闲探测间隔（0 = 关闭空闲探测）
 	DefaultSchedule   string        // 默认账号调度：failover / round_robin（渠道未显式配置时使用）
 }
 
@@ -239,6 +248,7 @@ func defaultPolicy() *RoutePolicy {
 		RotateAfter5xx:    cfg.RotateAfter5xx,
 		MaxRouteTries:     cfg.MaxRouteTries,
 		KeepaliveInterval: cfg.KeepaliveInterval,
+		ProbeIdleInterval: time.Duration(cfg.ProbeIdleSec) * time.Second,
 		DefaultSchedule:   cfg.DefaultSchedule,
 	}
 }
@@ -266,6 +276,9 @@ func applySettings(set GatewaySettings) {
 	}
 	if set.KeepaliveSec != nil {
 		p.KeepaliveInterval = time.Duration(*set.KeepaliveSec) * time.Second
+	}
+	if set.ProbeIdleSec != nil {
+		p.ProbeIdleInterval = time.Duration(*set.ProbeIdleSec) * time.Second
 	}
 	if set.DefaultSchedule != nil {
 		p.DefaultSchedule = normalizeScheduleDefault(*set.DefaultSchedule)

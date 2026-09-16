@@ -125,14 +125,16 @@ function fillSettingsForm() {
   $("#setRotateAfter5xx").value = s.rotate_after_5xx ?? "";
   $("#setMaxRouteTries").value = s.max_route_tries ?? "";
   $("#setKeepaliveSec").value = s.keepalive_sec ?? "";
+  $("#setProbeIdleSec").value = s.probe_idle_sec ?? "";
   $("#setDefaultSchedule").value = s.default_schedule || "";
   // RoutePolicy 无 json tag：生效值按 Go 字段名下发，Duration 序列化为纳秒
   const ns = (v) => Math.round((v || 0) / 1e9);
   const tries = (p.MaxRouteTries || 0) === 0 ? "全部" : p.MaxRouteTries;
   const ka = ns(p.KeepaliveInterval);
+  const pi = ns(p.ProbeIdleInterval);
   const sched = p.DefaultSchedule === "round_robin" ? "顺序轮询" : "故障转移";
   $("#policyNow").textContent =
-    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"} · 默认账号调度 ${sched}`;
+    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"} · 空闲探测 ${pi > 0 ? pi + "s" : "关闭"} · 默认账号调度 ${sched}`;
 }
 
 $("#settingsSaveBtn").addEventListener("click", async () => {
@@ -149,6 +151,7 @@ $("#settingsSaveBtn").addEventListener("click", async () => {
     num("#setRotateAfter5xx", "rotate_after_5xx");
     num("#setMaxRouteTries", "max_route_tries");
     num("#setKeepaliveSec", "keepalive_sec");
+    num("#setProbeIdleSec", "probe_idle_sec");
     const sched = $("#setDefaultSchedule").value;
     if (sched !== "") body.default_schedule = sched; // 留空 = 恢复环境变量默认
     await api("PUT", "/admin/api/settings", body);
@@ -336,6 +339,7 @@ function renderChannels() {
         ${ch.rewrite_reasoning ? '<span class="badge info">reasoning改写</span>' : ""}
         ${ch.cooldown_scope === "key_model" ? '<span class="badge info">按(Key,模型)冷却</span>' : ""}
         ${ch.schedule === "round_robin" ? '<span class="badge info" title="每次请求从下一个 key 开始轮流分配">顺序轮询</span>' : ""}
+        ${ch.auto_probe ? '<span class="badge info" title="key 冷却恢复/连续 8 小时无调用时自动发加法题验证账号状态">自动探测</span>' : ""}
         ${ch.proxy && ch.proxy.kind ? '<span class="badge info">渠道代理</span>' : ""}
         ${coolingN ? `<span class="badge warn">${coolingN} 个 key 冷却中</span>` : ""}
         <span class="spacer"></span>
@@ -494,7 +498,7 @@ function keyProxyDesc(k, ch) {
 // ---- 渠道编辑器 ----
 $("#addChannelBtn").addEventListener("click", () => openChannelEditor({
   id: "", name: "", group: "", base_url: "", models_url: "", endpoint_type: "chat", models: [], headers: {},
-  rewrite_reasoning: false, cooldown_scope: "key", enabled: true, keys: [],
+  rewrite_reasoning: false, cooldown_scope: "key", auto_probe: false, enabled: true, keys: [],
 }));
 
 function openChannelEditor(ch) {
@@ -510,6 +514,7 @@ function openChannelEditor(ch) {
   $("#chRewrite").checked = !!ch.rewrite_reasoning;
   $("#chCooldownScope").value = ch.cooldown_scope === "key_model" ? "key_model" : "key";
   $("#chSchedule").value = ch.schedule || "";
+  $("#chAutoProbe").checked = !!ch.auto_probe;
   renderChannelProxy(ch.proxy || null);
   renderHeaderRows(ch.headers || {});
   renderKeyBlocks(ch.keys || []);
@@ -981,6 +986,7 @@ function collectChannelForm() {
     rewrite_reasoning: $("#chRewrite").checked,
     cooldown_scope: $("#chCooldownScope").value,
     schedule: $("#chSchedule").value,
+    auto_probe: $("#chAutoProbe").checked,
     proxy: chProxy,
     enabled: $("#chEnabled").checked,
     keys,

@@ -254,6 +254,10 @@
             <input id="setKeepaliveSec" type="number" min="0" placeholder="默认 15">
             <span class="hint">秒，0 = 关闭</span>
           </label>
+          <label class="fld" title="渠道开启「自动探测」后：正常状态的账号连续该时长没有任何调用时，自动发一道加法题验证账号状态（按 (Key,模型) 冷却的渠道逐模型检查，只探测连续未使用的模型；停用/冷却中的账号不探测）。0 = 关闭空闲探测，冷却恢复探测不受影响">空闲探测间隔
+            <input id="setProbeIdleSec" type="number" min="0" placeholder="默认 28800">
+            <span class="hint">秒，默认 8 小时，0 = 关闭</span>
+          </label>
           <label class="fld" title="渠道未显式配置「账号调度」时使用的默认模式（渠道编辑弹窗可单独覆盖）。
 故障转移：按 key 顺序，靠前的用满/失败才换下一个；
 顺序轮询：每次请求从下一个 key 开始轮流分配，均摊账号用量">默认账号调度
@@ -335,6 +339,7 @@
             <option value="round_robin">顺序轮询</option>
           </select>
         </label>
+        <label class="inline" title="开启后自动向上游发一道随机 5 位数加法题验证账号状态：key 冷却恢复时探测一次（按模型冷却的渠道探测恢复的那个模型）；正常状态连续无调用达「设置页空闲探测间隔」（默认 8 小时）再探测一次，按 (Key,模型) 冷却的渠道逐模型检查、只探测连续未使用的模型（停用、冷却中的账号不探测）。结果写入请求日志（用户列 probe），429 会按上游到期时间重新冷却"><input type="checkbox" id="chAutoProbe"> 自动探测</label>
       </div>
       <h4>自定义请求头</h4>
       <div id="chHeaders"></div>

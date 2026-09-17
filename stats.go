@@ -264,17 +264,28 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	if !r.wroteHeader {
 		r.WriteHeader(http.StatusOK)
 	}
+	// 每次写出武装下游写超时：客户端保持连接但停止读取时，写（含底层
+	// bufio 刷出）会在超时后报错而不再永久阻塞（客户端停读兜底）
+	restore := armWriteDeadline(r)
 	n, err := r.ResponseWriter.Write(b)
+	restore()
 	r.bytes += int64(n)
 	return n, err
 }
 
-// Flush 透传 SSE 刷新。
+// Flush 透传 SSE 刷新；同样武装写超时——HTTP/1 的缓冲数据正是在 flush 时
+// 真正写向连接，客户端停读时阻塞点在这里。
 func (r *responseRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		restore := armWriteDeadline(r)
 		f.Flush()
+		restore()
 	}
 }
+
+// Unwrap 暴露被包装的 writer：http.ResponseController 据此把下游写超时
+// 穿透本包装层设在底层连接上（本类型自身不实现 SetWriteDeadline）。
+func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 // clientIP 取请求来源 IP。TRUST_PROXY_HEADERS（默认开）时按反代部署处理：
 // RemoteAddr 只是反代地址，改取转发头——优先 X-Real-IP（反代一般用 $remote_addr

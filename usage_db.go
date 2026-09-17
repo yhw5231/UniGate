@@ -31,12 +31,16 @@ type UsageEvent struct {
 
 // UsageDB SQLite 用量库。
 type UsageDB struct {
+	// mu 保护写路径（Append/LogAppend/清理/脱敏）：写事务在进程内串行，
+	// 避免多写者互相 SQLITE_BUSY。读路径（Query/LogQuery/Count）不加锁——
+	// WAL 下读不阻塞写、写不阻塞读，管理端的聚合查询不再卡住请求日志写入。
 	mu            sync.Mutex
 	path          string // 空 = :memory:
 	retentionDays int
 	maxRecords    int
 	db            *sql.DB
 	appendCount   int
+	stmts         map[string]*sql.Stmt // 热路径 SQL 预编译缓存（mu 保护）
 }
 
 // usageSchema 用量库 + 请求/错误日志表。日志表与用量事件分离：用量库是
@@ -128,22 +132,98 @@ func newUsageDB(path string, retentionDays, maxRecords int) *UsageDB {
 	if maxRecords <= 0 {
 		db.maxRecords = 100000
 	}
-	dsn := path
-	if dsn == "" {
-		dsn = ":memory:"
-	}
-	sqldb, err := sql.Open("sqlite", dsn)
+	sqldb, err := openUsageSQLite(path)
 	if err != nil {
 		return db // 打开失败则保持 nil db，Append/Query 均为空操作
 	}
-	// 单连接：保证 :memory: 语义一致，也避免 SQLite 写锁冲突
-	sqldb.SetMaxOpenConns(1)
 	db.db = sqldb
 	if _, err := sqldb.Exec(usageSchema); err == nil {
 		db.migrate(sqldb)
 		db.cleanupLocked()
 	}
 	return db
+}
+
+// usagePragmas SQLite 连接参数（经 modernc 驱动的 DSN 参数逐连接生效）。
+//
+// WAL + synchronous=NORMAL：默认 DELETE 日志模式下每笔写事务都要创建/删除
+// 日志文件并两次 fsync，是「请求越多、库越大越卡」的主因——每个 LLM 请求
+// 结束都要写请求日志 + 用量两笔事务，fsync 在单连接上串行化全部请求。WAL
+// 下提交只追加日志文件（NORMAL 不对每次提交 fsync），checkpoint 时才落盘；
+// 读也不再阻塞写。代价：掉电可能丢最近若干笔遥测记录（日志/账本可接受，
+// 冷却等关键状态另有 cooldowns.json 原子落盘）。
+// busy_timeout：并发读连接遇到在途写事务时等待而非立刻报 database is locked。
+const usagePragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)"
+
+// openUsageSQLite 打开用量库并配置连接池。优先使用带 _pragma 参数的 DSN
+//（参数对新连接逐一生效，多连接读才安全）；驱动/文件系统不支持时退回普通
+// DSN + 单连接显式 PRAGMA（退化为改造前行为，功能不受影响）。
+func openUsageSQLite(path string) (*sql.DB, error) {
+	plain := path
+	if plain == "" {
+		plain = ":memory:"
+	}
+	if sqldb, err := sql.Open("sqlite", plain+usagePragmas); err == nil {
+		if _, err := sqldb.Exec("SELECT 1"); err == nil {
+			configureUsagePool(sqldb, path)
+			return sqldb, nil
+		}
+		_ = sqldb.Close()
+	}
+	sqldb, err := sql.Open("sqlite", plain)
+	if err != nil {
+		return nil, err
+	}
+	// 退回路径：单连接（PRAGMA 只作用于该连接），显式设置
+	configureUsagePool(sqldb, "")
+	_, _ = sqldb.Exec("PRAGMA journal_mode=WAL")
+	_, _ = sqldb.Exec("PRAGMA synchronous=NORMAL")
+	_, _ = sqldb.Exec("PRAGMA busy_timeout=5000")
+	return sqldb, nil
+}
+
+// configureUsagePool 设置连接池大小：
+//   - :memory:（path 为空）每连接一个独立库，必须单连接，否则不同连接看到
+//     不同的数据库（测试语义依赖）；
+//   - 文件库：少量连接即可——写路径已被 mu 串行化，多出来的连接服务并发读。
+func configureUsagePool(sqldb *sql.DB, path string) {
+	n := 4
+	if path == "" {
+		n = 1
+	}
+	sqldb.SetMaxOpenConns(n)
+	sqldb.SetMaxIdleConns(n)
+}
+
+// execResultLocked 与 execLocked 相同但返回结果（需要 RowsAffected 时使用）。
+func (db *UsageDB) execResultLocked(query string, args ...any) (sql.Result, error) {
+	if db.stmts == nil {
+		db.stmts = map[string]*sql.Stmt{}
+	}
+	stmt := db.stmts[query]
+	if stmt == nil {
+		s, err := db.db.Prepare(query)
+		if err != nil {
+			return db.db.Exec(query, args...)
+		}
+		db.stmts[query] = s
+		stmt = s
+	}
+	res, err := stmt.Exec(args...)
+	if err != nil {
+		delete(db.stmts, query)
+		_ = stmt.Close()
+		return nil, err
+	}
+	return res, nil
+}
+
+// execLocked 执行写语句：热路径 SQL 预编译复用（每条 INSERT 都重新解析/编译
+// 在每请求两笔写入的量级下是可观的浪费）。执行失败时丢弃缓存语句，下次重新
+// 准备（连接重建等场景自愈），错误照常返回给调用方。
+func (db *UsageDB) execLocked(query string, args ...any) error {
+	_, err := db.execResultLocked(query, args...)
+	return err
 }
 
 // migrate 执行增量迁移（列已存在时忽略错误）。
@@ -157,6 +237,10 @@ func (db *UsageDB) migrate(sqldb *sql.DB) {
 func (db *UsageDB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	for q, s := range db.stmts {
+		_ = s.Close()
+		delete(db.stmts, q)
+	}
 	if db.db != nil {
 		return db.db.Close()
 	}
@@ -170,7 +254,7 @@ func (db *UsageDB) Append(ev UsageEvent) {
 	if db.db == nil {
 		return
 	}
-	_, err := db.db.Exec(`INSERT INTO usage_events
+	err := db.execLocked(`INSERT INTO usage_events
 		(time, user, channel, model, key, prompt_tokens, completion_tokens, status, bytes_out)
 		VALUES (?,?,?,?,?,?,?,?,?)`,
 		ev.Time.UnixNano(), ev.User, ev.Channel, ev.Model, ev.Key,
@@ -202,9 +286,9 @@ func (db *UsageDB) cleanupLocked() {
 		return
 	}
 	cutoff := time.Now().AddDate(0, 0, -db.retentionDays).UnixNano()
-	_, _ = db.db.Exec(`DELETE FROM usage_events WHERE time < ?`, cutoff)
+	_ = db.execLocked(`DELETE FROM usage_events WHERE time < ?`, cutoff)
 	if db.maxRecords > 0 {
-		_, _ = db.db.Exec(`DELETE FROM usage_events WHERE id <=
+		_ = db.execLocked(`DELETE FROM usage_events WHERE id <=
 			(SELECT COALESCE(MAX(id),0) FROM usage_events) - ?`, int64(db.maxRecords))
 	}
 }
@@ -214,16 +298,12 @@ func (db *UsageDB) Available() bool {
 	if db == nil {
 		return false
 	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.db != nil
+	return db.db != nil // db 指针在构造后只读，无需加锁
 }
 
 // Count 返回当前事件总数。
 func (db *UsageDB) Count() int64 {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.db == nil {
+	if db == nil || db.db == nil {
 		return 0
 	}
 	var n int64
@@ -328,6 +408,7 @@ func buildWhere(f UsageFilter) (string, []any) {
 }
 
 // Query 按条件聚合用量（SQL 聚合，含 by_user/by_model/by_key 分解）。
+// 只读：不加写锁（WAL 下与写并发不互扰），管理端查询不再阻塞请求日志写入。
 func (db *UsageDB) Query(f UsageFilter) UsageResult {
 	now := time.Now()
 	start, end := resolveWindow(f.Window, now)
@@ -339,8 +420,6 @@ func (db *UsageDB) Query(f UsageFilter) UsageResult {
 	}
 	res := UsageResult{Window: f.Window, Start: start, End: end}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
 	if db.db == nil {
 		return res
 	}
@@ -409,7 +488,7 @@ func (db *UsageDB) LogAppend(table string, rec RequestRecord, keep int) {
 	if db.db == nil {
 		return
 	}
-	_, err := db.db.Exec(`INSERT INTO `+table+`
+	err := db.execLocked(`INSERT INTO `+table+`
 		(rid, time, duration_ms, method, path, status, bytes_out, client_ip, user, channel, model, key, prompt_tokens, completion_tokens, error)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		rec.ID, rec.Time.UnixNano(), rec.DurationMs, rec.Method, rec.Path, rec.Status,
@@ -421,19 +500,15 @@ func (db *UsageDB) LogAppend(table string, rec RequestRecord, keep int) {
 	}
 	if keep > 0 {
 		// 环形缓冲语义：只保留最新 keep 条
-		_, _ = db.db.Exec(`DELETE FROM `+table+` WHERE id NOT IN (
+		_ = db.execLocked(`DELETE FROM `+table+` WHERE id NOT IN (
 			SELECT id FROM `+table+` ORDER BY id DESC LIMIT ?)`, keep)
 	}
 }
 
 // LogQuery 分页返回日志（最新在前）。返回 (记录, 总数)。
+// 只读：不加写锁。
 func (db *UsageDB) LogQuery(table string, page, pageSize int) ([]RequestRecord, int) {
-	if db == nil || !validLogTable(table) {
-		return []RequestRecord{}, 0
-	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.db == nil {
+	if db == nil || !validLogTable(table) || db.db == nil {
 		return []RequestRecord{}, 0
 	}
 	if page < 1 {
@@ -481,7 +556,7 @@ func (db *UsageDB) logPrune(table string, keep int) {
 	if db.db == nil {
 		return
 	}
-	_, _ = db.db.Exec(`DELETE FROM `+table+` WHERE id NOT IN (
+	_ = db.execLocked(`DELETE FROM `+table+` WHERE id NOT IN (
 		SELECT id FROM `+table+` ORDER BY id DESC LIMIT ?)`, keep)
 }
 
@@ -529,7 +604,7 @@ func (db *UsageDB) MaskStoredKeys(secrets map[string]bool) int64 {
 	rows.Close()
 	var n int64
 	for _, k := range plain {
-		res, err := db.db.Exec(`UPDATE usage_events SET key = ? WHERE key = ?`, maskKey(k), k)
+		res, err := db.execResultLocked(`UPDATE usage_events SET key = ? WHERE key = ?`, maskKey(k), k)
 		if err != nil {
 			continue
 		}

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -43,9 +44,18 @@ func isBearerToken(auth string) bool {
 
 // ---- SSE 处理 ----
 
+// maxSSEFrameBytes 单帧字节上限。上游若发出一条始终没有换行的超长「行」，
+// readFrame 会沿 bufio.ErrBufferFull 分支持续累积帧缓冲，单连接就能吃掉大量
+// 内存（下游可重复触发）。正常 LLM 帧（含 reasoning 全文）远小于该值。
+// var 而非 const：测试可调小以快速构造超限场景。
+var maxSSEFrameBytes = 8 << 20
+
+// errSSEFrameTooLarge 帧超限：按上游协议异常中止该流（调用方停止转发）。
+var errSSEFrameTooLarge = errors.New("sse frame exceeds size limit")
+
 // readFrame 以 "\n\n" 为帧边界读取一帧（对应 JS 的 TransformStream），返回不含分隔符的帧内容。
 // 到达 EOF 时：若有残余且非全空白，作为最后一帧返回 (frame, nil)；否则返回 (nil, io.EOF)。
-// 行超长（超出 bufio 缓冲区）时继续累积，避免把单帧拆散。
+// 行超长（超出 bufio 缓冲区）时继续累积（上限 maxSSEFrameBytes）。
 func readFrame(br *bufio.Reader) ([]byte, error) {
 	var frame []byte
 	for {
@@ -53,6 +63,9 @@ func readFrame(br *bufio.Reader) ([]byte, error) {
 		frame = append(frame, line...)
 		if frameEndsWithDoubleNL(frame) {
 			return frame[:len(frame)-2], nil
+		}
+		if len(frame) > maxSSEFrameBytes {
+			return nil, errSSEFrameTooLarge
 		}
 		if err != nil {
 			if err == bufio.ErrBufferFull {

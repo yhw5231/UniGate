@@ -349,6 +349,10 @@ func probeChannelModel(ch *Channel, k *UpKey, model string) (*ModelUpstreamPin, 
 	pin := ch.upstreamPinFor(model)
 	if pin == nil {
 		pin = &ModelUpstreamPin{}
+	} else {
+		// 探测会改写产物字段：先克隆，绝不就地修改传入渠道的固定配置
+		//（渠道可能来自只读视图，就地改写会污染已发布配置且无锁保护）
+		pin = cloneJSON(pin)
 	}
 	cand := candidate{ch: ch, k: k}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TestTimeout)

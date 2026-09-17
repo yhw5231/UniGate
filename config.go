@@ -57,6 +57,11 @@ type Config struct {
 	UpstreamHeaderTimeout time.Duration
 	UpstreamReadIdle      time.Duration // 上游响应读取静默超时（失联兜底；默认 10m，0 关闭）
 
+	// 下游写超时：客户端保持连接但停止读取（TCP 窗口填满）时，单次「写+flush」
+	// 的最长阻塞时长，超时即中止该请求（释放 goroutine 与上下游连接对）。
+	// 与上游读取静默超时对称；默认 60s，0 关闭。
+	DownstreamWriteTimeout time.Duration
+
 	// 流式保活：等待上游首包/流静默期间向下游发 SSE 注释心跳的间隔
 	// （默认 15s，0 = 关闭）。须低于下游反代/客户端的空闲超时（常见 60s）
 	KeepaliveInterval time.Duration
@@ -163,6 +168,8 @@ func loadConfig() Config {
 
 		UpstreamHeaderTimeout: durationEnv("UPSTREAM_HEADER_TIMEOUT", 10*time.Minute),
 		UpstreamReadIdle:      durationEnv("UPSTREAM_READ_IDLE_TIMEOUT", 10*time.Minute),
+
+		DownstreamWriteTimeout: durationEnv("DOWNSTREAM_WRITE_TIMEOUT", 60*time.Second),
 
 		KeepaliveInterval: durationEnv("KEEPALIVE_INTERVAL", 15*time.Second),
 

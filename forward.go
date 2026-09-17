@@ -11,6 +11,37 @@ import (
 	"time"
 )
 
+// ---- 下游写入（写超时兜底） ----
+
+// writeDownstream 向下游写一段数据并 flush，返回首错。
+// 写超时（配置 cfg.DownstreamWriteTimeout）由 responseRecorder 在每次 Write/
+// Flush 上武装：穿透包装层设在底层连接上，客户端保持连接但停止读取（TCP
+// 窗口填满）时，写会在超时后返回错误，转发循环随之中止——否则该请求的
+// goroutine 与上下游连接对会永久挂住（上游侧已有读取静默超时兜底，下游侧
+// 需要对称保护）。
+func writeDownstream(w http.ResponseWriter, payload []byte) error {
+	_, err := w.Write(payload)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return err
+}
+
+// armWriteDeadline 武装下游单次写超时（cfg.DownstreamWriteTimeout，0 = 关闭），
+// 返回清除超时的恢复函数。通过 http.ResponseController 调用（穿透
+// responseRecorder / streamKeeper 的 Unwrap 链设在底层连接上）。
+// 底层不支持写超时（HTTP/2、httptest.ResponseRecorder 等）时退化为普通写入。
+func armWriteDeadline(w http.ResponseWriter) func() {
+	if cfg.DownstreamWriteTimeout <= 0 {
+		return func() {}
+	}
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(cfg.DownstreamWriteTimeout)); err != nil {
+		return func() {}
+	}
+	return func() { _ = rc.SetWriteDeadline(time.Time{}) }
+}
+
 // idleTimeoutReader 包装上游响应体：每次 Read 武装一个看门狗，连续 idle 没有
 // 任何字节返回（上游失联，TCP 半开 / NAT 静默回收等）就关闭底层连接强制结束
 // 阻塞中的 Read，调用方把错误当普通上游故障处理（路由层换 key，转发层结束
@@ -143,7 +174,7 @@ func serveUpstreamResponse(w http.ResponseWriter, upResp *http.Response, stream,
 		p, c := parseUsageJSON(out)
 		recordUsageToRecorder(w, p, c)
 		w.WriteHeader(upResp.StatusCode)
-		_, _ = w.Write(out)
+		_ = writeDownstream(w, out)
 		return
 	}
 
@@ -155,12 +186,14 @@ func serveUpstreamResponse(w http.ResponseWriter, upResp *http.Response, stream,
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(upResp.StatusCode)
-	flusher, _ := w.(http.Flusher)
 
 	br := bufio.NewReader(upResp.Body)
 	for {
 		frame, readErr := readFrame(br)
 		if readErr != nil && readErr != io.EOF {
+			// 上游读取中断（失联看门狗、帧超限、连接被取消）：
+			// 结束该流，日志留痕便于定位
+			log.Printf("forward: upstream stream read aborted: %v", readErr)
 			break
 		}
 		if len(frame) > 0 {
@@ -174,9 +207,9 @@ func serveUpstreamResponse(w http.ResponseWriter, upResp *http.Response, stream,
 				out = passFrame(frame)
 			}
 			if out != nil {
-				_, _ = w.Write(out)
-				if flusher != nil {
-					flusher.Flush()
+				if err := writeDownstream(w, out); err != nil {
+					log.Printf("forward: downstream write aborted: %v", err)
+					break
 				}
 			}
 		}
@@ -206,7 +239,7 @@ func serveResponsesUpstream(w http.ResponseWriter, upResp *http.Response, stream
 		p, c := parseUsageJSON(out)
 		recordUsageToRecorder(w, p, c)
 		w.WriteHeader(upResp.StatusCode)
-		_, _ = w.Write(out)
+		_ = writeDownstream(w, out)
 		return
 	}
 
@@ -217,13 +250,13 @@ func serveResponsesUpstream(w http.ResponseWriter, upResp *http.Response, stream
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(upResp.StatusCode)
-	flusher, _ := w.(http.Flusher)
 
 	conv := newResponsesStreamConv()
 	br := bufio.NewReader(upResp.Body)
 	for {
 		frame, readErr := readFrame(br)
 		if readErr != nil && readErr != io.EOF {
+			log.Printf("forward: upstream stream read aborted: %v", readErr)
 			break
 		}
 		if len(frame) > 0 {
@@ -232,9 +265,9 @@ func serveResponsesUpstream(w http.ResponseWriter, upResp *http.Response, stream
 				if p, c2, ok := parseUsageFromFrame(out); ok {
 					recordUsageToRecorder(w, p, c2)
 				}
-				_, _ = w.Write(out)
-				if flusher != nil {
-					flusher.Flush()
+				if err := writeDownstream(w, out); err != nil {
+					log.Printf("forward: downstream write aborted: %v", err)
+					return
 				}
 			}
 		}
@@ -246,14 +279,8 @@ func serveResponsesUpstream(w http.ResponseWriter, upResp *http.Response, stream
 	// 补发 finish_reason + [DONE]，避免下游悬挂
 	if !conv.done {
 		if out := conv.finalize(); len(out) > 0 {
-			_, _ = w.Write(out)
-			if flusher != nil {
-				flusher.Flush()
-			}
+			_ = writeDownstream(w, out)
 		}
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
-		if flusher != nil {
-			flusher.Flush()
-		}
+		_ = writeDownstream(w, []byte("data: [DONE]\n\n"))
 	}
 }

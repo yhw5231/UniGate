@@ -8,11 +8,13 @@
 .env
 .dev.vars
 
-# 用量数据库（SQLite，容器需挂载 data 目录持久化）
+# 用量数据库（SQLite，容器需挂载 data 目录持久化；WAL 模式随附 -wal/-shm）
 /data/
 # upgrade.sh 升级前的数据目录备份
 /backups/
 *.db
+*.db-wal
+*.db-shm
 *.db.tmp
 
 # ZCode 会话内部状态（计划记录等）

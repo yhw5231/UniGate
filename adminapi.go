@@ -83,7 +83,7 @@ func requireAdmin(w http.ResponseWriter, r *http.Request) (string, bool) {
 
 // handleAdminState 返回 WebUI 所需的全部状态：渠道、下游 key、池租约缓存、总览。
 func handleAdminState(w http.ResponseWriter, r *http.Request) {
-	snap := store.Snapshot()
+	snap := store.View() // 只读视图：本接口只序列化展示，无需深拷贝
 	type channelInfo struct {
 		ID         string   `json:"id"`
 		Name       string   `json:"name"`
@@ -497,7 +497,7 @@ func handleAdminPutChannel(w http.ResponseWriter, r *http.Request) {
 // 代理来源：key 自身配置优先，未配置时继承渠道级代理。
 func reconcileLeases() {
 	live := map[string]map[string]livePoolKey{}
-	for _, ch := range store.Snapshot().Channels {
+	for _, ch := range store.View().Channels {
 		for _, k := range ch.Keys {
 			spec := k.effectiveProxy(ch)
 			if spec == nil || spec.Kind != "ipv6pool" {
@@ -624,7 +624,7 @@ func handleAdminPoolTest(w http.ResponseWriter, r *http.Request) {
 	}
 	poolURL, poolToken := strings.TrimSpace(body.PoolURL), strings.TrimSpace(body.PoolToken)
 	if strings.TrimSpace(body.PoolID) != "" {
-		pool, ok := store.proxyPoolByID(strings.TrimSpace(body.PoolID))
+		pool, ok := store.ProxyPool(strings.TrimSpace(body.PoolID))
 		if !ok {
 			writeJSONError(w, http.StatusNotFound, "proxy pool not found", "not_found")
 			return

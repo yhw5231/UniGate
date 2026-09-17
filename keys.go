@@ -34,6 +34,14 @@ type Cooldowns struct {
 	mu    sync.Mutex
 	until map[cooldownPair]time.Time
 	path  string // 冷却持久化文件路径（SetPersistPath 设置；空 = 仅内存，测试默认）
+
+	// 落盘在锁外进行（writeMu 串行化文件写入）。旧实现每次变更都在 mu 内
+	// MarshalIndent 全表 + 写临时文件 + rename：IsCooling 每个候选都要抢
+	// 同一把锁，429 风暴（大量 key 同时限流）时磁盘 IO 会把全部并发请求的
+	// 冷却检查堵在锁后。gen/savedGen 让被更新状态超越的旧快照跳过写入。
+	writeMu  sync.Mutex
+	gen      uint64 // 最近一次状态变更代号（mu 保护）
+	savedGen uint64 // 已落盘代号（writeMu 保护）
 }
 
 var cool *Cooldowns
@@ -81,12 +89,33 @@ func (c *Cooldowns) SetPersistPath(path string) error {
 	return nil
 }
 
-// saveLocked 原子落盘冷却表（调用方持有写锁；未配置路径时跳过）。
-// 只写未过期条目；写失败仅记日志，不影响内存状态。冷却变更（429 记冷却、
-// 穿透成功/Admin 操作解除）都是低频事件，同步写即可，重启前最后一笔不丢。
-func (c *Cooldowns) saveLocked() {
+// snapshotLocked 取当前未过期条目快照并推进变更代号（调用方持有 mu）。
+// 持久化在锁外据此完成：写盘耗时不再阻塞冷却表读写。
+func (c *Cooldowns) snapshotLocked() ([]persistedCooldown, uint64) {
+	c.gen++
+	now := time.Now()
+	entries := make([]persistedCooldown, 0, len(c.until))
+	for p, until := range c.until {
+		if !now.Before(until) {
+			continue
+		}
+		entries = append(entries, persistedCooldown{KeyID: p.keyID, Model: p.model, Until: until.Unix()})
+	}
+	return entries, c.gen
+}
+
+// persist 原子落盘冷却表（锁外调用，writeMu 串行化）。代号不新于已落盘状态
+// 时直接跳过（并发变更已被更新的快照覆盖）；写失败仅记日志，不影响内存状态。
+// 同步（返回前完成写入）是刻意保持的语义：429 冷却常长达数小时，重启丢了会
+// 立刻把请求打回限流中的账号。
+func (c *Cooldowns) persist(entries []persistedCooldown, gen uint64) {
 	if c.path == "" {
 		return
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if gen <= c.savedGen {
+		return // 已有更新的状态落盘（并发 Mark 的旧快照）
 	}
 	dir := filepath.Dir(c.path)
 	if dir != "." && dir != "" {
@@ -95,14 +124,10 @@ func (c *Cooldowns) saveLocked() {
 			return
 		}
 	}
-	now := time.Now()
-	data := persistedCooldowns{SavedAt: now.Unix(), Entries: []persistedCooldown{}}
-	for p, until := range c.until {
-		if !now.Before(until) {
-			continue
-		}
-		data.Entries = append(data.Entries, persistedCooldown{KeyID: p.keyID, Model: p.model, Until: until.Unix()})
+	if entries == nil {
+		entries = []persistedCooldown{}
 	}
+	data := persistedCooldowns{SavedAt: time.Now().Unix(), Entries: entries}
 	body, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return
@@ -116,7 +141,9 @@ func (c *Cooldowns) saveLocked() {
 	if err := os.Rename(tmp, c.path); err != nil {
 		_ = os.Remove(tmp)
 		log.Printf("save cooldowns: %v", err)
+		return
 	}
+	c.savedGen = gen
 }
 
 // IsCooling 返回 (keyID, model) 是否处于冷却中。
@@ -141,43 +168,43 @@ func (c *Cooldowns) Mark(keyID, model string, dur time.Duration) {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.until[cooldownPair{keyID, model}] = time.Now().Add(dur)
-	if len(c.until) <= cooldownSoftCap {
-		c.saveLocked()
-		return
-	}
-	c.pruneLocked()
-	if n := len(c.until); n > cooldownSoftCap {
-		target := n / 2
-		for k := range c.until {
-			if len(c.until) <= target {
-				break
+	if len(c.until) > cooldownSoftCap {
+		c.pruneLocked()
+		if n := len(c.until); n > cooldownSoftCap {
+			target := n / 2
+			for k := range c.until {
+				if len(c.until) <= target {
+					break
+				}
+				delete(c.until, k)
 			}
-			delete(c.until, k)
 		}
 	}
-	c.saveLocked()
+	entries, gen := c.snapshotLocked()
+	c.mu.Unlock()
+	c.persist(entries, gen) // 锁外落盘：不阻塞其它请求的冷却检查
 }
 
 // Clear 解除 (keyID, model) 的冷却。渠道测试成功后调用：
 // 真实请求已打通该 key，存量冷却与事实相悖（表现为「测试通过但网关 502」）。
 func (c *Cooldowns) Clear(keyID, model string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	p := cooldownPair{keyID, model}
 	if _, ok := c.until[p]; !ok {
+		c.mu.Unlock()
 		return
 	}
 	delete(c.until, p)
-	c.saveLocked()
+	entries, gen := c.snapshotLocked()
+	c.mu.Unlock()
+	c.persist(entries, gen)
 }
 
 // ClearKey 解除某 key 的全部冷却（所有模型粒度），返回清除的条数。
 // WebUI「解除冷却」手动操作使用。
 func (c *Cooldowns) ClearKey(keyID string) int {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	n := 0
 	for k := range c.until {
 		if k.keyID == keyID {
@@ -185,9 +212,13 @@ func (c *Cooldowns) ClearKey(keyID string) int {
 			n++
 		}
 	}
-	if n > 0 {
-		c.saveLocked()
+	if n == 0 {
+		c.mu.Unlock()
+		return 0
 	}
+	entries, gen := c.snapshotLocked()
+	c.mu.Unlock()
+	c.persist(entries, gen)
 	return n
 }
 
@@ -195,13 +226,15 @@ func (c *Cooldowns) ClearKey(keyID string) int {
 // 渠道页/路由页对 key_model 渠道的单模型解除使用），返回是否清除。
 func (c *Cooldowns) ClearModel(keyID, model string) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	p := cooldownPair{keyID, model}
 	if _, ok := c.until[p]; !ok {
+		c.mu.Unlock()
 		return false
 	}
 	delete(c.until, p)
-	c.saveLocked()
+	entries, gen := c.snapshotLocked()
+	c.mu.Unlock()
+	c.persist(entries, gen)
 	return true
 }
 
@@ -225,13 +258,15 @@ func (c *Cooldowns) CoolingMap(keyID string) map[string]time.Time {
 // 测试重置也走这里。
 func (c *Cooldowns) ClearAll() int {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	n := len(c.until)
 	if n == 0 {
+		c.mu.Unlock()
 		return 0
 	}
 	c.until = map[cooldownPair]time.Time{}
-	c.saveLocked()
+	entries, gen := c.snapshotLocked()
+	c.mu.Unlock()
+	c.persist(entries, gen)
 	return n
 }
 

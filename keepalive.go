@@ -46,7 +46,8 @@ func newStreamKeeper(w http.ResponseWriter, interval time.Duration) *streamKeepe
 }
 
 // start 启动心跳协程：每 interval/2 检查一次，距上次写出超过 interval 就
-// 补一帧注释（兼作首包等待期与流中途的静默期）。
+// 补一帧注释（兼作首包等待期与流中途的静默期）。心跳写出失败（下游停读
+// 超时/断开）即停止——客户端已不可达，继续写没有意义。
 func (k *streamKeeper) start() {
 	per := k.interval / 2
 	if per < 10*time.Millisecond {
@@ -62,7 +63,10 @@ func (k *streamKeeper) start() {
 			case now := <-t.C:
 				k.mu.Lock()
 				if !k.committed || now.Sub(k.lastWrite) >= k.interval {
-					k.keepaliveLocked()
+					if err := k.keepaliveLocked(); err != nil {
+						k.mu.Unlock()
+						return
+					}
 				}
 				k.mu.Unlock()
 			}
@@ -76,7 +80,8 @@ func (k *streamKeeper) stop() {
 }
 
 // keepaliveLocked 确保已提交 SSE 响应头，再写一帧注释心跳。调用方须持 mu。
-func (k *streamKeeper) keepaliveLocked() {
+// 写出带下游写超时（客户端停读时不会把心跳协程永久挂在写调用上）。
+func (k *streamKeeper) keepaliveLocked() error {
 	if !k.committed {
 		h := k.w.Header()
 		h.Set("Content-Type", "text/event-stream")
@@ -85,16 +90,20 @@ func (k *streamKeeper) keepaliveLocked() {
 		k.w.WriteHeader(http.StatusOK)
 		k.committed = true
 	}
-	_, _ = k.w.Write([]byte(keepaliveFrame))
-	if f, ok := k.w.(http.Flusher); ok {
-		f.Flush()
+	err := writeDownstream(k.w, []byte(keepaliveFrame))
+	if err == nil {
+		k.lastWrite = time.Now()
 	}
-	k.lastWrite = time.Now()
+	return err
 }
 
 // ---- http.ResponseWriter 代理：serveUpstreamResponse 经此写出 ----
 
 func (k *streamKeeper) Header() http.Header { return k.w.Header() }
+
+// Unwrap 暴露被包装的 writer：http.ResponseController 据此把下游写超时
+// 穿透包装层设在底层连接上（本类型自身不实现 SetWriteDeadline）。
+func (k *streamKeeper) Unwrap() http.ResponseWriter { return k.w }
 
 // WriteHeader 提交上游状态码；若心跳已抢先发过 200 SSE 头则吞掉
 // （同一连接不能再发第二份头，上游 body 帧仍照常透传）。
@@ -147,11 +156,8 @@ func (k *streamKeeper) finish(msg, code string, status int, retryAfter int64) {
 			"error": map[string]string{"message": msg, "type": "gateway_error", "code": code},
 		})
 		if err == nil {
-			_, _ = k.w.Write(append(append([]byte("data: "), payload...), '\n', '\n'))
-			_, _ = k.w.Write([]byte("data: [DONE]\n\n"))
-			if f, ok := k.w.(http.Flusher); ok {
-				f.Flush()
-			}
+			_ = writeDownstream(k.w, append(append([]byte("data: "), payload...), '\n', '\n'))
+			_ = writeDownstream(k.w, []byte("data: [DONE]\n\n"))
 		}
 		return
 	}

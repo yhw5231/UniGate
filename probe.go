@@ -176,7 +176,7 @@ func (s *probeScheduler) scanOnce() [][]probeTask {
 	if store == nil {
 		return nil
 	}
-	snap := store.Snapshot()
+	snap := store.View() // 只读视图，零拷贝
 
 	nowCooling := map[cooldownPair]bool{}
 	nowCoolingKeys := map[string]bool{}

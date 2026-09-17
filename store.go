@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -476,17 +477,72 @@ type gatewayConfig struct {
 	Settings   *GatewaySettings `json:"settings,omitempty"`
 }
 
-// GatewayStore 配置存储（进程内单例，mutex 保护）。
+// GatewayStore 配置存储（进程内单例）。
+//
+// 并发模型：写路径（load / Put* / Delete*）由 mu 串行化；已发布的配置对象
+// 一律视为不可变——每次写入都克隆出新的 gatewayConfig 并原子发布，读路径
+// View() 直接取当前发布的指针。热路径（每个转发请求的候选构建、鉴权、
+// 路由视图）此前对全量配置做 JSON 深拷贝，配置里模型列表/固定渠道产物越大
+// 越慢；现在零拷贝，且读不再与写互斥。
+// 需要「取副本 → 修改 → 整体写回」的管理端流程用 Snapshot()（深拷贝副本）。
 type GatewayStore struct {
-	mu   sync.RWMutex
+	mu   sync.Mutex // 写路径串行化（发布 + 落盘）
 	path string
-	data gatewayConfig
+	cur  atomic.Pointer[gatewayConfig]
 }
 
 var store *GatewayStore
 
+// emptyGatewayConfig 未初始化（store 为 nil 或尚未 load）时的只读空配置，
+// 调用方一律只读，无需每次分配。
+var emptyGatewayConfig = &gatewayConfig{Channels: []*Channel{}, GWKeys: []*GWKey{}, ProxyPools: []*ProxyPool{}}
+
 func newGatewayStore(path string) *GatewayStore {
-	return &GatewayStore{path: path}
+	s := &GatewayStore{path: path}
+	s.cur.Store(emptyGatewayConfig)
+	return s
+}
+
+// View 返回当前已发布配置（零拷贝）。调用方只能读，绝不可修改其字段——该
+// 对象与并发中的请求共享（修改会污染运行中的路由且无锁保护，是数据竞争）。
+// 管理端要改配置请用 Snapshot() 取深拷贝副本再 Put 回来。
+func (s *GatewayStore) View() *gatewayConfig {
+	if s == nil {
+		return emptyGatewayConfig
+	}
+	if cfg := s.cur.Load(); cfg != nil {
+		return cfg
+	}
+	return emptyGatewayConfig
+}
+
+// publishLocked 原子发布新配置（调用方持有写锁）。
+func (s *GatewayStore) publishLocked(cfg *gatewayConfig) { s.cur.Store(cfg) }
+
+// cloneConfigShallow 复制配置骨架：切片头部复制（元素指针共享，元素本身
+// 不可变），Settings 整体替换故可直接共享。写入路径据此构造并发布新配置。
+func cloneConfigShallow(cur *gatewayConfig) *gatewayConfig {
+	return &gatewayConfig{
+		Channels:   append([]*Channel(nil), cur.Channels...),
+		GWKeys:     append([]*GWKey(nil), cur.GWKeys...),
+		ProxyPools: append([]*ProxyPool(nil), cur.ProxyPools...),
+		Settings:   cur.Settings,
+	}
+}
+
+// cloneJSON 深拷贝（JSON 往返）。写入路径把外部对象克隆进已发布配置：发布
+// 后与调用方脱钩，调用方随后修改自己持有的对象不会影响运行中的路由。克隆
+// 只在管理端写入时发生（低频），不在请求热路径上。
+func cloneJSON[T any](v T) T {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return v
+	}
+	var out T
+	if err := json.Unmarshal(body, &out); err != nil {
+		return v
+	}
+	return out
 }
 
 // load 从磁盘读取；文件不存在时初始化空配置并落盘。
@@ -495,14 +551,14 @@ func (s *GatewayStore) load() error {
 	defer s.mu.Unlock()
 	body, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
-		s.data = gatewayConfig{Channels: []*Channel{}, GWKeys: []*GWKey{}}
+		s.publishLocked(&gatewayConfig{Channels: []*Channel{}, GWKeys: []*GWKey{}})
 		return s.saveLocked()
 	}
 	if err != nil {
 		return fmt.Errorf("read gateway config: %w", err)
 	}
 	if len(strings.TrimSpace(string(body))) == 0 {
-		s.data = gatewayConfig{Channels: []*Channel{}, GWKeys: []*GWKey{}}
+		s.publishLocked(&gatewayConfig{Channels: []*Channel{}, GWKeys: []*GWKey{}})
 		return nil
 	}
 	var data gatewayConfig
@@ -523,23 +579,25 @@ func (s *GatewayStore) load() error {
 			ch.Keys = []*UpKey{}
 		}
 	}
-	s.data = data
-	if s.migrateInlinePoolsLocked() {
+	// 迁移在发布前完成：发布出去的对象必须已定稿（不可变）
+	migrated := migrateInlinePools(&data)
+	s.publishLocked(&data)
+	if migrated {
 		return s.saveLocked() // 迁移写回，保证之后保存的都是新的引用格式
 	}
 	return nil
 }
 
-// migrateInlinePoolsLocked 把旧格式的内联代理池连接信息（key 上的 pool_url/
+// migrateInlinePools 把旧格式的内联代理池连接信息（key 上的 pool_url/
 // pool_token/socks_host）迁移为独立的 ProxyPool 实体：按连接信息合并去重，
 // key 改为引用 PoolID 并清空内联字段（调用方持有写锁）。无变化时返回 false。
-func (s *GatewayStore) migrateInlinePoolsLocked() bool {
+func migrateInlinePools(data *gatewayConfig) bool {
 	byKey := map[string]*ProxyPool{}
-	for _, p := range s.data.ProxyPools {
+	for _, p := range data.ProxyPools {
 		byKey[poolConnKey(p.PoolURL, p.PoolToken, p.SocksHost)] = p
 	}
 	changed := false
-	for _, ch := range s.data.Channels {
+	for _, ch := range data.Channels {
 		for _, k := range ch.Keys {
 			spec := k.Proxy
 			if spec == nil || spec.Kind != "ipv6pool" || strings.TrimSpace(spec.PoolID) != "" {
@@ -558,7 +616,7 @@ func (s *GatewayStore) migrateInlinePoolsLocked() bool {
 					PoolToken: spec.PoolToken,
 					SocksHost: spec.SocksHost,
 				}
-				s.data.ProxyPools = append(s.data.ProxyPools, pool)
+				data.ProxyPools = append(data.ProxyPools, pool)
 				byKey[key] = pool
 			}
 			spec.PoolID = pool.ID
@@ -576,7 +634,7 @@ func poolConnKey(poolURL, token, socksHost string) string {
 	return strings.TrimRight(strings.TrimSpace(poolURL), "/") + "|" + token + "|" + socksHost
 }
 
-// saveLocked 原子落盘（调用方持有写锁）。
+// saveLocked 原子落盘当前发布配置（调用方持有写锁）。
 func (s *GatewayStore) saveLocked() error {
 	dir := filepath.Dir(s.path)
 	if dir != "." && dir != "" {
@@ -584,7 +642,7 @@ func (s *GatewayStore) saveLocked() error {
 			return fmt.Errorf("create config dir: %w", err)
 		}
 	}
-	body, err := json.MarshalIndent(s.data, "", "  ")
+	body, err := json.MarshalIndent(s.View(), "", "  ")
 	if err != nil {
 		return err
 	}
@@ -601,10 +659,9 @@ func (s *GatewayStore) saveLocked() error {
 }
 
 // Snapshot 返回配置深拷贝（含全部敏感字段，仅 Admin API 使用）。
+// 管理端「取副本 → 修改 → Put 写回」的流程依赖它；只读路径请用 View()。
 func (s *GatewayStore) Snapshot() gatewayConfig {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	body, _ := json.Marshal(s.data)
+	body, _ := json.Marshal(s.View())
 	var out gatewayConfig
 	_ = json.Unmarshal(body, &out)
 	return out
@@ -617,6 +674,7 @@ func (s *GatewayStore) PutChannel(ch *Channel) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cur := s.View()
 	// 校验 ipv6pool key 引用的代理池存在（连接信息统一在池实体上配置；
 	// 渠道级代理与 key 级代理都会引用池）
 	specs := []*ProxySpec{ch.Proxy}
@@ -624,24 +682,27 @@ func (s *GatewayStore) PutChannel(ch *Channel) error {
 		specs = append(specs, k.Proxy)
 	}
 	for _, spec := range specs {
-		if spec != nil && spec.Kind == "ipv6pool" && spec.PoolID != "" && s.proxyPoolByIDLocked(spec.PoolID) == nil {
+		if spec != nil && spec.Kind == "ipv6pool" && spec.PoolID != "" && proxyPoolByID(cur, spec.PoolID) == nil {
 			return fmt.Errorf("ipv6pool proxy references unknown proxy pool %q (create it on the pool page first)", spec.PoolID)
 		}
 	}
 	if ch.ID == "" {
 		ch.ID = randomHex(8)
 	}
+	next := cloneConfigShallow(cur)
+	stored := cloneJSON(ch) // 发布后与调用方脱钩
 	replaced := false
-	for i, cur := range s.data.Channels {
-		if cur.ID == ch.ID {
-			s.data.Channels[i] = ch
+	for i, c := range next.Channels {
+		if c.ID == stored.ID {
+			next.Channels[i] = stored
 			replaced = true
 			break
 		}
 	}
 	if !replaced {
-		s.data.Channels = append(s.data.Channels, ch)
+		next.Channels = append(next.Channels, stored)
 	}
+	s.publishLocked(next)
 	return s.saveLocked()
 }
 
@@ -748,13 +809,16 @@ func validateAPIKey(key string) error {
 func (s *GatewayStore) DeleteChannel(id string) (*Channel, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i, ch := range s.data.Channels {
-		if ch.ID == id {
-			removed := ch
-			s.data.Channels = append(s.data.Channels[:i], s.data.Channels[i+1:]...)
-			_ = s.saveLocked()
-			return removed, true
+	cur := s.View()
+	for i, ch := range cur.Channels {
+		if ch.ID != id {
+			continue
 		}
+		next := cloneConfigShallow(cur)
+		next.Channels = append(append([]*Channel(nil), cur.Channels[:i]...), cur.Channels[i+1:]...)
+		s.publishLocked(next)
+		_ = s.saveLocked()
+		return ch, true // 已发布对象（只读）
 	}
 	return nil, false
 }
@@ -769,17 +833,21 @@ func (s *GatewayStore) PutProxyPool(p *ProxyPool) error {
 	if p.ID == "" {
 		p.ID = randomHex(8)
 	}
+	cur := s.View()
+	next := cloneConfigShallow(cur)
+	stored := cloneJSON(p)
 	replaced := false
-	for i, cur := range s.data.ProxyPools {
-		if cur.ID == p.ID {
-			s.data.ProxyPools[i] = p
+	for i, c := range next.ProxyPools {
+		if c.ID == stored.ID {
+			next.ProxyPools[i] = stored
 			replaced = true
 			break
 		}
 	}
 	if !replaced {
-		s.data.ProxyPools = append(s.data.ProxyPools, p)
+		next.ProxyPools = append(next.ProxyPools, stored)
 	}
+	s.publishLocked(next)
 	return s.saveLocked()
 }
 
@@ -788,13 +856,14 @@ func (s *GatewayStore) PutProxyPool(p *ProxyPool) error {
 func (s *GatewayStore) DeleteProxyPool(id string) (*ProxyPool, bool, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pool := s.proxyPoolByIDLocked(id)
+	cur := s.View()
+	pool := proxyPoolByID(cur, id)
 	if pool == nil {
 		return nil, false, ""
 	}
 	// 引用检查：key 显式绑定的 PoolID，或尚未迁移的旧内联同 URL 配置
 	var usedBy []string
-	for _, ch := range s.data.Channels {
+	for _, ch := range cur.Channels {
 		for _, k := range ch.Keys {
 			if k.Proxy == nil || k.Proxy.Kind != "ipv6pool" {
 				continue
@@ -809,44 +878,30 @@ func (s *GatewayStore) DeleteProxyPool(id string) (*ProxyPool, bool, string) {
 	if len(usedBy) > 0 {
 		return nil, false, strings.Join(usedBy, "、")
 	}
-	for i, cur := range s.data.ProxyPools {
-		if cur.ID == id {
-			removed := cur
-			s.data.ProxyPools = append(s.data.ProxyPools[:i], s.data.ProxyPools[i+1:]...)
-			_ = s.saveLocked()
-			return removed, true, ""
+	for i, c := range cur.ProxyPools {
+		if c.ID != id {
+			continue
 		}
+		next := cloneConfigShallow(cur)
+		next.ProxyPools = append(append([]*ProxyPool(nil), cur.ProxyPools[:i]...), cur.ProxyPools[i+1:]...)
+		s.publishLocked(next)
+		_ = s.saveLocked()
+		return c, true, "" // 已发布对象（只读）
 	}
 	return nil, false, ""
 }
 
-// proxyPoolByIDLocked 按 ID 查找代理池（调用方持有读/写锁）。
-func (s *GatewayStore) proxyPoolByIDLocked(id string) *ProxyPool {
-	if id == "" {
+// proxyPoolByID 在给定配置里按 ID 查找代理池（返回已发布对象，只读）。
+func proxyPoolByID(cfg *gatewayConfig, id string) *ProxyPool {
+	if cfg == nil || id == "" {
 		return nil
 	}
-	for _, p := range s.data.ProxyPools {
+	for _, p := range cfg.ProxyPools {
 		if p.ID == id {
 			return p
 		}
 	}
 	return nil
-}
-
-// proxyPoolByID 按 ID 查找代理池（快照，供锁外调用）。
-func (s *GatewayStore) proxyPoolByID(id string) (*ProxyPool, bool) {
-	if s == nil || id == "" {
-		return nil, false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if p := s.proxyPoolByIDLocked(id); p != nil {
-		body, _ := json.Marshal(p)
-		var out ProxyPool
-		_ = json.Unmarshal(body, &out)
-		return &out, true
-	}
-	return nil, false
 }
 
 // poolSpecReady 把 ipv6pool key 上绑定的池引用解析为带连接信息的完整 spec（快照）。
@@ -857,7 +912,7 @@ func poolSpecReady(spec *ProxySpec) (*ProxySpec, error) {
 		return spec, nil
 	}
 	if strings.TrimSpace(spec.PoolID) != "" {
-		pool, ok := store.proxyPoolByID(spec.PoolID)
+		pool, ok := store.ProxyPool(spec.PoolID)
 		if !ok {
 			return nil, fmt.Errorf("proxy pool %q not found", spec.PoolID)
 		}
@@ -873,6 +928,12 @@ func poolSpecReady(spec *ProxySpec) (*ProxySpec, error) {
 	return spec, nil // 旧格式：连接信息内联
 }
 
+// ProxyPool 按 ID 查找代理池（返回已发布对象，调用方只读）。
+func (s *GatewayStore) ProxyPool(id string) (*ProxyPool, bool) {
+	p := proxyPoolByID(s.View(), id)
+	return p, p != nil
+}
+
 // PutGWKey 新增或更新下游 key。
 func (s *GatewayStore) PutGWKey(k *GWKey) error {
 	k.Name = strings.TrimSpace(k.Name)
@@ -885,24 +946,29 @@ func (s *GatewayStore) PutGWKey(k *GWKey) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cur := s.View()
 	if k.ID == "" {
 		k.ID = randomHex(8)
 	}
 	if k.CreatedAt.IsZero() {
 		k.CreatedAt = time.Now()
 	}
+	next := cloneConfigShallow(cur)
+	stored := cloneJSON(k)
 	replaced := false
-	for i, cur := range s.data.GWKeys {
-		if cur.ID == k.ID {
-			k.CreatedAt = cur.CreatedAt
-			s.data.GWKeys[i] = k
+	for i, c := range next.GWKeys {
+		if c.ID == stored.ID {
+			stored.CreatedAt = c.CreatedAt
+			k.CreatedAt = c.CreatedAt
+			next.GWKeys[i] = stored
 			replaced = true
 			break
 		}
 	}
 	if !replaced {
-		s.data.GWKeys = append(s.data.GWKeys, k)
+		next.GWKeys = append(next.GWKeys, stored)
 	}
+	s.publishLocked(next)
 	return s.saveLocked()
 }
 
@@ -910,25 +976,26 @@ func (s *GatewayStore) PutGWKey(k *GWKey) error {
 func (s *GatewayStore) DeleteGWKey(id string) (*GWKey, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i, k := range s.data.GWKeys {
-		if k.ID == id {
-			removed := k
-			s.data.GWKeys = append(s.data.GWKeys[:i], s.data.GWKeys[i+1:]...)
-			_ = s.saveLocked()
-			return removed, true
+	cur := s.View()
+	for i, k := range cur.GWKeys {
+		if k.ID != id {
+			continue
 		}
+		next := cloneConfigShallow(cur)
+		next.GWKeys = append(append([]*GWKey(nil), cur.GWKeys[:i]...), cur.GWKeys[i+1:]...)
+		s.publishLocked(next)
+		_ = s.saveLocked()
+		return k, true // 已发布对象（只读）
 	}
 	return nil, false
 }
 
 // Settings 返回路由策略设置快照（无设置时返回零值对象，字段均为 nil）。
 func (s *GatewayStore) Settings() GatewaySettings {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.data.Settings == nil {
-		return GatewaySettings{}
+	if set := s.View().Settings; set != nil {
+		return *set
 	}
-	return *s.data.Settings
+	return GatewaySettings{}
 }
 
 // PutSettings 整体更新路由策略设置（全量替换，字段 nil = 清除该项覆盖、
@@ -939,16 +1006,17 @@ func (s *GatewayStore) PutSettings(set *GatewaySettings) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Settings = set
+	next := cloneConfigShallow(s.View())
+	next.Settings = cloneJSON(set)
+	s.publishLocked(next)
 	return s.saveLocked()
 }
 
 // PutModelPin 已移除：模型固定上游渠道改挂在渠道上（见 Channel.ModelPins 与 upstreampin.go）。
 
-// FindUpKey 按 keyID 全局查找（返回渠道 + key 快照）。
+// FindUpKey 按 keyID 全局查找（返回渠道 + key，已发布对象只读）。
 func (s *GatewayStore) FindUpKey(keyID string) (*Channel, *UpKey, bool) {
-	snap := s.Snapshot()
-	for _, ch := range snap.Channels {
+	for _, ch := range s.View().Channels {
 		if k := ch.keyByID(keyID); k != nil {
 			return ch, k, true
 		}
@@ -956,10 +1024,9 @@ func (s *GatewayStore) FindUpKey(keyID string) (*Channel, *UpKey, bool) {
 	return nil, nil, false
 }
 
-// FindUpKey2 按 (channelID, keyID) 精确查找（返回快照）。
+// FindUpKey2 按 (channelID, keyID) 精确查找（返回渠道 + key，已发布对象只读）。
 func (s *GatewayStore) FindUpKey2(channelID, keyID string) (*Channel, *UpKey, bool) {
-	snap := s.Snapshot()
-	for _, ch := range snap.Channels {
+	for _, ch := range s.View().Channels {
 		if ch.ID != channelID {
 			continue
 		}

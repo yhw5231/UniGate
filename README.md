@@ -250,7 +250,7 @@ journalctl -u unigate -f             # 跟踪日志
 | `gateway.json` | 渠道、上游 key 与代理配置、下游通用 key（WebUI 管理，原子写入） |
 | `accounts.json` | 管理员与额外用户账号的持久化文件（可选；启动时读取，环境变量优先级更高，手动编辑可固定账号） |
 | `token-secret` | 登录 token 签名密钥（首次启动自动生成；固定后重启不影响已登录状态） |
-| `usage.db` | 用量统计 + 请求/错误日志 SQLite 数据库（请求/错误日志持久化，重启不丢） |
+| `usage.db` | 用量统计 + 请求/错误日志 SQLite 数据库（请求/错误日志持久化，重启不丢）。运行在 **WAL + synchronous=NORMAL** 下：提交只追加 WAL 而不每次 fsync，每个请求的两笔写入（请求日志 + 用量）不再被磁盘串行化；同目录会出现 `usage.db-wal`/`usage.db-shm`（属正常现象，最近写入暂存在 WAL 里，下次启动自动恢复合并）。**备份/迁移请停服后拷贝整个数据目录**，只拷 `usage.db` 会丢掉仍在 WAL 中的最新记录 |
 | `lease-assignments.json` | 代理池「key→租约」分配表（保证重启后一号一 IP 不变） |
 | `cooldowns.json` | 429 冷却状态（key/model → 重试到期时间；重启、重新部署后自动恢复，不会因重启清零而立刻冲击限流中的上游账号） |
 
@@ -519,6 +519,7 @@ Admin API（均需管理员 token）：`PUT /admin/api/channels/{id}/model-pin` 
 | `DEFAULT_SCHEDULE` | `failover` | 默认账号调度（渠道未显式配置时使用）：`failover` 故障转移 / `round_robin` 顺序轮询；也可在 WebUI「设置」/「路由」页修改 |
 | `UPSTREAM_HEADER_TIMEOUT` | `10m` | 等待上游响应头超时（LLM 非流式可能较慢，勿设过小） |
 | `UPSTREAM_READ_IDLE_TIMEOUT` | `10m` | 上游响应**读取静默超时**：连续该时长未从上游读到任何字节（连接失联：TCP 半开、NAT 静默回收等）即关闭连接中止该候选，避免读取永久阻塞导致 goroutine/连接泄漏累积；须大于最长的上游思考时间，流式期间任何字节都会重置计时；0 = 关闭 |
+| `DOWNSTREAM_WRITE_TIMEOUT` | `60s` | 下游**写出静默超时**（与上游读取静默超时对称）：客户端保持连接但停止读取（TCP 窗口填满）时，单次「写 + flush」阻塞超过该时长即中止该请求，释放 goroutine 与上下游连接对；正常慢速客户端不受影响（只约束单次写的阻塞时长，不限制流的总时长）；0 = 关闭 |
 | `KEEPALIVE_INTERVAL` | `15s` | 流式转发心跳：等待上游首包/流静默期间，每该间隔向下游写一帧 SSE 注释（`: keepalive`），防下游反代按空闲超时（常见 60s）掐连接；0 = 关闭。首帧心跳会提前提交 200 + event-stream 头，此后路由彻底失败改用流内 `data: {"error":...}` 帧表达（也可在 WebUI「设置」页修改） |
 | `PROBE_IDLE_SEC` | `28800`（8h） | 自动探测的空闲探测间隔秒数：开启「自动探测」的渠道内，正常状态账号连续无调用该时长后发加法题验证账号状态（按 (Key,模型) 冷却的渠道逐模型检查）；0 = 关闭空闲探测，冷却恢复探测不受影响（也可在 WebUI「设置」页修改） |
 | `TEST_TIMEOUT` | `45s` | WebUI 渠道/key 测试的整体超时（默认低于常见反代 60s，避免测试被反代掐断成 504） |

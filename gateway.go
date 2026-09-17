@@ -73,7 +73,7 @@ type modelsEntry struct {
 // 渠道声明了模型列表（静态配置或拉取结果）时直接使用；否则尝试拉取其 models
 // 端点（失败不阻塞其它渠道）。
 func gatewayModels(w http.ResponseWriter, r *http.Request) {
-	snap := store.Snapshot()
+	snap := store.View() // 只读视图，零拷贝
 	seen := map[string]bool{}
 	var ids []string
 	addModel := func(id string) {
@@ -207,8 +207,7 @@ func authorizeGW(w http.ResponseWriter, r *http.Request) (string, bool) {
 		writeJSONError(w, http.StatusUnauthorized, "missing gateway key", "unauthorized")
 		return "", false
 	}
-	snap := store.Snapshot()
-	for _, k := range snap.GWKeys {
+	for _, k := range store.View().GWKeys { // 只读视图（热路径，零拷贝）
 		if k.Enabled && k.Key == token {
 			return k.Name, true
 		}

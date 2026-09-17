@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,6 +35,66 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// TestUsageDBPragmas 文件库必须跑在 WAL + synchronous=NORMAL 上：默认 DELETE
+// 日志模式下每笔写事务都要建/删日志文件并两次 fsync，每个请求两笔写入（请求
+// 日志 + 用量）会被磁盘串行化，是「用得越多越卡」的主因。内存库（:memory:）
+// 无法使用 WAL，跳过该断言。
+func TestUsageDBPragmas(t *testing.T) {
+	db := newUsageDB(filepath.Join(t.TempDir(), "usage.db"), 30, 1000)
+	defer db.Close()
+
+	var mode string
+	if err := db.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatalf("query journal_mode: %v", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Fatalf("journal_mode = %q, want wal", mode)
+	}
+	var sync int
+	if err := db.db.QueryRow(`PRAGMA synchronous`).Scan(&sync); err != nil {
+		t.Fatalf("query synchronous: %v", err)
+	}
+	if sync != 1 { // 0=OFF 1=NORMAL 2=FULL 3=EXTRA
+		t.Fatalf("synchronous = %d, want 1 (NORMAL)", sync)
+	}
+	var busy int
+	if err := db.db.QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil {
+		t.Fatalf("query busy_timeout: %v", err)
+	}
+	if busy <= 0 {
+		t.Fatalf("busy_timeout = %d, want > 0", busy)
+	}
+}
+
+// TestUsageDBConcurrentReadDuringWrite 管理端聚合查询不得阻塞请求日志写入：
+// 读路径不持有写锁，WAL 下读写并发互不等待。这里以「写入线程持续推进」验证
+// 并发写不受同步进行的读查询影响（旧实现读持同一把锁，写入会被读卡住）。
+func TestUsageDBConcurrentReadDuringWrite(t *testing.T) {
+	db := newUsageDB(filepath.Join(t.TempDir(), "usage.db"), 30, 100000)
+	defer db.Close()
+	now := time.Now()
+	for i := 0; i < 200; i++ {
+		db.Append(UsageEvent{Time: now, User: "u", Model: "m", Key: "k", Status: 200})
+	}
+
+	done := make(chan struct{})
+	go func() { // 持续做聚合查询（模拟 WebUI 用量页）
+		defer close(done)
+		for i := 0; i < 20; i++ {
+			db.Query(UsageFilter{Window: "all"})
+		}
+	}()
+	// 查询进行中写入必须照常完成（不等待读锁）
+	for i := 0; i < 200; i++ {
+		db.Append(UsageEvent{Time: now, User: "u", Model: "m", Key: "k", Status: 200})
+	}
+	<-done
+	if n := db.Count(); n != 400 {
+		t.Fatalf("count = %d, want 400", n)
+	}
+}
+
+// TestUsageDBAppendAndPersist 验证文件库写入与重载。
 func TestUsageDBAppendAndPersist(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "usage.db")

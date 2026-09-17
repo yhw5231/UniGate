@@ -98,7 +98,7 @@ func endsWithChatCompletions(s string) bool {
 // 按固定列表展开为多个候选（每个候选注入对应的内部渠道固定请求体），
 // strict 模式按固定顺序逐个内部渠道独占尝试。
 func buildCandidates(model string, rawBody []byte) []candidate {
-	snap := store.Snapshot()
+	snap := store.View() // 只读视图：零拷贝（每请求热路径，不做全量配置深拷贝）
 	def := currentPolicy().DefaultSchedule
 	var out []candidate
 	for _, ch := range snap.Channels {
@@ -671,7 +671,7 @@ type RouteStatusData struct {
 // 时对全部模型放行，其 key 会出现在每个模型分组里。若所有渠道都未声明
 // 模型，则合并为单个空模型分组（前端标注「全部模型」）。
 func routeStatusData(model string) *RouteStatusData {
-	snap := store.Snapshot()
+	snap := store.View() // 只读视图，零拷贝
 	def := normalizeScheduleDefault(currentPolicy().DefaultSchedule)
 
 	var order []string
@@ -699,10 +699,25 @@ func routeStatusData(model string) *RouteStatusData {
 		}
 	}
 
+	// 每个渠道预构建模型允许集合：allowsModel 是模型列表的线性扫描，而下面
+	// 的循环是「模型分组 × 渠道」嵌套，直接调用会退化成 O(模型² × 渠道)。
+	// 集合化后整体回到 O(模型 × 渠道)。nil = 未声明模型列表（对全部模型放行）。
+	allowSets := make([]map[string]bool, len(snap.Channels))
+	for i, ch := range snap.Channels {
+		if len(ch.Models) == 0 {
+			continue
+		}
+		set := make(map[string]bool, len(ch.Models))
+		for _, m := range ch.Models {
+			set[m] = true
+		}
+		allowSets[i] = set
+	}
+
 	for _, g := range groups {
-		for _, ch := range snap.Channels {
-			if g.Model != "" && !ch.allowsModel(g.Model) {
-				continue // 未声明模型列表的渠道 allowsModel 恒真：对每个模型放行
+		for i, ch := range snap.Channels {
+			if set := allowSets[i]; set != nil && g.Model != "" && !set[g.Model] {
+				continue // 该渠道未声明此模型
 			}
 			for _, k := range ch.Keys {
 				st := RouteKeyStatus{

@@ -29,10 +29,18 @@ type cooldownPair struct {
 	model string
 }
 
+// cooldownEntry 一条冷却记录。explicit 表示时长来自上游明确给出的到期时间
+// （Retry-After 头或错误体文本/时间戳）而非配置兜底——启动探测据此跳过
+// 「确定还在限流中」的账号，只对兜底冷却的账号重新核对状态。
+type cooldownEntry struct {
+	until    time.Time
+	explicit bool
+}
+
 // Cooldowns 冷却状态表。
 type Cooldowns struct {
 	mu    sync.Mutex
-	until map[cooldownPair]time.Time
+	until map[cooldownPair]cooldownEntry
 	path  string // 冷却持久化文件路径（SetPersistPath 设置；空 = 仅内存，测试默认）
 
 	// 落盘在锁外进行（writeMu 串行化文件写入）。旧实现每次变更都在 mu 内
@@ -47,7 +55,7 @@ type Cooldowns struct {
 var cool *Cooldowns
 
 func newCooldowns() *Cooldowns {
-	return &Cooldowns{until: map[cooldownPair]time.Time{}}
+	return &Cooldowns{until: map[cooldownPair]cooldownEntry{}}
 }
 
 // persistedCooldowns cooldowns.json 的文件格式：只写未过期条目，启动时恢复。
@@ -57,9 +65,10 @@ type persistedCooldowns struct {
 }
 
 type persistedCooldown struct {
-	KeyID string `json:"key_id"`
-	Model string `json:"model,omitempty"` // 空 = 按 key 共享粒度
-	Until int64  `json:"until_unix"`      // 冷却到期时间（unix 秒）
+	KeyID    string `json:"key_id"`
+	Model    string `json:"model,omitempty"`    // 空 = 按 key 共享粒度
+	Until    int64  `json:"until_unix"`         // 冷却到期时间（unix 秒）
+	Explicit bool   `json:"explicit,omitempty"` // 时长来自上游明确到期时间
 }
 
 // SetPersistPath 设置冷却持久化文件并加载已有条目（进程启动时调用一次；
@@ -84,7 +93,7 @@ func (c *Cooldowns) SetPersistPath(path string) error {
 		if e.KeyID == "" || e.Until <= now.Unix() {
 			continue
 		}
-		c.until[cooldownPair{e.KeyID, e.Model}] = time.Unix(e.Until, 0)
+		c.until[cooldownPair{e.KeyID, e.Model}] = cooldownEntry{until: time.Unix(e.Until, 0), explicit: e.Explicit}
 	}
 	return nil
 }
@@ -95,11 +104,11 @@ func (c *Cooldowns) snapshotLocked() ([]persistedCooldown, uint64) {
 	c.gen++
 	now := time.Now()
 	entries := make([]persistedCooldown, 0, len(c.until))
-	for p, until := range c.until {
-		if !now.Before(until) {
+	for p, e := range c.until {
+		if !now.Before(e.until) {
 			continue
 		}
-		entries = append(entries, persistedCooldown{KeyID: p.keyID, Model: p.model, Until: until.Unix()})
+		entries = append(entries, persistedCooldown{KeyID: p.keyID, Model: p.model, Until: e.until.Unix(), Explicit: e.explicit})
 	}
 	return entries, c.gen
 }
@@ -109,7 +118,11 @@ func (c *Cooldowns) snapshotLocked() ([]persistedCooldown, uint64) {
 // 同步（返回前完成写入）是刻意保持的语义：429 冷却常长达数小时，重启丢了会
 // 立刻把请求打回限流中的账号。
 func (c *Cooldowns) persist(entries []persistedCooldown, gen uint64) {
-	if c.path == "" {
+	// path 由 SetPersistPath 在 mu 下写入：这里取一次快照，避免无锁读与之竞争
+	c.mu.Lock()
+	path := c.path
+	c.mu.Unlock()
+	if path == "" {
 		return
 	}
 	c.writeMu.Lock()
@@ -117,7 +130,7 @@ func (c *Cooldowns) persist(entries []persistedCooldown, gen uint64) {
 	if gen <= c.savedGen {
 		return // 已有更新的状态落盘（并发 Mark 的旧快照）
 	}
-	dir := filepath.Dir(c.path)
+	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			log.Printf("save cooldowns: %v", err)
@@ -133,12 +146,12 @@ func (c *Cooldowns) persist(entries []persistedCooldown, gen uint64) {
 		return
 	}
 	body = append(body, '\n')
-	tmp := c.path + ".tmp"
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, body, 0o600); err != nil {
 		log.Printf("save cooldowns: %v", err)
 		return
 	}
-	if err := os.Rename(tmp, c.path); err != nil {
+	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		log.Printf("save cooldowns: %v", err)
 		return
@@ -150,8 +163,8 @@ func (c *Cooldowns) persist(entries []persistedCooldown, gen uint64) {
 func (c *Cooldowns) IsCooling(keyID, model string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	until, ok := c.until[cooldownPair{keyID, model}]
-	return ok && time.Now().Before(until)
+	e, ok := c.until[cooldownPair{keyID, model}]
+	return ok && time.Now().Before(e.until)
 }
 
 // cooldownSoftCap 冷却表条目软阈值：越过时做一次维护（过期清理 + 必要时
@@ -162,13 +175,23 @@ func (c *Cooldowns) IsCooling(keyID, model string) bool {
 // 摊销 O(1)/写入 的成本触发（否则每次写入都会全表扫描，越满越卡）。
 const cooldownSoftCap = 10000
 
-// Mark 记录冷却（dur <=0 时忽略）。
+// Mark 记录冷却（dur <=0 时忽略）；时长来自配置兜底（上游未给明确到期时间）。
 func (c *Cooldowns) Mark(keyID, model string, dur time.Duration) {
+	c.mark(keyID, model, dur, false)
+}
+
+// MarkExplicit 记录冷却，且标记时长来自上游明确给出的到期时间（Retry-After
+// 头或错误体文本/时间戳）。启动探测对这类账号不再试探，等它自然到期。
+func (c *Cooldowns) MarkExplicit(keyID, model string, dur time.Duration) {
+	c.mark(keyID, model, dur, true)
+}
+
+func (c *Cooldowns) mark(keyID, model string, dur time.Duration, explicit bool) {
 	if dur <= 0 {
 		return
 	}
 	c.mu.Lock()
-	c.until[cooldownPair{keyID, model}] = time.Now().Add(dur)
+	c.until[cooldownPair{keyID, model}] = cooldownEntry{until: time.Now().Add(dur), explicit: explicit}
 	if len(c.until) > cooldownSoftCap {
 		c.pruneLocked()
 		if n := len(c.until); n > cooldownSoftCap {
@@ -245,13 +268,32 @@ func (c *Cooldowns) CoolingMap(keyID string) map[string]time.Time {
 	defer c.mu.Unlock()
 	now := time.Now()
 	out := map[string]time.Time{}
-	for p, until := range c.until {
-		if p.keyID != keyID || !now.Before(until) {
+	for p, e := range c.until {
+		if p.keyID != keyID || !now.Before(e.until) {
 			continue
 		}
-		out[p.model] = until
+		out[p.model] = e.until
 	}
 	return out
+}
+
+// ExplicitCooling 返回某 key 生效中的冷却里最晚的上游明确到期时间
+// （explicit 条目；未冷却或只有兜底冷却返回零值, false）。启动探测据此跳过
+// 「上游已告知何时重置」的账号：试探只会白撞一次 429。
+func (c *Cooldowns) ExplicitCooling(keyID string) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	var latest time.Time
+	for p, e := range c.until {
+		if p.keyID != keyID || !e.explicit || !now.Before(e.until) {
+			continue
+		}
+		if e.until.After(latest) {
+			latest = e.until
+		}
+	}
+	return latest, !latest.IsZero()
 }
 
 // ClearAll 清空全部冷却，返回清除的条数。WebUI「路由」页一键清理使用；
@@ -263,7 +305,7 @@ func (c *Cooldowns) ClearAll() int {
 		c.mu.Unlock()
 		return 0
 	}
-	c.until = map[cooldownPair]time.Time{}
+	c.until = map[cooldownPair]cooldownEntry{}
 	entries, gen := c.snapshotLocked()
 	c.mu.Unlock()
 	c.persist(entries, gen)
@@ -274,19 +316,20 @@ func (c *Cooldowns) ClearAll() int {
 func (c *Cooldowns) CoolingKey(keyID, model string) (time.Time, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	until, ok := c.until[cooldownPair{keyID, model}]
-	if !ok || !time.Now().Before(until) {
+	e, ok := c.until[cooldownPair{keyID, model}]
+	if !ok || !time.Now().Before(e.until) {
 		return time.Time{}, false
 	}
-	return until, true
+	return e.until, true
 }
 
 // CoolingEntry 一条生效中的冷却（Admin state 用；key 按 ID 引用，WebUI 换算名称）。
 type CoolingEntry struct {
-	KeyID  string `json:"key_id"`
-	Model  string `json:"model,omitempty"` // 空 = 按 key 共享粒度
-	Until  int64  `json:"until_unix"`
-	LeftMS int64  `json:"left_ms"`
+	KeyID    string `json:"key_id"`
+	Model    string `json:"model,omitempty"` // 空 = 按 key 共享粒度
+	Until    int64  `json:"until_unix"`
+	LeftMS   int64  `json:"left_ms"`
+	Explicit bool   `json:"explicit,omitempty"` // 时长来自上游明确到期时间
 }
 
 // CoolingList 列出全部生效中的冷却（快照）。
@@ -295,16 +338,17 @@ func (c *Cooldowns) CoolingList() []CoolingEntry {
 	defer c.mu.Unlock()
 	now := time.Now()
 	out := []CoolingEntry{}
-	for p, until := range c.until {
-		left := until.Sub(now)
+	for p, e := range c.until {
+		left := e.until.Sub(now)
 		if left <= 0 {
 			continue
 		}
 		out = append(out, CoolingEntry{
-			KeyID:  p.keyID,
-			Model:  p.model,
-			Until:  until.Unix(),
-			LeftMS: left.Milliseconds(),
+			KeyID:    p.keyID,
+			Model:    p.model,
+			Until:    e.until.Unix(),
+			LeftMS:   left.Milliseconds(),
+			Explicit: e.explicit,
 		})
 	}
 	return out
@@ -318,10 +362,10 @@ func (c *Cooldowns) EarliestRetry(pairs []cooldownPair) (time.Duration, bool) {
 	now := time.Now()
 	var earliest time.Time
 	for _, p := range pairs {
-		until, ok := c.until[p]
-		if ok && now.Before(until) {
-			if earliest.IsZero() || until.Before(earliest) {
-				earliest = until
+		e, ok := c.until[p]
+		if ok && now.Before(e.until) {
+			if earliest.IsZero() || e.until.Before(earliest) {
+				earliest = e.until
 			}
 		}
 	}
@@ -337,8 +381,8 @@ func (c *Cooldowns) EarliestRetry(pairs []cooldownPair) (time.Duration, bool) {
 
 func (c *Cooldowns) pruneLocked() {
 	now := time.Now()
-	for k, until := range c.until {
-		if !now.Before(until) {
+	for k, e := range c.until {
+		if !now.Before(e.until) {
 			delete(c.until, k)
 		}
 	}

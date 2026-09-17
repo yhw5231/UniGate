@@ -5,12 +5,16 @@
 //   - 按 (key, model) 冷却：冷却恢复探测用「冷却恢复的那个模型」，空闲探测
 //     逐模型检查、探测「连续未使用的模型」。
 //
-// 两种触发时机：
+// 三种触发时机：
+//   - 启动探测：进程启动（重启/重新部署）后一次性核对账号状态——跳过「上游
+//     明确给出到期时间、仍在冷却中」与「最近窗口内成功调用过」的账号，其余
+//     账号各发一题（并发上限 PROBE_CONCURRENCY）。内存计时线在启动时先从
+//     持久化请求日志恢复，因此重启不会把「刚用过的账号」当成空闲账号；
 //   - 冷却恢复探测：key 的全部冷却到期（从冷却中恢复可路由）时发一题，确认
 //     账号确实恢复正常。若上游再次 429（错误体给的到期时间偏短/额度未真正
 //     重置），按上游明确给出的到期时间重新记冷却，避免路由反复撞限流；
 //   - 空闲探测：正常状态（渠道与 key 均启用且不在冷却）的账号连续
-//     PROBE_IDLE_SEC（WebUI 设置页可改，默认 8h）没有任何调用时发一题，确认
+//     PROBE_IDLE_SEC（WebUI 设置页可改，默认 2h）没有任何调用时发一题，确认
 //     账号仍然可用；停用与冷却中的账号不探测；间隔 0 = 关闭空闲探测。
 //
 // 探测本身就是一次真实调用：无论结果如何都会刷新该 key（及对应模型）的空闲
@@ -35,10 +39,17 @@ import (
 )
 
 const (
-	probeUser      = "probe"       // 请求日志中探测请求的 User 标识
+	probeUser      = "probe" // 请求日志中探测请求的 User 标识
 	probeScanEvery = 30 * time.Second
 	probeKindIdle  = "idle"
 	probeKindRecov = "recover"
+	probeKindBoot  = "startup" // 启动探测（重启/重新部署后一次性核对账号状态）
+
+	// probeBootRecentWindow 启动探测判断「最近用过」的窗口：窗口内成功调用过的
+	// 账号不核对（刚验证过，不必再花一次额度）。固定 2h，不跟随空闲探测间隔
+	// ——空闲探测间隔是「多久没调用值得检查一次」的调度参数，启动探测要的是
+	// 「重启瞬间这个账号是不是正在被使用」的事实判断。
+	probeBootRecentWindow = 2 * time.Hour
 )
 
 // ---- key 活动跟踪 ----
@@ -112,6 +123,24 @@ func (a *keyActivity) pruneLocked(now time.Time) {
 // note 刷新 key 的最近调用时刻。
 func (a *keyActivity) note(keyID, model string) { a.noteAt(keyID, model, time.Now()) }
 
+// noteMax 仅在 t 晚于已记录值时刷新（启动时从请求日志恢复计时线用：同一 key
+// 的多条历史记录不保证顺序，避免较早的记录覆盖较晚的）。
+func (a *keyActivity) noteMax(keyID, model string, t time.Time) {
+	if keyID == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, k := range []string{keyID, activityKey(keyID, model)} {
+		if k == "" {
+			continue
+		}
+		if prev, ok := a.last[k]; !ok || t.After(prev) {
+			a.last[k] = t
+		}
+	}
+}
+
 // lastCall 返回 key（model 为空）或 (key, model) 的最近调用时刻；从未记录返回 false。
 func (a *keyActivity) lastCall(keyID, model string) (time.Time, bool) {
 	a.mu.Lock()
@@ -139,18 +168,54 @@ type probeTask struct {
 // 一个探测在途。cooling 跟踪「上一轮扫描时处于冷却中的 (key, model) 对」：
 // 本轮消失（到期或手动解除）即视为该 key 从冷却恢复——无论开关状态如何都
 // 持续跟踪，避免关闭再打开探测后误触发历史恢复。
+// sem 是全局探测并发上限（PROBE_CONCURRENCY，nil = 不限制）：启动探测一次
+// 核对大量账号，空闲探测也可能在一轮扫描里同时命中很多账号（一批账号同时
+// 越过空闲阈值），无限并发会瞬间打满上游额度与本机连接。
 type probeScheduler struct {
 	mu        sync.Mutex
 	cooling   map[cooldownPair]bool
 	inFlight  map[string]bool
 	interval  time.Duration
+	sem       chan struct{} // 在途探测请求数上限（nil = 不限制）
 	startOnce sync.Once
 }
 
 var probes = newProbeScheduler()
 
 func newProbeScheduler() *probeScheduler {
-	return &probeScheduler{cooling: map[cooldownPair]bool{}, inFlight: map[string]bool{}, interval: probeScanEvery}
+	return &probeScheduler{
+		cooling:  map[cooldownPair]bool{},
+		inFlight: map[string]bool{},
+		interval: probeScanEvery,
+	}
+}
+
+// setConcurrency 设置探测并发上限（0 = 不限制）。进程启动与测试重置时显式调用：
+// 包级变量初始化先于 init() 里的 cfg 装载，构造时读环境变量只会拿到零值。
+func (s *probeScheduler) setConcurrency(n int) { s.sem = newProbeSem(n) }
+
+// newProbeSem 构造并发信号量（n <= 0 = 不限制，返回 nil）。
+func newProbeSem(n int) chan struct{} {
+	if n <= 0 {
+		return nil
+	}
+	return make(chan struct{}, n)
+}
+
+// concurrency 当前探测并发上限（0 = 不限制）。
+func (s *probeScheduler) concurrency() int { return cap(s.sem) }
+
+// acquireProbe / releaseProbe 占位/释放一个探测并发名额（不限制时为空操作）。
+func (s *probeScheduler) acquireProbe() {
+	if s.sem != nil {
+		s.sem <- struct{}{}
+	}
+}
+
+func (s *probeScheduler) releaseProbe() {
+	if s.sem != nil {
+		<-s.sem
+	}
 }
 
 // Start 启动后台扫描循环（幂等）。扫描本身在 ticker 协程内同步做（只做状态
@@ -228,7 +293,7 @@ func (s *probeScheduler) scanOnce() [][]probeTask {
 	}
 
 	// 空闲探测：仅正常状态账号（渠道/key 启用且不在冷却），间隔取设置页
-	// probe_idle_sec（默认 8h，0 = 关闭）
+	// probe_idle_sec（默认 2h，0 = 关闭）
 	if idle := currentPolicy().ProbeIdleInterval; idle > 0 {
 		for _, ch := range snap.Channels {
 			if !ch.Enabled || !ch.AutoProbe {
@@ -343,7 +408,7 @@ func (s *probeScheduler) execute(t probeTask) {
 		return // 同一 key 已有探测在途
 	}
 	defer s.endProbe(t.Key.ID)
-	probeOne(t)
+	s.probeOne(t)
 }
 
 // runBatch 执行同一 key 的一批探测任务（批内串行、整批共用一个在途占位）。
@@ -356,23 +421,184 @@ func (s *probeScheduler) runBatch(batch []probeTask) {
 	}
 	defer s.endProbe(batch[0].Key.ID)
 	for _, t := range batch {
-		probeOne(t)
+		s.probeOne(t)
 	}
+}
+
+// ---- 启动探测 ----
+
+// seedActivityFromHistory 启动时从持久化请求日志恢复活跃度计时线：window 内
+// 每个成功调用过的 (key, 模型) 的最近时刻写回内存（key 级计时取该 key 所有
+// 模型中最晚的一次）。返回恢复的计时线条数。
+// 日志里的 key 是「名称@渠道」标签，按标签匹配当前配置里的 key；改过名/删过的
+// key 匹配不上，按「没有历史」处理（启动探测会核对一次，无害）。
+func seedActivityFromHistory(window time.Duration) int {
+	if usageDB == nil || store == nil || window <= 0 {
+		return 0
+	}
+	uses := usageDB.RecentKeyUse(window)
+	if len(uses) == 0 {
+		return 0
+	}
+	snap := store.View() // 只读视图，零拷贝
+	byLabel := map[string][]*UpKey{}
+	for _, ch := range snap.Channels {
+		for _, k := range ch.Keys {
+			label := k.Name + "@" + ch.Name
+			byLabel[label] = append(byLabel[label], k)
+		}
+	}
+	n := 0
+	for _, u := range uses {
+		// 日志里的 key 是「名称@渠道」完整标签，直接按标签匹配
+		for _, k := range byLabel[u.Key] {
+			activity.noteMax(k.ID, u.Model, u.Last)
+			n++
+		}
+	}
+	return n
+}
+
+// startupSkip 启动探测的跳过统计（仅用于日志）。
+type startupSkip struct {
+	explicit int // 上游明确到期时间的冷却中：等它自然到期
+	recent   int // 最近窗口内成功调用过：刚验证过
+	cooling  int // 全部模型都在兜底冷却中：没有可测模型
+}
+
+func (s startupSkip) total() int { return s.explicit + s.recent + s.cooling }
+
+// startupTasks 收集启动探测任务：渠道与 key 均启用且开启自动探测的账号，
+// 跳过上游明确冷却与最近成功调用的，其余每个账号一道加法题。window 为
+// 「最近使用」判定窗口（probeBootRecentWindow）。
+func (s *probeScheduler) startupTasks(window time.Duration) ([]probeTask, startupSkip) {
+	var (
+		tasks []probeTask
+		skip  startupSkip
+	)
+	if store == nil {
+		return nil, skip
+	}
+	snap := store.View() // 只读视图，零拷贝
+	for _, ch := range snap.Channels {
+		if !ch.Enabled || !ch.AutoProbe {
+			continue
+		}
+		perModel := ch.CooldownScope == cooldownScopeKeyModel && len(ch.Models) > 0
+		for _, k := range ch.Keys {
+			if !k.Enabled {
+				continue
+			}
+			if _, ok := cool.ExplicitCooling(k.ID); ok {
+				skip.explicit++
+				continue
+			}
+			if t, ok := activity.lastCall(k.ID, ""); ok && time.Since(t) < window {
+				skip.recent++
+				continue
+			}
+			model := probeModelFor(ch)
+			if perModel {
+				// 按 (key, model) 冷却：探测第一个不在冷却中的模型；全在冷却中
+				// 则跳过（到期后的恢复探测会验证它们）
+				cooling := cool.CoolingMap(k.ID)
+				model = ""
+				for _, m := range ch.Models {
+					if _, ok := cooling[m]; !ok {
+						model = m
+						break
+					}
+				}
+				if model == "" {
+					skip.cooling++
+					continue
+				}
+			}
+			tasks = append(tasks, probeTask{Kind: probeKindBoot, Ch: ch, Key: k, Model: model})
+		}
+	}
+	return tasks, skip
+}
+
+// StartupSweep 进程启动时调用一次：先恢复活跃度计时线（重启后「最近用过」
+// 不再归零：最近用过的账号不会被当空闲账号探测，空闲计时也从真实调用时刻
+// 起算），再按设置（policy.ProbeStartup，默认开）做一轮启动探测——对「上游
+// 明确冷却中」与「最近成功调用过」之外的账号各发一题核对状态，按并发上限
+// 分发给 worker。探测在后台进行，不阻塞监听；随后由周期扫描按冷却恢复/空闲
+// 规则继续探测。
+func (s *probeScheduler) StartupSweep() {
+	pol := currentPolicy()
+	// 恢复窗口 = max(空闲探测间隔, 启动探测的「最近用过」窗口)：计时线要对齐空闲
+	// 探测的阈值，同时空闲探测关闭（间隔 0）时也要能判断最近是否在用。
+	seedWindow := pol.ProbeIdleInterval
+	if seedWindow < probeBootRecentWindow {
+		seedWindow = probeBootRecentWindow
+	}
+	if n := seedActivityFromHistory(seedWindow); n > 0 {
+		log.Printf("probe: 启动活跃度基线：从请求日志恢复 %d 条计时线（窗口 %s）", n, seedWindow)
+	}
+	if !pol.ProbeStartup {
+		return
+	}
+	tasks, skip := s.startupTasks(probeBootRecentWindow)
+	if len(tasks) == 0 {
+		if skip.total() > 0 {
+			log.Printf("probe: 启动探测：无待核对账号（跳过 %d：明确冷却 %d、最近使用 %d、兜底冷却 %d）",
+				skip.total(), skip.explicit, skip.recent, skip.cooling)
+		}
+		return
+	}
+	log.Printf("probe: 启动探测：%d 个账号待核对（跳过 %d：明确冷却 %d、最近使用 %d、兜底冷却 %d；并发上限 %d）",
+		len(tasks), skip.total(), skip.explicit, skip.recent, skip.cooling, s.concurrency())
+	go s.runTasks(tasks)
+}
+
+// runTasks 并发执行一批探测（worker 数 = 并发上限；不限制时为任务数），
+// 阻塞到全部完成。任务本身按在途占位去重：与周期扫描撞上同一 key 时跳过。
+func (s *probeScheduler) runTasks(tasks []probeTask) {
+	if len(tasks) == 0 {
+		return
+	}
+	workers := s.concurrency()
+	if workers <= 0 || workers > len(tasks) {
+		workers = len(tasks)
+	}
+	queue := make(chan probeTask)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range queue {
+				s.execute(t)
+			}
+		}()
+	}
+	for _, t := range tasks {
+		queue <- t
+	}
+	close(queue)
+	wg.Wait()
 }
 
 // probeOne 执行一次探测并按结果处置：429 重新记冷却（上游明确到期时间优先），
 // 鉴权失败/5xx/答案异常记入日志供人工核查，成功则仅刷新空闲计时。探测请求
-// 全部写入请求日志（User=probe）。
-func probeOne(t probeTask) {
+// 全部写入请求日志（User=probe）。在途请求数受并发上限约束。
+func (s *probeScheduler) probeOne(t probeTask) {
 	activity.note(t.Key.ID, t.Model) // 探测即调用：无论结果如何都重置空闲计时
 
 	a, b, c := randomProbeOperands()
 	sum := a + b + c
+	s.acquireProbe()
 	res := sendProbeRequest(t.Ch, t.Key, t.Model, probeQuestion(a, b, c))
+	s.releaseProbe()
 
 	kind := "空闲探测"
-	if t.Kind == probeKindRecov {
+	switch t.Kind {
+	case probeKindRecov:
 		kind = "冷却恢复探测"
+	case probeKindBoot:
+		kind = "启动探测"
 	}
 	label := t.Key.Name + "@" + t.Ch.Name
 
@@ -389,10 +615,15 @@ func probeOne(t probeTask) {
 				d = d2
 			}
 		}
-		if d == 0 {
+		explicit := d != 0
+		if !explicit {
 			d = currentPolicy().RateLimitCooldown
 		}
-		cool.Mark(t.Key.ID, t.Ch.cooldownModelFor(t.Model), d)
+		if explicit {
+			cool.MarkExplicit(t.Key.ID, t.Ch.cooldownModelFor(t.Model), d)
+		} else {
+			cool.Mark(t.Key.ID, t.Ch.cooldownModelFor(t.Model), d)
+		}
 		log.Printf("probe: %s %s 上游仍 429，按 %s 重新冷却", kind, label, d)
 		recordProbeRequest(t, res, fmt.Sprintf("still rate limited after probe; cooldown %s", d))
 		return

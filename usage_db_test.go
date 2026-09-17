@@ -44,21 +44,21 @@ func TestUsageDBPragmas(t *testing.T) {
 	defer db.Close()
 
 	var mode string
-	if err := db.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+	if err := db.handle.Load().QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
 		t.Fatalf("query journal_mode: %v", err)
 	}
 	if !strings.EqualFold(mode, "wal") {
 		t.Fatalf("journal_mode = %q, want wal", mode)
 	}
 	var sync int
-	if err := db.db.QueryRow(`PRAGMA synchronous`).Scan(&sync); err != nil {
+	if err := db.handle.Load().QueryRow(`PRAGMA synchronous`).Scan(&sync); err != nil {
 		t.Fatalf("query synchronous: %v", err)
 	}
 	if sync != 1 { // 0=OFF 1=NORMAL 2=FULL 3=EXTRA
 		t.Fatalf("synchronous = %d, want 1 (NORMAL)", sync)
 	}
 	var busy int
-	if err := db.db.QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil {
+	if err := db.handle.Load().QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil {
 		t.Fatalf("query busy_timeout: %v", err)
 	}
 	if busy <= 0 {
@@ -364,7 +364,7 @@ func TestUsageDBMaskStoredKeys(t *testing.T) {
 
 	// 明文已消失，且 by_key 维度仍可用（掩码值分组）
 	var plain int
-	if err := db.db.QueryRow(`SELECT COUNT(*) FROM usage_events WHERE key = ?`, "sk-plaintextkey12345").Scan(&plain); err != nil {
+	if err := db.handle.Load().QueryRow(`SELECT COUNT(*) FROM usage_events WHERE key = ?`, "sk-plaintextkey12345").Scan(&plain); err != nil {
 		t.Fatal(err)
 	}
 	if plain != 0 {
@@ -372,7 +372,7 @@ func TestUsageDBMaskStoredKeys(t *testing.T) {
 	}
 	// 「名称@渠道」不是凭证：迁移不得动它
 	var names int
-	if err := db.db.QueryRow(`SELECT COUNT(*) FROM usage_events WHERE key = ?`, "daphne@cline").Scan(&names); err != nil {
+	if err := db.handle.Load().QueryRow(`SELECT COUNT(*) FROM usage_events WHERE key = ?`, "daphne@cline").Scan(&names); err != nil {
 		t.Fatal(err)
 	}
 	if names != 1 {

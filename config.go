@@ -67,8 +67,14 @@ type Config struct {
 	KeepaliveInterval time.Duration
 
 	// 账号自动探测：空闲探测间隔（正常状态 key 连续无调用该时长后发探测题，
-	// 默认 8h，0 = 关闭空闲探测；冷却恢复探测不受影响）
+	// 默认 2h，0 = 关闭空闲探测；冷却恢复探测不受影响）
 	ProbeIdleSec int
+	// 启动探测：进程启动（重启/重新部署）后对本渠道内「无上游明确冷却、最近
+	// 窗口内没有成功调用」的账号各发一题核对状态（默认开启；活跃度计时线的
+	// 恢复不受此开关影响）
+	ProbeStartup bool
+	// 探测并发上限（同时进行中的上游探测请求数；0 = 不限制）
+	ProbeConcurrency int
 
 	// 测试
 	TestTimeout time.Duration // 渠道/key 测试端点的整体超时（默认 45s，低于常见反代 60s）
@@ -138,6 +144,7 @@ func loadConfig() Config {
 	loginReq, _ := parseBoolEnv("LOGIN_REQUIRED", true)
 	gwKeyAuth, _ := parseBoolEnv("GW_KEY_AUTH", true)
 	trustProxy, _ := parseBoolEnv("TRUST_PROXY_HEADERS", true)
+	probeStartup, _ := parseBoolEnv("PROBE_STARTUP", true)
 
 	return Config{
 		Port:            getenv("PORT", defaultPort),
@@ -173,7 +180,10 @@ func loadConfig() Config {
 
 		KeepaliveInterval: durationEnv("KEEPALIVE_INTERVAL", 15*time.Second),
 
-		ProbeIdleSec: intEnv("PROBE_IDLE_SEC", 8*3600),
+		ProbeIdleSec: intEnv("PROBE_IDLE_SEC", 2*3600),
+		ProbeStartup: probeStartup,
+		// 默认 4：启动探测/空闲探测成批命中时，限制同时压向上游的探测请求数
+		ProbeConcurrency: intEnv("PROBE_CONCURRENCY", 4),
 
 		TestTimeout: durationEnv("TEST_TIMEOUT", 45*time.Second),
 
@@ -196,6 +206,7 @@ func resetCfgForTest() {
 	resetLoginThrottle()
 	activity = newKeyActivity()
 	probes = newProbeScheduler()
+	probes.setConcurrency(cfg.ProbeConcurrency)
 	initUsageDB()
 	initStats()
 }
@@ -248,6 +259,7 @@ type RoutePolicy struct {
 	MaxRouteTries     int           // 单请求最多尝试 key 数（0 = 全部）
 	KeepaliveInterval time.Duration // 流式心跳间隔（0 = 关闭）
 	ProbeIdleInterval time.Duration // 自动探测的空闲探测间隔（0 = 关闭空闲探测）
+	ProbeStartup      bool          // 启动探测（重启/重新部署后核对账号状态）
 	DefaultSchedule   string        // 默认账号调度：failover / round_robin（渠道未显式配置时使用）
 }
 
@@ -261,6 +273,7 @@ func defaultPolicy() *RoutePolicy {
 		MaxRouteTries:     cfg.MaxRouteTries,
 		KeepaliveInterval: cfg.KeepaliveInterval,
 		ProbeIdleInterval: time.Duration(cfg.ProbeIdleSec) * time.Second,
+		ProbeStartup:      cfg.ProbeStartup,
 		DefaultSchedule:   cfg.DefaultSchedule,
 	}
 }
@@ -291,6 +304,9 @@ func applySettings(set GatewaySettings) {
 	}
 	if set.ProbeIdleSec != nil {
 		p.ProbeIdleInterval = time.Duration(*set.ProbeIdleSec) * time.Second
+	}
+	if set.ProbeStartup != nil {
+		p.ProbeStartup = *set.ProbeStartup
 	}
 	if set.DefaultSchedule != nil {
 		p.DefaultSchedule = normalizeScheduleDefault(*set.DefaultSchedule)

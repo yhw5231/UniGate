@@ -149,7 +149,7 @@ type Channel struct {
 	Rewrite       bool                         `json:"rewrite_reasoning"`        // reasoning -> reasoning_content 改写（Cline 等需要）
 	CooldownScope string                       `json:"cooldown_scope,omitempty"` // 冷却粒度："" / "key" 按 key 跨模型共享（默认）；"key_model" 按 (key,model)
 	Schedule      string                       `json:"schedule,omitempty"`       // 账号调度："" 跟随全局默认；"failover" 故障转移；"round_robin" 顺序轮询
-	AutoProbe     bool                         `json:"auto_probe,omitempty"`     // 自动探测：key 冷却恢复时、正常状态连续 8h 无调用时，自动发加法题验证账号状态（probe.go）
+	AutoProbe     bool                         `json:"auto_probe,omitempty"`     // 自动探测：启动时、key 冷却恢复时、正常状态连续无调用达空闲探测间隔（默认 2h）时，自动发加法题验证账号状态（probe.go）
 	Proxy         *ProxySpec                   `json:"proxy,omitempty"`          // 渠道级代理（如代理池）：未单独配置代理的 key 全部继承，每个 key 独立租约/出口 IP
 	ModelPins     map[string]*ModelUpstreamPin `json:"model_pins,omitempty"`     // 模型 → 上游内部渠道固定（upstreampin.go）
 	Enabled       bool                         `json:"enabled"`
@@ -439,7 +439,8 @@ type GatewaySettings struct {
 	RotateAfter5xx       *int    `json:"rotate_after_5xx,omitempty"`        // 连续 5xx 换出口阈值（默认 3，0 关闭）
 	MaxRouteTries        *int    `json:"max_route_tries,omitempty"`         // 单请求最多尝试 key 数（默认 0 = 全部）
 	KeepaliveSec         *int    `json:"keepalive_sec,omitempty"`           // 流式心跳间隔秒数（默认 15，0 关闭）
-	ProbeIdleSec         *int    `json:"probe_idle_sec,omitempty"`          // 自动探测的空闲探测间隔秒数（默认 28800=8h，0 关闭）
+	ProbeIdleSec         *int    `json:"probe_idle_sec,omitempty"`          // 自动探测的空闲探测间隔秒数（默认 7200=2h，0 关闭）
+	ProbeStartup         *bool   `json:"probe_startup,omitempty"`           // 启动探测开关（默认 true；重启/部署后核对账号状态）
 	DefaultSchedule      *string `json:"default_schedule,omitempty"`        // 默认账号调度："" 沿用环境变量；"failover" / "round_robin"
 }
 

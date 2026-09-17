@@ -76,7 +76,8 @@ func (l *RequestLog) attachTable(table string) {
 	}
 }
 
-// dbLog 返回挂载的日志表（未挂载或用量库不可用时为空串）。
+// dbLog 返回挂载的日志表（未挂载或无用量库实例时为空串）。库暂时不可用也算
+// 挂载：写入会失败并退回内存环形缓冲，库恢复后自动继续落库。
 func (l *RequestLog) dbLog() string {
 	if l.table == "" || usageDB == nil {
 		return ""
@@ -92,14 +93,12 @@ func (l *RequestLog) dbLog() string {
 const logPruneEvery = 256
 
 // Add 写入一条记录（有数据库时持久化，否则写入内存环形缓冲）。
+// 库暂时不可用（LogAppend 失败）时同样退回内存环形缓冲：记录仍能在 WebUI 里
+// 看到，库恢复后新记录继续落库（这段窗口内的旧记录不会被回填）。
 func (l *RequestLog) Add(rec RequestRecord) {
 	table := l.dbLog()
 	if table == "" {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		l.recs[l.next] = rec
-		l.next = (l.next + 1) % l.cap
-		l.n++
+		l.addMem(rec)
 		return
 	}
 	l.mu.Lock()
@@ -107,18 +106,38 @@ func (l *RequestLog) Add(rec RequestRecord) {
 	prune := l.dbAppends%logPruneEvery == 0
 	keep := l.cap
 	l.mu.Unlock()
-	usageDB.LogAppend(table, rec, 0)
+	if err := usageDB.LogAppend(table, rec, 0); err != nil {
+		l.addMem(rec)
+		return
+	}
 	if prune {
 		usageDB.logPrune(table, keep)
 	}
 }
 
-// Snapshot 返回现有记录，最新在前。
+// addMem 写入内存环形缓冲（最新覆盖最旧），供无数据库或库不可用时使用。
+func (l *RequestLog) addMem(rec RequestRecord) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.recs[l.next] = rec
+	l.next = (l.next + 1) % l.cap
+	l.n++
+}
+
+// Snapshot 返回现有记录，最新在前。库可用时以库为准（即使为空 = 已被清空）；
+// 库暂时不可用时退回内存环形缓冲——库不可用期间写入的记录只存在于内存里。
 func (l *RequestLog) Snapshot() []RequestRecord {
 	if table := l.dbLog(); table != "" {
 		recs, _ := usageDB.LogQuery(table, 1, l.cap)
-		return recs
+		if len(recs) > 0 || usageDB.Available() {
+			return recs
+		}
 	}
+	return l.memSnapshot()
+}
+
+// memSnapshot 内存环形缓冲里的记录（最新在前）。
+func (l *RequestLog) memSnapshot() []RequestRecord {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := make([]RequestRecord, 0, l.count())
@@ -137,27 +156,28 @@ func (l *RequestLog) count() int {
 }
 
 // Clear 清空全部记录（管理员在 WebUI 手动清空日志用）。重新分配底层数组，
-// 顺带释放已存错误信息（单条可达 8KB）的内存引用。
+// 顺带释放已存错误信息（单条可达 8KB）的内存引用。库不可用期间写入内存环形
+// 缓冲的记录一并清掉，避免清空后又被读出来。
 func (l *RequestLog) Clear() {
-	if table := l.dbLog(); table != "" {
-		l.mu.Lock()
-		l.dbAppends = 0
-		l.mu.Unlock()
-		usageDB.LogClear(table)
-		return
-	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.recs = make([]RequestRecord, l.cap)
 	l.next, l.n = 0, 0
+	l.dbAppends = 0
+	l.mu.Unlock()
+	if table := l.dbLog(); table != "" {
+		usageDB.LogClear(table)
+	}
 }
 
 // Query 分页返回记录（最新在前；page 从 1 起，越界返回空页）。
 func (l *RequestLog) Query(page, pageSize int) ([]RequestRecord, int) {
 	if table := l.dbLog(); table != "" {
-		return usageDB.LogQuery(table, page, pageSize)
+		recs, total := usageDB.LogQuery(table, page, pageSize)
+		if len(recs) > 0 || total > 0 || usageDB.Available() {
+			return recs, total
+		}
 	}
-	all := l.Snapshot()
+	all := l.memSnapshot()
 	if page < 1 {
 		page = 1
 	}
@@ -185,13 +205,15 @@ var (
 // errMsgMax 请求记录错误信息的最大长度（逐 key 失败轨迹完整保留，仅设上限防膨胀）。
 const errMsgMax = 8192
 
-// initStats 用配置初始化（幂等，reloadConfig 时调用）。用量库已就绪时把
-// 请求/错误日志挂到 SQLite 表（重启不丢），否则退化为内存环形缓冲。
+// initStats 用配置初始化（幂等，reloadConfig 时调用）。用量库就绪时把请求/错误
+// 日志挂到 SQLite 表（重启不丢），否则退化为内存环形缓冲。
 // 必须先 initUsageDB 再调用本函数。
+// 注意：建库失败时也照样挂表（LogAppend 会失败并退回内存环形缓冲），这样库一旦
+// 运行期自愈，日志不需要重启进程就会重新落库。
 func initStats() {
 	reqLog = newRequestLog(cfg.ReqLogSize)
 	errLog = newRequestLog(cfg.ErrLogSize)
-	if usageDB != nil && usageDB.Available() {
+	if usageDB != nil {
 		reqLog.attachTable(logTableRequest)
 		errLog.attachTable(logTableError)
 	}

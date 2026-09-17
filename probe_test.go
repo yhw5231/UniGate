@@ -1,4 +1,4 @@
-// 账号自动探测测试：冷却恢复触发、8h 空闲触发、禁用/冷却账号跳过、加法题
+// 账号自动探测测试：冷却恢复触发、默认间隔空闲触发、禁用/冷却账号跳过、加法题
 // 生成与答案提取、探测请求的真实发送与 429 重新冷却。
 package main
 
@@ -36,9 +36,10 @@ func runScan(t *testing.T) []probeTask {
 	return out
 }
 
-// TestProbeIdleAfter8h 启用探测的渠道：key 空闲超过 8h 应产出空闲探测任务；
+// TestProbeIdleAfterDefaultInterval 启用探测的渠道：key 空闲超过默认空闲探测
+// 间隔（PROBE_IDLE_SEC，默认 2h）应产出空闲探测任务；
 // 停用渠道 / 停用 key / 未开启开关不产出。
-func TestProbeIdleAfter8h(t *testing.T) {
+func TestProbeIdleAfterDefaultInterval(t *testing.T) {
 	setupProbeTest(t)
 	ch := testProbeChannel(true)
 	if err := store.PutChannel(ch); err != nil {
@@ -47,7 +48,12 @@ func TestProbeIdleAfter8h(t *testing.T) {
 	if tasks := runScan(t); len(tasks) != 0 {
 		t.Fatalf("just-seen key should not be probed, got %d task(s)", len(tasks))
 	}
-	activity.noteAt("k1", "", time.Now().Add(-8*time.Hour-time.Second))
+	// 默认间隔（2h）内不探测、超过才探测
+	activity.noteAt("k1", "", time.Now().Add(-time.Hour))
+	if tasks := runScan(t); len(tasks) != 0 {
+		t.Fatalf("key used 1h ago should not be probed (default interval 2h), got %d task(s)", len(tasks))
+	}
+	activity.noteAt("k1", "", time.Now().Add(-2*time.Hour-time.Second))
 	tasks := runScan(t)
 	if len(tasks) != 1 || tasks[0].Kind != probeKindIdle || tasks[0].Key.ID != "k1" {
 		t.Fatalf("want one idle probe for k1, got %+v", tasks)

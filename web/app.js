@@ -127,6 +127,7 @@ function fillSettingsForm() {
   $("#setMaxRouteTries").value = s.max_route_tries ?? "";
   $("#setKeepaliveSec").value = s.keepalive_sec ?? "";
   $("#setProbeIdleSec").value = s.probe_idle_sec ?? "";
+  $("#setProbeStartup").value = s.probe_startup === undefined ? "" : (s.probe_startup ? "1" : "0");
   $("#setDefaultSchedule").value = s.default_schedule || "";
   // RoutePolicy 无 json tag：生效值按 Go 字段名下发，Duration 序列化为纳秒
   const ns = (v) => Math.round((v || 0) / 1e9);
@@ -135,7 +136,7 @@ function fillSettingsForm() {
   const pi = ns(p.ProbeIdleInterval);
   const sched = p.DefaultSchedule === "round_robin" ? "顺序轮询" : "故障转移";
   $("#policyNow").textContent =
-    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"} · 空闲探测 ${pi > 0 ? pi + "s" : "关闭"} · 默认账号调度 ${sched}`;
+    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"} · 空闲探测 ${pi > 0 ? pi + "s" : "关闭"} · 启动探测 ${p.ProbeStartup ? "开" : "关"} · 默认账号调度 ${sched}`;
 }
 
 $("#settingsSaveBtn").addEventListener("click", async () => {
@@ -153,6 +154,8 @@ $("#settingsSaveBtn").addEventListener("click", async () => {
     num("#setMaxRouteTries", "max_route_tries");
     num("#setKeepaliveSec", "keepalive_sec");
     num("#setProbeIdleSec", "probe_idle_sec");
+    const ps = $("#setProbeStartup").value;
+    if (ps !== "") body.probe_startup = ps === "1"; // 留空 = 恢复环境变量默认
     const sched = $("#setDefaultSchedule").value;
     if (sched !== "") body.default_schedule = sched; // 留空 = 恢复环境变量默认
     await api("PUT", "/admin/api/settings", body);
@@ -344,7 +347,7 @@ function renderChannels() {
         ${ch.rewrite_reasoning ? '<span class="badge info">reasoning改写</span>' : ""}
         ${ch.cooldown_scope === "key_model" ? '<span class="badge info">按(Key,模型)冷却</span>' : ""}
         ${ch.schedule === "round_robin" ? '<span class="badge info" title="每次请求从下一个 key 开始轮流分配">顺序轮询</span>' : ""}
-        ${ch.auto_probe ? '<span class="badge info" title="key 冷却恢复/连续 8 小时无调用时自动发加法题验证账号状态">自动探测</span>' : ""}
+        ${ch.auto_probe ? '<span class="badge info" title="启动时、key 冷却恢复/连续无调用达空闲探测间隔（默认 2 小时）时自动发加法题验证账号状态">自动探测</span>' : ""}
         ${ch.proxy && ch.proxy.kind ? '<span class="badge info">渠道代理</span>' : ""}
         ${pinnedModels ? `<span class="badge info" title="该渠道有模型的内部渠道被固定（请求注入 provider.only/order，不再随机路由）">已固定 ${pinnedModels} 个模型</span>` : ""}
         ${coolingN ? `<span class="badge warn">${coolingN} 个 key 冷却中</span>` : ""}
@@ -652,12 +655,19 @@ function coolingByKeyID() {
   }
   return m;
 }
+// coolingSrcHint 冷却来源提示：到期时间来自上游明确提示（如 "Try again in 14h"）
+// 还是配置兜底时长——启动探测跳过前者（等自然到期），只对后者重新核对。
+function coolingSrcHint(c) {
+  return c.explicit
+    ? "；到期时间由上游明确给出，启动探测会跳过该账号、等它自然到期"
+    : "；到期时间为配置兜底（上游未给明确时间），重启后启动探测会重新核对";
+}
 function coolingBadge(cooling, keyID) {
   const c = cooling[keyID];
   if (!c) return "";
   const left = c.left_ms > 0 ? Math.round(c.left_ms / 1000) : 0;
   const scope = c.model ? `（${esc(c.model)}）` : "";
-  return `<span class="badge warn" title="该 key 因上游故障处于冷却中，网关转发会跳过它；渠道测试成功或点「解除冷却」可立即恢复">冷却中${scope} · 剩 ${fmtLeft(left)}</span>`;
+  return `<span class="badge warn" title="该 key 因上游故障处于冷却中，网关转发会跳过它；渠道测试成功或点「解除冷却」可立即恢复${coolingSrcHint(c)}">冷却中${scope} · 剩 ${fmtLeft(left)}</span>`;
 }
 
 // keyCoolDetail 某 key 的冷却明细（渠道卡片与编辑弹窗共用）：null = 无生效冷却。
@@ -673,7 +683,7 @@ function keyCoolDetail(ch, keyID) {
     return { whole: true, left: Math.max(0, Math.round(max.left_ms / 1000)), cooled: [], available: [], hasModelList: false };
   }
   const cooled = entries
-    .map((c) => ({ model: c.model, left: Math.max(0, Math.round(c.left_ms / 1000)) }))
+    .map((c) => ({ model: c.model, left: Math.max(0, Math.round(c.left_ms / 1000)), explicit: !!c.explicit }))
     .sort((a, b) => a.model.localeCompare(b.model));
   const models = ch.models || [];
   const cooledSet = new Set(cooled.map((c) => c.model));
@@ -694,7 +704,7 @@ function keyCoolHTML(ch, keyID, cooling) {
   if (!d) return "";
   if (d.whole) return coolingBadge(cooling, keyID);
   const chips = d.cooled.map((c) =>
-    `<span class="badge warn" title="该 (key, 模型) 因上游 429 处于冷却中，转发此模型时网关会跳过该 key；其余模型不受影响">冷却 ${esc(c.model)} · 剩 ${fmtLeft(c.left)}
+    `<span class="badge warn" title="该 (key, 模型) 因上游 429 处于冷却中，转发此模型时网关会跳过该 key；其余模型不受影响${coolingSrcHint(c)}">冷却 ${esc(c.model)} · 剩 ${fmtLeft(c.left)}
       <button class="btn small" data-act="clearcoolmodel" data-key="${esc(keyID)}" data-model="${esc(c.model)}" title="只解除该 (key, 模型) 的冷却">×</button></span>`
   ).join("");
   let avail = "";

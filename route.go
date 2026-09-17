@@ -367,10 +367,17 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 					d = d2
 				}
 			}
-			if d == 0 {
+			// explicit：时长来自上游明确到期时间（启动探测对这类账号不再试探，
+			// 等它自然到期；只有兜底冷却的账号才值得重启后重新核对状态）
+			explicit := d != 0
+			if !explicit {
 				d = pol.RateLimitCooldown
 			}
-			cool.Mark(cand.k.ID, cm, d)
+			if explicit {
+				cool.MarkExplicit(cand.k.ID, cm, d)
+			} else {
+				cool.Mark(cand.k.ID, cm, d)
+			}
 			leaseMgr.RecordUse(cand.k.effectiveProxy(cand.ch), cand.k.ID)
 			lastErr = "upstream " + formatRejectReason(resp.StatusCode, prefix)
 			recordTrace(&cand, "rejected_429", lastErr)

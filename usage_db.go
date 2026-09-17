@@ -4,12 +4,16 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // 注册 "sqlite" 驱动
@@ -30,17 +34,33 @@ type UsageEvent struct {
 }
 
 // UsageDB SQLite 用量库。
+//
+// 句柄可用性：handle 为原子指针，只有「打开 + 建表」都成功后才会发布，因此
+// handle != nil 即代表可用（不用另设标志）。打开失败不再是永久降级——每次
+// 使用都会按 usageReopenEvery 退避尝试重开（磁盘瞬时占用、挂载点暂不可用、
+// 库文件被替换等恢复后自动继续记遥测），失败只记一次日志。
 type UsageDB struct {
 	// mu 保护写路径（Append/LogAppend/清理/脱敏）：写事务在进程内串行，
 	// 避免多写者互相 SQLITE_BUSY。读路径（Query/LogQuery/Count）不加锁——
 	// WAL 下读不阻塞写、写不阻塞读，管理端的聚合查询不再卡住请求日志写入。
 	mu            sync.Mutex
-	path          string // 空 = :memory:
+	openMu        sync.Mutex // 建库/重开串行化（不可与 mu 反向获取：先 mu 再 openMu）
+	path          string     // 空 = :memory:
 	retentionDays int
 	maxRecords    int
-	db            *sql.DB
+	handle        atomic.Pointer[sql.DB] // nil = 不可用（尚未打开或打开失败）
+	handleGen     atomic.Uint64          // 句柄代号：重开后 +1，语句缓存据此失效
+	lastOpenTry   atomic.Int64           // 上次重开尝试（unix 纳秒；0 = 尚未尝试）
+	closed        atomic.Bool            // Close 后置位：不再重开，避免复活已关闭实例
 	appendCount   int
-	stmts         map[string]*sql.Stmt // 热路径 SQL 预编译缓存（mu 保护）
+	warned        atomic.Bool           // 首次写入/查询失败已告警（避免刷屏）
+	stmts         map[string]cachedStmt // 热路径 SQL 预编译缓存（mu 保护，按句柄代号失效）
+}
+
+// cachedStmt 一条预编译语句 + 其所属句柄代号（重开库后旧语句不可用）。
+type cachedStmt struct {
+	stmt *sql.Stmt
+	gen  uint64
 }
 
 // usageSchema 用量库 + 请求/错误日志表。日志表与用量事件分离：用量库是
@@ -132,16 +152,88 @@ func newUsageDB(path string, retentionDays, maxRecords int) *UsageDB {
 	if maxRecords <= 0 {
 		db.maxRecords = 100000
 	}
-	sqldb, err := openUsageSQLite(path)
-	if err != nil {
-		return db // 打开失败则保持 nil db，Append/Query 均为空操作
+	var err error
+	for i := 0; i < usageOpenAttempts; i++ {
+		if i > 0 {
+			time.Sleep(usageOpenRetryGap)
+		}
+		if err = db.open(); err == nil {
+			db.cleanupLocked() // 启动时清理一次：丢弃保留期外事件并裁剪条数
+			return db
+		}
 	}
-	db.db = sqldb
-	if _, err := sqldb.Exec(usageSchema); err == nil {
-		db.migrate(sqldb)
-		db.cleanupLocked()
-	}
+	// 打开/建表失败不阻断启动（遥测降级），但绝不静默：留日志，且运行期会按
+	// usageReopenEvery 退避自动重开，磁盘/权限恢复后自愈
+	log.Printf("usage db: open %s failed after %d attempts: %v (telemetry disabled until it recovers)",
+		path, usageOpenAttempts, err)
+	// 刻意不记 lastOpenTry：紧接着的第一次读写会立刻再试一次（瞬时故障往往在
+	// 建库重试的几百毫秒里就消失了），那次再失败才进入退避节奏
 	return db
+}
+
+// usageOpenAttempts / usageOpenRetryGap 建库尝试次数与间隔：全新库第一条连接
+// 要在连接建立阶段切换 journal_mode=WAL（需要短暂独占锁），磁盘繁忙、杀软/
+// 索引器正在扫描、容器卷挂载慢都会让这次切换立刻失败；之前的实现一次失败就
+// 永久降级（写日志/用量静默停止），这里重试几次吸收瞬时故障。
+const (
+	usageOpenAttempts = 3
+	usageOpenRetryGap = 150 * time.Millisecond
+)
+
+// usageReopenEvery 运行期重开的最小间隔（库不可用时每次读写都尝试重开会给
+// 磁盘带来无谓压力）。变量便于测试置 0。
+var usageReopenEvery = 5 * time.Second
+
+// open 打开库并建表，成功后发布句柄（幂等：已可用时直接返回 nil）。
+// 失败时保持句柄为空并把错误交给调用方。
+//
+// 只做「打开 + 建表 + 补列」，不做清理等维护性写操作：本函数可能由读路径
+// 触发（ensure），而维护写要碰语句缓存（mu 保护），在只持 openMu 的情况下写
+// 会与写路径竞争。保留期/条数清理仍由 Append 的定期清理与启动时的初始化负责。
+func (db *UsageDB) open() error {
+	if db.handle.Load() != nil {
+		return nil
+	}
+	sqldb, err := openUsageSQLite(db.path)
+	if err != nil {
+		return err
+	}
+	if _, err := sqldb.Exec(usageSchema); err != nil {
+		_ = sqldb.Close()
+		return fmt.Errorf("init schema: %w", err)
+	}
+	db.migrate(sqldb)
+	db.handleGen.Add(1) // 换代：热路径语句缓存按新代号重新准备
+	db.handle.Store(sqldb)
+	return nil
+}
+
+// ensure 返回当前可用句柄；不可用时按 usageReopenEvery 退避尝试重开（自愈），
+// 仍不可用返回 nil，调用方按「遥测降级」静默跳过。
+// 调用方可能已持 db.mu（写路径）——本函数不自取 db.mu，避免反向加锁。
+func (db *UsageDB) ensure() *sql.DB {
+	if db == nil || db.closed.Load() {
+		return nil
+	}
+	if h := db.handle.Load(); h != nil {
+		return h
+	}
+	db.openMu.Lock()
+	defer db.openMu.Unlock()
+	if h := db.handle.Load(); h != nil {
+		return h
+	}
+	if last := db.lastOpenTry.Load(); last != 0 && time.Since(time.Unix(0, last)) < usageReopenEvery {
+		return nil
+	}
+	db.lastOpenTry.Store(time.Now().UnixNano())
+	if err := db.open(); err != nil {
+		log.Printf("usage db: reopen %s: %v", db.path, err)
+		return nil
+	}
+	db.warned.Store(false) // 恢复后允许再次告警（下次故障仍要有日志）
+	log.Printf("usage db: reopened %s, telemetry resumed", db.path)
+	return db.handle.Load()
 }
 
 // usagePragmas SQLite 连接参数（经 modernc 驱动的 DSN 参数逐连接生效）。
@@ -152,23 +244,33 @@ func newUsageDB(path string, retentionDays, maxRecords int) *UsageDB {
 // 下提交只追加日志文件（NORMAL 不对每次提交 fsync），checkpoint 时才落盘；
 // 读也不再阻塞写。代价：掉电可能丢最近若干笔遥测记录（日志/账本可接受，
 // 冷却等关键状态另有 cooldowns.json 原子落盘）。
-// busy_timeout：并发读连接遇到在途写事务时等待而非立刻报 database is locked。
-const usagePragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)"
+//
+// busy_timeout 必须排在 journal_mode 之前：_pragma 按顺序在连接建立阶段执行，
+// 切换 WAL 需要短暂独占锁，此刻磁盘/杀软/索引器的瞬时占用会**立刻**失败
+// （busy_timeout 还没生效，不会等待），表现为新连接的第一次读写直接报错、
+// 遥测静默丢失。先设 busy_timeout，这类瞬时竞争就会等待而不是失败。
+const usagePragmas = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
 
 // openUsageSQLite 打开用量库并配置连接池。优先使用带 _pragma 参数的 DSN
-//（参数对新连接逐一生效，多连接读才安全）；驱动/文件系统不支持时退回普通
-// DSN + 单连接显式 PRAGMA（退化为改造前行为，功能不受影响）。
+// （参数对新连接逐一生效，多连接读才安全）；驱动/文件系统不支持时退回普通
+// DSN + 单连接显式 PRAGMA（退化为改造前行为，功能不受影响），此时先验证句柄
+// 真能用——不验证就返回会让「打开失败」变成运行期的静默空操作。
 func openUsageSQLite(path string) (*sql.DB, error) {
 	plain := path
 	if plain == "" {
 		plain = ":memory:"
 	}
+	var firstErr error
 	if sqldb, err := sql.Open("sqlite", plain+usagePragmas); err == nil {
 		if _, err := sqldb.Exec("SELECT 1"); err == nil {
 			configureUsagePool(sqldb, path)
 			return sqldb, nil
+		} else {
+			firstErr = err
 		}
 		_ = sqldb.Close()
+	} else {
+		firstErr = err
 	}
 	sqldb, err := sql.Open("sqlite", plain)
 	if err != nil {
@@ -176,9 +278,16 @@ func openUsageSQLite(path string) (*sql.DB, error) {
 	}
 	// 退回路径：单连接（PRAGMA 只作用于该连接），显式设置
 	configureUsagePool(sqldb, "")
+	_, _ = sqldb.Exec("PRAGMA busy_timeout=5000")
 	_, _ = sqldb.Exec("PRAGMA journal_mode=WAL")
 	_, _ = sqldb.Exec("PRAGMA synchronous=NORMAL")
-	_, _ = sqldb.Exec("PRAGMA busy_timeout=5000")
+	if _, err := sqldb.Exec("SELECT 1"); err != nil {
+		_ = sqldb.Close()
+		if firstErr != nil {
+			return nil, fmt.Errorf("dsn-path: %v; plain-path: %w", firstErr, err)
+		}
+		return nil, err
+	}
 	return sqldb, nil
 }
 
@@ -195,24 +304,44 @@ func configureUsagePool(sqldb *sql.DB, path string) {
 	sqldb.SetMaxIdleConns(n)
 }
 
+// errUsageDBUnavailable 库当前不可用（打开失败且仍在退避期内）：调用方按
+// 「遥测降级」处理，写入丢弃、查询返回空。
+var errUsageDBUnavailable = errors.New("usage db unavailable")
+
 // execResultLocked 与 execLocked 相同但返回结果（需要 RowsAffected 时使用）。
+// 缓存语句按句柄代号校验：重开库后旧语句属于已关闭的连接池，直接丢弃重准备。
 func (db *UsageDB) execResultLocked(query string, args ...any) (sql.Result, error) {
-	if db.stmts == nil {
-		db.stmts = map[string]*sql.Stmt{}
+	h := db.ensure()
+	if h == nil {
+		return nil, errUsageDBUnavailable
 	}
-	stmt := db.stmts[query]
-	if stmt == nil {
-		s, err := db.db.Prepare(query)
-		if err != nil {
-			return db.db.Exec(query, args...)
+	if db.stmts == nil {
+		db.stmts = map[string]cachedStmt{}
+	}
+	gen := db.handleGen.Load()
+	stmt := (*sql.Stmt)(nil)
+	if e, ok := db.stmts[query]; ok {
+		if e.gen == gen {
+			stmt = e.stmt
+		} else {
+			_ = e.stmt.Close()
+			delete(db.stmts, query)
 		}
-		db.stmts[query] = s
+	}
+	if stmt == nil {
+		s, err := h.Prepare(query)
+		if err != nil {
+			// 预编译失败（连接池刚重建等）：退回一次性执行，不缓存
+			return h.Exec(query, args...)
+		}
+		db.stmts[query] = cachedStmt{stmt: s, gen: gen}
 		stmt = s
 	}
 	res, err := stmt.Exec(args...)
 	if err != nil {
 		delete(db.stmts, query)
 		_ = stmt.Close()
+		db.retireIfDead(h) // 句柄级故障（连接池关闭/库被替换）→ 下次使用重开
 		return nil, err
 	}
 	return res, nil
@@ -235,23 +364,52 @@ func (db *UsageDB) migrate(sqldb *sql.DB) {
 
 // Close 关闭底层连接。
 func (db *UsageDB) Close() error {
+	db.closed.Store(true)
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	for q, s := range db.stmts {
-		_ = s.Close()
+	for q, e := range db.stmts {
+		_ = e.stmt.Close()
 		delete(db.stmts, q)
 	}
-	if db.db != nil {
-		return db.db.Close()
+	if h := db.handle.Load(); h != nil {
+		return h.Close()
 	}
 	return nil
+}
+
+// retireIfDead 语句报错后探测句柄是否已失效（连接池被关闭、库文件被替换等
+// 句柄级故障）：失效则退役句柄，下一次使用自动重开；仍然健康（磁盘满、约束
+// 冲突等语句级错误）则原样保留，不做无谓重开。误判代价只是一次重开，漏判代价
+// 是遥测永久停摆——所以这里保守地探测一次，超时 1s 封顶。
+func (db *UsageDB) retireIfDead(h *sql.DB) {
+	if h == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := h.PingContext(ctx); err == nil {
+		return
+	}
+	if db.handle.CompareAndSwap(h, nil) {
+		log.Printf("usage db: handle for %s is dead, reopening on next use", db.path)
+	}
+}
+
+// warnOnce 记录首次写入/查询失败：写入失败此前完全静默，磁盘满/库损坏/被占用
+// 时表现为「用量与日志悄悄停了」，没有任何线索。只报一次，避免每请求刷屏。
+func (db *UsageDB) warnOnce(what string, err error) {
+	if err == nil || db.warned.Load() {
+		return
+	}
+	db.warned.Store(true)
+	log.Printf("usage db: %s failed once (further failures suppressed): %v", what, err)
 }
 
 // Append 记录一条事件（INSERT）。
 func (db *UsageDB) Append(ev UsageEvent) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.db == nil {
+	if db.ensure() == nil {
 		return
 	}
 	err := db.execLocked(`INSERT INTO usage_events
@@ -260,6 +418,7 @@ func (db *UsageDB) Append(ev UsageEvent) {
 		ev.Time.UnixNano(), ev.User, ev.Channel, ev.Model, ev.Key,
 		ev.PromptTokens, ev.CompletionTokens, ev.Status, ev.BytesOut)
 	if err != nil {
+		db.warnOnce("append usage event", err)
 		return
 	}
 	db.appendCount++
@@ -282,7 +441,7 @@ func (db *UsageDB) Cleanup() {
 // 表上每次清理都要全表扫描（十万行级、数百毫秒），而清理持有数据库互斥锁，
 // 期间所有请求的日志写入都被阻塞——用量表越满、服务器越卡。
 func (db *UsageDB) cleanupLocked() {
-	if db.db == nil {
+	if db.ensure() == nil {
 		return
 	}
 	cutoff := time.Now().AddDate(0, 0, -db.retentionDays).UnixNano()
@@ -293,21 +452,23 @@ func (db *UsageDB) cleanupLocked() {
 	}
 }
 
-// Available 报告底层数据库是否可用（打开失败时为 false，全部读写降级为空操作）。
+// Available 报告底层数据库当前是否可用（不可用时全部读写降级为空操作；
+// 运行期会自动尝试重开，恢复后这里随之返回 true）。
 func (db *UsageDB) Available() bool {
 	if db == nil {
 		return false
 	}
-	return db.db != nil // db 指针在构造后只读，无需加锁
+	return db.handle.Load() != nil
 }
 
 // Count 返回当前事件总数。
 func (db *UsageDB) Count() int64 {
-	if db == nil || db.db == nil {
+	h := db.ensure()
+	if h == nil {
 		return 0
 	}
 	var n int64
-	_ = db.db.QueryRow(`SELECT COUNT(*) FROM usage_events`).Scan(&n)
+	_ = h.QueryRow(`SELECT COUNT(*) FROM usage_events`).Scan(&n)
 	return n
 }
 
@@ -420,7 +581,8 @@ func (db *UsageDB) Query(f UsageFilter) UsageResult {
 	}
 	res := UsageResult{Window: f.Window, Start: start, End: end}
 
-	if db.db == nil {
+	h := db.ensure()
+	if h == nil {
 		return res
 	}
 
@@ -428,13 +590,15 @@ func (db *UsageDB) Query(f UsageFilter) UsageResult {
 
 	// 总量
 	var promptTok, compTok, bytesOut, errors int64
-	err := db.db.QueryRow(`SELECT COUNT(*),
+	err := h.QueryRow(`SELECT COUNT(*),
 		COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
 		COALESCE(SUM(bytes_out),0),
 		COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END),0)
 		FROM usage_events WHERE `+where, args...).
 		Scan(&res.Requests, &promptTok, &compTok, &bytesOut, &errors)
 	if err != nil {
+		db.warnOnce("query usage", err)
+		db.retireIfDead(h)
 		return res
 	}
 	res.PromptTokens = promptTok
@@ -452,13 +616,18 @@ func (db *UsageDB) Query(f UsageFilter) UsageResult {
 
 // queryBreakdown 按某列分组聚合（col 为 user/model/key）。
 func (db *UsageDB) queryBreakdown(where string, args []any, col string) []UsageBreakdown {
-	rows, err := db.db.Query(`SELECT COALESCE(NULLIF(`+col+`,''),'unknown') AS name,
+	h := db.handle.Load()
+	if h == nil {
+		return nil
+	}
+	rows, err := h.Query(`SELECT COALESCE(NULLIF(`+col+`,''),'unknown') AS name,
 		COUNT(*),
 		COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(bytes_out),0),
 		COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0)
 		FROM usage_events WHERE `+where+` GROUP BY name`, args...)
 	if err != nil {
+		db.retireIfDead(h)
 		return nil
 	}
 	defer rows.Close()
@@ -478,15 +647,15 @@ func (db *UsageDB) queryBreakdown(where string, args []any, col string) []UsageB
 // ---- 请求/错误日志（持久化环形缓冲） ----
 
 // LogAppend 追加一条日志记录，并把表裁剪到 keep 条以内（保留最新）。
-// keep <= 0 时仅追加不裁剪。
-func (db *UsageDB) LogAppend(table string, rec RequestRecord, keep int) {
+// keep <= 0 时仅追加不裁剪。库不可用时返回错误，调用方应退回内存环形缓冲。
+func (db *UsageDB) LogAppend(table string, rec RequestRecord, keep int) error {
 	if db == nil || !validLogTable(table) {
-		return
+		return errUsageDBUnavailable
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.db == nil {
-		return
+	if db.ensure() == nil {
+		return errUsageDBUnavailable
 	}
 	err := db.execLocked(`INSERT INTO `+table+`
 		(rid, time, duration_ms, method, path, status, bytes_out, client_ip, user, channel, model, key, prompt_tokens, completion_tokens, error)
@@ -496,19 +665,24 @@ func (db *UsageDB) LogAppend(table string, rec RequestRecord, keep int) {
 		rec.PromptTokens, rec.CompletionTokens, rec.ErrMsg)
 	if err != nil {
 		log.Printf("usage db: append %s: %v", table, err)
-		return
+		return err
 	}
 	if keep > 0 {
 		// 环形缓冲语义：只保留最新 keep 条
 		_ = db.execLocked(`DELETE FROM `+table+` WHERE id NOT IN (
 			SELECT id FROM `+table+` ORDER BY id DESC LIMIT ?)`, keep)
 	}
+	return nil
 }
 
 // LogQuery 分页返回日志（最新在前）。返回 (记录, 总数)。
 // 只读：不加写锁。
 func (db *UsageDB) LogQuery(table string, page, pageSize int) ([]RequestRecord, int) {
-	if db == nil || !validLogTable(table) || db.db == nil {
+	if db == nil || !validLogTable(table) {
+		return []RequestRecord{}, 0
+	}
+	h := db.ensure()
+	if h == nil {
 		return []RequestRecord{}, 0
 	}
 	if page < 1 {
@@ -518,13 +692,16 @@ func (db *UsageDB) LogQuery(table string, page, pageSize int) ([]RequestRecord, 
 		pageSize = 1
 	}
 	var total int
-	if err := db.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&total); err != nil {
+	if err := h.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&total); err != nil {
+		db.warnOnce("query "+table, err)
+		db.retireIfDead(h)
 		return []RequestRecord{}, 0
 	}
-	rows, err := db.db.Query(`SELECT rid, time, duration_ms, method, path, status, bytes_out,
+	rows, err := h.Query(`SELECT rid, time, duration_ms, method, path, status, bytes_out,
 		client_ip, user, channel, model, key, prompt_tokens, completion_tokens, error
 		FROM `+table+` ORDER BY id DESC LIMIT ? OFFSET ?`, pageSize, (page-1)*pageSize)
 	if err != nil {
+		db.retireIfDead(h)
 		return []RequestRecord{}, total
 	}
 	defer rows.Close()
@@ -553,7 +730,7 @@ func (db *UsageDB) logPrune(table string, keep int) {
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.db == nil {
+	if db.ensure() == nil {
 		return
 	}
 	_ = db.execLocked(`DELETE FROM `+table+` WHERE id NOT IN (
@@ -567,10 +744,11 @@ func (db *UsageDB) LogClear(table string) int64 {
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.db == nil {
+	h := db.ensure()
+	if h == nil {
 		return 0
 	}
-	res, err := db.db.Exec(`DELETE FROM ` + table)
+	res, err := h.Exec(`DELETE FROM ` + table)
 	if err != nil {
 		log.Printf("usage db: clear %s: %v", table, err)
 		return 0
@@ -586,10 +764,11 @@ func (db *UsageDB) LogClear(table string) int64 {
 func (db *UsageDB) MaskStoredKeys(secrets map[string]bool) int64 {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.db == nil {
+	h := db.ensure()
+	if h == nil {
 		return 0
 	}
-	rows, err := db.db.Query(`SELECT DISTINCT key FROM usage_events
+	rows, err := h.Query(`SELECT DISTINCT key FROM usage_events
 		WHERE key <> '' AND key NOT LIKE '%****%'`)
 	if err != nil {
 		return 0
@@ -613,6 +792,63 @@ func (db *UsageDB) MaskStoredKeys(secrets map[string]bool) int64 {
 		}
 	}
 	return n
+}
+
+// ---- 启动探测的活跃度基线 ----
+
+// KeyUse 一条「某上游 key 最近一次成功调用」记录（channel/key 为日志里的
+// 「渠道名 / 名称@渠道」标签，探测调度按当前配置换算回 keyID）。
+type KeyUse struct {
+	Channel string
+	Key     string
+	Model   string
+	Last    time.Time
+}
+
+// RecentKeyUse 返回 window 内每个 (渠道, key, 模型) 最近一次成功请求的时间：
+// usage_events（下游真实请求，保留 30 天/10 万条）与 request_log（含探测请求，
+// 环形 1000 条）取并集的最大值。启动时用它恢复活跃度计时线——进程重启会清空
+// 内存态计时，不恢复的话「最近用过的账号」会被当成从没调用过的账号，重启即
+// 被探测、且空闲探测要重新计满一个间隔才生效。
+// 只统计成功请求（status < 400）：失败（尤其 429）不是账号可用的证据。
+func (db *UsageDB) RecentKeyUse(window time.Duration) []KeyUse {
+	if db == nil || window <= 0 {
+		return nil
+	}
+	h := db.ensure()
+	if h == nil {
+		return nil
+	}
+	cutoff := time.Now().Add(-window).UnixNano()
+	merged := map[string]KeyUse{}
+	for _, table := range []string{"usage_events", logTableRequest} {
+		rows, err := h.Query(`SELECT channel, key, model, MAX(time) FROM `+table+
+			` WHERE time >= ? AND status < 400 AND key <> '' GROUP BY channel, key, model`, cutoff)
+		if err != nil {
+			db.retireIfDead(h)
+			continue
+		}
+		for rows.Next() {
+			var (
+				u    KeyUse
+				unix int64
+			)
+			if err := rows.Scan(&u.Channel, &u.Key, &u.Model, &unix); err != nil {
+				continue
+			}
+			u.Last = time.Unix(0, unix)
+			id := u.Channel + "\x00" + u.Key + "\x00" + u.Model
+			if prev, ok := merged[id]; !ok || u.Last.After(prev.Last) {
+				merged[id] = u
+			}
+		}
+		rows.Close()
+	}
+	out := make([]KeyUse, 0, len(merged))
+	for _, u := range merged {
+		out = append(out, u)
+	}
+	return out
 }
 
 // ---- 全局实例 ----

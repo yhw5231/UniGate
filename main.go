@@ -54,7 +54,11 @@ func main() {
 	applySettings(store.Settings()) // WebUI 设置覆盖（gateway.json）
 	initUsageDB()                   // 先建库：请求/错误日志持久化需要它
 	initStats()
-	probes.Start() // 账号自动探测调度器（渠道 auto_probe 开关控制是否实际探测）
+	probes.setConcurrency(cfg.ProbeConcurrency) // 探测并发上限（PROBE_CONCURRENCY）
+	probes.Start()                              // 账号自动探测调度器（渠道 auto_probe 开关控制是否实际探测）
+	// 启动探测：先从持久化请求日志恢复活跃度计时线（重启后「最近用过」不再
+	// 归零），再对无明确冷却、最近未成功调用的账号并发核对一轮状态
+	probes.StartupSweep()
 	if usageDB != nil {
 		// 请求记录/用量库现在只写「key 名称@渠道」（非凭证），但更早版本的
 		// 库里可能残留明文真实 key：按现存 api_key 精确匹配就地脱敏一次

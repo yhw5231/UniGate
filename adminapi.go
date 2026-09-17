@@ -328,13 +328,18 @@ func handleAdminProbeUpstreams(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("admin probed upstreams: channel %q model %q pipeline=%s last=%s known=%v",
 		ch.Name, model, pin.Pipeline, pin.LastProvider, pin.Known)
+	// known 恒为数组：上游未点名可用渠道时前端不做 null/undefined 判断
+	known := pin.Known
+	if known == nil {
+		known = []string{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"channel_id":     ch.ID,
 		"model":          model,
 		"pipeline":       pin.Pipeline,
 		"canonical_slug": pin.CanonicalSlug,
 		"last_provider":  pin.LastProvider,
-		"known":          pin.Known,
+		"known":          known,
 		"pin":            pin,
 	})
 }

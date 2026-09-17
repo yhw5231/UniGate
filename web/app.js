@@ -99,6 +99,7 @@ $$(".tab").forEach((btn) => btn.addEventListener("click", () => {
   $("#tab-" + btn.dataset.tab).classList.remove("hidden");
   if (btn.dataset.tab === "logs") refreshLogs();
   if (btn.dataset.tab === "errors") refreshErrors();
+  if (btn.dataset.tab === "pin") renderPinPage();
   if (btn.dataset.tab === "route") refreshRoute();
   if (btn.dataset.tab === "test") refreshTestTab();
   if (btn.dataset.tab === "usage") refreshUsage();
@@ -363,10 +364,12 @@ function renderChannels() {
   }));
   wrap.querySelectorAll('[data-act="pin"]').forEach((b) => b.addEventListener("click", () => {
     const id = b.closest(".channel-card").dataset.id;
-    // 固定设置就在渠道编辑弹窗内：直接打开并滚动到该分区
-    openChannelEditor(JSON.parse(JSON.stringify(chans.find((c) => c.id === id))));
-    const sec = $("#chPinSection");
-    if (sec) sec.scrollIntoView({ block: "start", behavior: "smooth" });
+    // 固定设置在独立「渠道固定」页：切换过去并定位该渠道
+    document.querySelector('[data-tab="pin"]').click();
+    setTimeout(() => {
+      const el = document.querySelector(`#pinChannels .channel-card[data-ch="${CSS.escape(id)}"]`);
+      if (el) el.scrollIntoView({ block: "start" });
+    }, 150);
   }));
   wrap.querySelectorAll('[data-act="del"]').forEach((b) => b.addEventListener("click", async () => {
     const id = b.closest(".channel-card").dataset.id;
@@ -394,190 +397,248 @@ function renderChannels() {
 $("#channelSearch").addEventListener("input", renderChannels);
 $("#channelGroupFilter").addEventListener("change", renderChannels);
 
-// ---- 内部渠道固定（upstreampin）——渠道编辑弹窗内的分区 ----
-// 每个启用模型一行：探测（发现该上游内部渠道清单与管线类型）/ 验证（逐渠道测试）/
-// 单独编辑固定列表、排除、模式与排序。随「保存渠道」一起落盘；探测/验证走专用
-// 端点立即写库生效。pinsDraft：渠道编辑期间的固定配置草稿（model → 草稿对象）。
-let pinsDraft = null;
-let pinsDirty = false; // 有未保存的固定配置改动（保存渠道时随渠道落盘）
+// ---- 渠道固定（独立设置页，upstreampin）----
+// ---- 渠道固定（独立设置页）----
+// 每个渠道一块、渠道的每个模型一行：探测（发现该上游内部渠道清单与管线类型）/
+// 验证（逐渠道测试）/ 固定顺序·排除·模式·排序。所有改动经专用端点立即落盘生效，
+// 不与「编辑渠道」弹窗耦合（编辑渠道保存时原样保留 model_pins，不会清空配置）。
+// pinExtras：手工添加、尚不在渠道模型列表/model_pins 中的模型行（渠道ID → [模型]）。
+let pinExtras = {};
 
-// pinsActiveModels 返回渠道启用模型列表（chModels 文本域当前内容）。
-function pinsActiveModels() {
-  return $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
-}
-
-// renderUpstreamPins 渲染「内部渠道固定」分区（渠道编辑弹窗内）。
-function renderUpstreamPins() {
-  const wrap = $("#chUpstreamPins");
-  if (!wrap || !pinsDraft) return;
-  if ($("#chEndpointType").value === "responses") {
-    // Responses API 请求体会被转换重建，provider/providerOptions 注入字段无法保留
-    wrap.innerHTML = '<p class="muted" style="font-size:12px">responses 端点渠道不支持内部渠道固定（转换会丢弃注入字段）。</p>';
+// renderPinPage 渲染渠道固定页（渠道 tab 切入与刷新时调用）。
+function renderPinPage() {
+  const wrap = $("#pinChannels");
+  if (!wrap) return;
+  const chans = (STATE && STATE.channels) || [];
+  if (!chans.length) {
+    wrap.innerHTML = '<p class="muted">还没有渠道。先在「渠道」页添加 OpenAI 兼容上游。</p>';
     return;
   }
-  const models = [...new Set([...pinsActiveModels(), ...Object.keys(pinsDraft)])];
-  if (!models.length) {
-    wrap.innerHTML = '<p class="muted" style="font-size:12px">先在上方填写启用模型列表（每行一个），再为各模型固定内部渠道（「探测」可发现上游内置的渠道清单）。</p>';
-    return;
-  }
-  wrap.innerHTML = models.map((m) => pinRowHTML(m)).join("") +
-    '<div class="pin-row"><input id="pinNewModel" placeholder="其他模型 ID…" style="width:240px"><button class="btn small" data-act="pin-add-model">添加模型</button><span class="muted" style="font-size:11px">为未列入上方的模型单独固定（如渠道未声明模型列表时）</span></div>';
-  wirePinRows();
+  wrap.innerHTML = chans.map((ch) => pinChannelSectionHTML(ch)).join("");
+  wirePinPage();
 }
 
-// pinStateOf 取/建某模型的草稿（默认继承渠道里已保存的配置）。
-function pinStateOf(model) {
-  if (!pinsDraft[model]) {
-    const saved = (editChannel.model_pins || {})[model] || {};
-    pinsDraft[model] = {
-      mode: saved.mode === "preferred" ? "preferred" : "strict",
-      sort: saved.sort || "",
-      upstreams: [...(saved.upstreams || [])],
-      exclude: [...(saved.exclude || [])],
-      known: [...(saved.known || [])],
-      pipeline: saved.pipeline || "",
-      canonical_slug: saved.canonical_slug || "",
-      last_provider: saved.last_provider || "",
-      probed_at: saved.probed_at || 0,
-    };
-  }
-  return pinsDraft[model];
-}
-
-// pinRowHTML 单个模型的固定配置行。
-function pinRowHTML(model) {
-  const s = pinStateOf(model);
-  const probeInfo = s.pipeline
-    ? `管线 <b>${esc(s.pipeline)}</b>${s.last_provider ? ` · 最近 <b>${esc(s.last_provider)}</b>` : ""}${s.probed_at ? ` · ${new Date(s.probed_at * 1000).toLocaleString()}` : ""}`
-    : "未探测";
-  const known = [...new Set([...s.known, ...s.upstreams, ...s.exclude])];
-  const knownChips = known.map((k) => {
-    const cls = s.upstreams.includes(k) ? "info" : (s.exclude.includes(k) ? "warn" : "");
-    const tag = s.upstreams.includes(k) ? "固定" : (s.exclude.includes(k) ? "排除" : "未固定");
-    return `<span class="chip clickable" data-act="pin-toggle" data-model="${esc(model)}" data-slug="${esc(k)}" title="点击在 固定→排除→移除 间切换"><span class="badge ${cls}">${esc(k)}</span><span class="muted" style="font-size:11px">${tag}</span></span>`;
-  }).join("");
-  const chipBtn = (list, i, slug) => {
-    const up = list === "upstreams" && i > 0 ? `<button class="chip-btn" data-act="pin-move" data-model="${esc(model)}" data-list="upstreams" data-idx="${i}" data-dir="-1" title="上移">↑</button>` : "";
-    const down = list === "upstreams" && i < s.upstreams.length - 1 ? `<button class="chip-btn" data-act="pin-move" data-model="${esc(model)}" data-list="upstreams" data-idx="${i}" data-dir="1" title="下移">↓</button>` : "";
-    return `<span class="chip">${esc(slug)}${up}${down}<button class="chip-btn" data-act="pin-remove" data-model="${esc(model)}" data-list="${list}" data-idx="${i}" title="移除">×</button></span>`;
-  };
-  const configured = (s.upstreams.length || s.exclude.length || s.sort) ? '<span class="badge info" title="该模型已固定内部渠道，随「保存渠道」落盘；探测/验证立即生效">已配置</span>' : "";
-  return `<div class="pin-model" data-model="${esc(model)}">
-    <div class="pin-row">
-      <span class="rk-name">${esc(model)}</span> ${configured}
-      <select data-act="pin-mode" data-model="${esc(model)}" style="width:auto" title="严格固定：按固定列表逐个独占尝试（only=[渠道]）；固定优先：一条请求给出完整 order，由上游按序自选">
-        <option value="strict" ${s.mode !== "preferred" ? "selected" : ""}>严格固定</option>
-        <option value="preferred" ${s.mode === "preferred" ? "selected" : ""}>固定优先（order）</option>
-      </select>
-      <select data-act="pin-sort" data-model="${esc(model)}" style="width:auto" title="排序指标（direct 管线自动映射为 price/latency/throughput）">
-        <option value="">不排序</option>
-        <option value="cost" ${s.sort === "cost" ? "selected" : ""}>价格最低</option>
-        <option value="ttft" ${s.sort === "ttft" ? "selected" : ""}>首字最快</option>
-        <option value="tps" ${s.sort === "tps" ? "selected" : ""}>吞吐最高</option>
-      </select>
-      <button class="btn small" data-act="pin-probe" data-model="${esc(model)}" title="发两条小请求：识别管线类型与实际服务的渠道，并把 only 钉到不存在渠道让上游报出全部可用渠道（立即落盘生效）">探测</button>
-      <button class="btn small" data-act="pin-validate" data-model="${esc(model)}" title="对每个已知内部渠道发固定小请求，验证可用性">验证</button>
-      <span class="muted" style="font-size:11px" data-act="pin-info" data-model="${esc(model)}">${probeInfo}</span>
+// pinChannelSectionHTML 单个渠道块：模型行 + 手工添加模型输入。
+function pinChannelSectionHTML(ch) {
+  const models = [...new Set([...(ch.models || []), ...Object.keys(ch.model_pins || {}), ...(pinExtras[ch.id] || [])])];
+  const noKey = !(ch.keys || []).some((k) => k.enabled);
+  const rows = models.length
+    ? models.map((m) => pinPageRowHTML(ch, m)).join("")
+    : '<p class="muted" style="font-size:12px;margin:4px 0">该渠道未声明模型：在下方输入模型 ID 后再设置固定。</p>';
+  return `<div class="channel-card" data-ch="${esc(ch.id)}">
+    <div class="head">
+      <span class="badge ${ch.enabled ? "on" : "off"}">${ch.enabled ? "启用" : "停用"}</span>
+      <span class="name">${esc(ch.name)}</span>
+      <span class="muted">${esc(ch.base_url)}</span>
+      ${noKey ? '<span class="badge warn" title="渠道没有启用的 key：探测/验证需要真实上游请求，请先在渠道页启用 key">无启用 key</span>' : ""}
     </div>
-    <div class="pin-chips"><span class="muted" style="font-size:11px">固定顺序：</span>${s.upstreams.map((k, i) => chipBtn("upstreams", i, k)).join("") || '<span class="muted" style="font-size:11px">（无——上游随机路由）</span>'}
-      <span class="muted" style="font-size:11px">排除：</span>${s.exclude.map((k, i) => chipBtn("exclude", i, k)).join("") || '<span class="muted" style="font-size:11px">（无）</span>'}</div>
-    ${knownChips ? `<div class="pin-chips"><span class="muted" style="font-size:11px">已知渠道（点击切换 固定→排除→移除）：</span>${knownChips}</div>` : ""}
-    <div class="pin-row"><input placeholder="手工添加渠道 slug…" style="width:200px" data-act="pin-slug" data-model="${esc(model)}">
-      <button class="btn small" data-act="pin-add-up" data-model="${esc(model)}">加为固定</button>
-      <button class="btn small" data-act="pin-add-ex" data-model="${esc(model)}">加为排除</button>
-      <span class="muted" style="font-size:11px" data-act="pin-validate-out" data-model="${esc(model)}"></span></div>
+    ${rows}
+    <div class="pin-row">
+      <input placeholder="添加模型 ID…" style="width:240px" data-act="pinp-model-input" data-ch="${esc(ch.id)}">
+      <button class="btn small" data-act="pinp-add-model" data-ch="${esc(ch.id)}">添加模型</button>
+      <span class="muted" style="font-size:11px">渠道未声明模型列表时可在此添加要固定的模型</span>
+    </div>
   </div>`;
 }
 
-// wirePinRows 绑定分区行内事件（innerHTML 重建后调用）。
-function wirePinRows() {
-  const wrap = $("#chUpstreamPins");
-  const modelOf = (el) => el.closest(".pin-model").dataset.model;
-  wrap.querySelectorAll('[data-act="pin-toggle"]').forEach((chip) => chip.addEventListener("click", () => {
-    const model = chip.dataset.model, slug = chip.dataset.slug;
-    const s = pinStateOf(model);
-    if (s.upstreams.includes(slug)) { s.upstreams = s.upstreams.filter((x) => x !== slug); s.exclude.push(slug); }
-    else if (s.exclude.includes(slug)) { s.exclude = s.exclude.filter((x) => x !== slug); }
-    else { s.upstreams.push(slug); }
-    pinsDirty = true;
-    renderUpstreamPins();
-  }));
-  wrap.querySelectorAll('[data-act="pin-remove"]').forEach((b) => b.addEventListener("click", () => {
-    const s = pinStateOf(modelOf(b));
-    s[b.dataset.list].splice(Number(b.dataset.idx), 1);
-    pinsDirty = true;
-    renderUpstreamPins();
-  }));
-  wrap.querySelectorAll('[data-act="pin-move"]').forEach((b) => b.addEventListener("click", () => {
-    const s = pinStateOf(modelOf(b));
-    const i = Number(b.dataset.idx), j = i + Number(b.dataset.dir);
-    [s.upstreams[i], s.upstreams[j]] = [s.upstreams[j], s.upstreams[i]];
-    pinsDirty = true;
-    renderUpstreamPins();
-  }));
-  wrap.querySelectorAll('[data-act="pin-mode"]').forEach((sel) => sel.addEventListener("change", () => {
-    pinStateOf(modelOf(sel)).mode = sel.value;
-    pinsDirty = true;
-  }));
-  wrap.querySelectorAll('[data-act="pin-sort"]').forEach((sel) => sel.addEventListener("change", () => {
-    pinStateOf(modelOf(sel)).sort = sel.value;
-    pinsDirty = true;
-  }));
-  wrap.querySelectorAll('[data-act="pin-add-up"], [data-act="pin-add-ex"]').forEach((b) => b.addEventListener("click", () => {
-    const model = b.dataset.model;
-    const input = wrap.querySelector(`.pin-model[data-model="${CSS.escape(model)}"] [data-act="pin-slug"]`);
-    const slug = (input.value || "").trim();
-    if (!slug) { toast("先输入渠道 slug", true); return; }
-    const s = pinStateOf(model);
-    if (b.dataset.act === "pin-add-up") {
-      s.exclude = s.exclude.filter((x) => x !== slug);
-      if (!s.upstreams.includes(slug)) s.upstreams.push(slug);
+// pinPageRowHTML 单个模型的固定配置行（改动即落盘）。
+function pinPageRowHTML(ch, model) {
+  const p = (ch.model_pins || {})[model] || {};
+  const upstreams = p.upstreams || [], exclude = p.exclude || [], known = p.known || [];
+  const configured = (upstreams.length || exclude.length || p.sort) ? '<span class="badge info" title="该模型已固定内部渠道，改动立即落盘生效">已配置</span>' : "";
+  const probeInfo = p.pipeline
+    ? `管线 <b>${esc(p.pipeline)}</b>${p.last_provider ? ` · 最近 <b>${esc(p.last_provider)}</b>` : ""}${p.probed_at ? ` · ${new Date(p.probed_at * 1000).toLocaleString()}` : ""}`
+    : "未探测";
+  const chipBtn = (list, i, slug) => {
+    const up = list === "upstreams" && i > 0 ? `<button class="chip-btn" data-act="pinp-move" data-ch="${esc(ch.id)}" data-model="${esc(model)}" data-idx="${i}" data-dir="-1" title="上移">↑</button>` : "";
+    const down = list === "upstreams" && i < upstreams.length - 1 ? `<button class="chip-btn" data-act="pinp-move" data-ch="${esc(ch.id)}" data-model="${esc(model)}" data-idx="${i}" data-dir="1" title="下移">↓</button>` : "";
+    return `<span class="chip">${esc(slug)}${up}${down}<button class="chip-btn" data-act="pinp-remove" data-ch="${esc(ch.id)}" data-model="${esc(model)}" data-list="${list}" data-idx="${i}" title="移除">×</button></span>`;
+  };
+  const allKnown = [...new Set([...known, ...upstreams, ...exclude])];
+  const knownChips = allKnown.map((k) => {
+    const cls = upstreams.includes(k) ? "info" : (exclude.includes(k) ? "warn" : "");
+    const tag = upstreams.includes(k) ? "固定" : (exclude.includes(k) ? "排除" : "未固定");
+    return `<span class="chip clickable" data-act="pinp-toggle" data-ch="${esc(ch.id)}" data-model="${esc(model)}" data-slug="${esc(k)}" title="点击在 固定→排除→移除 间切换（点击即落盘生效）"><span class="badge ${cls}">${esc(k)}</span><span class="muted" style="font-size:11px">${tag}</span></span>`;
+  }).join("");
+  return `<div class="pin-model" data-model="${esc(model)}">
+    <div class="pin-row">
+      <span class="rk-name">${esc(model)}</span> ${configured}
+      <select data-act="pinp-mode" data-ch="${esc(ch.id)}" data-model="${esc(model)}" style="width:auto" title="严格固定：按固定列表逐个独占尝试（only=[渠道]）；固定优先：一条请求给出完整 order，由上游按序自选">
+        <option value="strict" ${p.mode !== "preferred" ? "selected" : ""}>严格固定</option>
+        <option value="preferred" ${p.mode === "preferred" ? "selected" : ""}>固定优先（order）</option>
+      </select>
+      <select data-act="pinp-sort" data-ch="${esc(ch.id)}" data-model="${esc(model)}" style="width:auto" title="排序指标（direct 管线自动映射为 price/latency/throughput）">
+        <option value="">不排序</option>
+        <option value="cost" ${p.sort === "cost" ? "selected" : ""}>价格最低</option>
+        <option value="ttft" ${p.sort === "ttft" ? "selected" : ""}>首字最快</option>
+        <option value="tps" ${p.sort === "tps" ? "selected" : ""}>吞吐最高</option>
+      </select>
+      <button class="btn small" data-act="pinp-probe" data-ch="${esc(ch.id)}" data-model="${esc(model)}" title="发两条小请求：识别管线类型与实际服务的渠道，并把 only 钉到不存在渠道让上游报出全部可用渠道（立即落盘）">探测</button>
+      <button class="btn small" data-act="pinp-validate" data-ch="${esc(ch.id)}" data-model="${esc(model)}" title="对每个已知内部渠道发固定小请求，验证可用性">验证</button>
+      <button class="btn small danger" data-act="pinp-clear" data-ch="${esc(ch.id)}" data-model="${esc(model)}" title="清除该模型的固定配置（探测产物保留）">清除</button>
+      <span class="muted" style="font-size:11px" data-act="pinp-info" data-ch="${esc(ch.id)}" data-model="${esc(model)}">${probeInfo}</span>
+    </div>
+    <div class="pin-chips"><span class="muted" style="font-size:11px">固定顺序：</span>${upstreams.map((k, i) => chipBtn("upstreams", i, k)).join("") || '<span class="muted" style="font-size:11px">（无——上游随机路由）</span>'}
+      <span class="muted" style="font-size:11px">排除：</span>${exclude.map((k, i) => chipBtn("exclude", i, k)).join("") || '<span class="muted" style="font-size:11px">（无）</span>'}</div>
+    ${knownChips ? `<div class="pin-chips"><span class="muted" style="font-size:11px">已知渠道（点击切换 固定→排除→移除）：</span>${knownChips}</div>` : ""}
+    <div class="pin-row"><input placeholder="手工添加渠道 slug…" style="width:200px" data-act="pinp-slug" data-ch="${esc(ch.id)}" data-model="${esc(model)}">
+      <button class="btn small" data-act="pinp-add-up" data-ch="${esc(ch.id)}" data-model="${esc(model)}">加为固定</button>
+      <button class="btn small" data-act="pinp-add-ex" data-ch="${esc(ch.id)}" data-model="${esc(model)}">加为排除</button>
+      <span class="muted" style="font-size:11px" data-act="pinp-validate-out" data-ch="${esc(ch.id)}" data-model="${esc(model)}"></span></div>
+  </div>`;
+}
+
+// pinSavedPin 有内容的判定（与后端 normalize 一致）：任一字段非空即保留条目。
+function pinSavedPin(p) {
+  if (!p) return false;
+  return (p.upstreams || []).length > 0 || (p.exclude || []).length > 0 || !!p.sort ||
+    !!p.pipeline || (p.known || []).length > 0 || !!p.canonical_slug || !!p.last_provider || !!p.probed_at;
+}
+
+// applyPinState 把 model-pin 保存/探测结果写回本地 STATE 并重渲染（不整页刷新）。
+function applyPinState(chID, model, pin) {
+  const ch = ((STATE && STATE.channels) || []).find((c) => c.id === chID);
+  if (!ch) { renderPinPage(); return; }
+  ch.model_pins = ch.model_pins || {};
+  if (pinSavedPin(pin)) {
+    ch.model_pins[model] = pin;
+    pinExtras[chID] = (pinExtras[chID] || []).filter((m) => m !== model);
+  } else {
+    delete ch.model_pins[model];
+  }
+  renderPinPage();
+}
+
+// wirePinPage 绑定渠道固定页事件（innerHTML 重建后调用）。
+function wirePinPage() {
+  const wrap = $("#pinChannels");
+  const args = (el) => ({ ch: el.dataset.ch, model: el.dataset.model });
+  const slugInput = (chID, model) =>
+    wrap.querySelector(`.pin-model[data-model="${CSS.escape(model)}"] [data-act="pinp-slug"]`);
+
+  // 已知渠道 chip：固定→排除→移除 三态切换，每步立即落盘
+  wrap.querySelectorAll('[data-act="pinp-toggle"]').forEach((chip) => chip.addEventListener("click", async () => {
+    const { ch, model } = args(chip);
+    const slug = chip.dataset.slug;
+    const p = ((STATE.channels.find((c) => c.id === ch) || {}).model_pins || {})[model] || {};
+    const upstreams = [...(p.upstreams || [])], exclude = [...(p.exclude || [])];
+    let patch;
+    if (upstreams.includes(slug)) {
+      patch = { mode: p.mode || "strict", sort: p.sort || "", upstreams: upstreams.filter((x) => x !== slug), exclude: [...exclude, slug] };
+    } else if (exclude.includes(slug)) {
+      patch = { mode: p.mode || "strict", sort: p.sort || "", upstreams, exclude: exclude.filter((x) => x !== slug) };
     } else {
-      s.upstreams = s.upstreams.filter((x) => x !== slug);
-      if (!s.exclude.includes(slug)) s.exclude.push(slug);
+      patch = { mode: p.mode || "strict", sort: p.sort || "", upstreams: [...upstreams, slug], exclude };
     }
-    pinsDirty = true;
-    renderUpstreamPins();
+    try {
+      const r = await api("PUT", `/admin/api/channels/${ch}/model-pin`, { model, ...patch });
+      applyPinState(ch, model, r.pin);
+    } catch (e) { toast(e.message, true); }
   }));
-  // 探测：专用端点立即写库生效，并刷新该行的已知渠道与探测产物
-  wrap.querySelectorAll('[data-act="pin-probe"]').forEach((b) => b.addEventListener("click", async () => {
-    if (!editChannel.id) { toast("请先保存渠道（探测需要已保存的渠道与启用 key）", true); return; }
-    const model = b.dataset.model;
+  // 固定/排除 chips 的移除与排序
+  wrap.querySelectorAll('[data-act="pinp-remove"]').forEach((b) => b.addEventListener("click", async () => {
+    const { ch, model } = args(b);
+    const p = ((STATE.channels.find((c) => c.id === ch) || {}).model_pins || {})[model] || {};
+    const patch = { mode: p.mode || "strict", sort: p.sort || "", upstreams: [...(p.upstreams || [])], exclude: [...(p.exclude || [])] };
+    patch[b.dataset.list].splice(Number(b.dataset.idx), 1);
+    try {
+      const r = await api("PUT", `/admin/api/channels/${ch}/model-pin`, { model, ...patch });
+      applyPinState(ch, model, r.pin);
+    } catch (e) { toast(e.message, true); }
+  }));
+  wrap.querySelectorAll('[data-act="pinp-move"]').forEach((b) => b.addEventListener("click", async () => {
+    const { ch, model } = args(b);
+    const p = ((STATE.channels.find((c) => c.id === ch) || {}).model_pins || {})[model] || {};
+    const upstreams = [...(p.upstreams || [])];
+    const i = Number(b.dataset.idx), j = i + Number(b.dataset.dir);
+    [upstreams[i], upstreams[j]] = [upstreams[j], upstreams[i]];
+    try {
+      const r = await api("PUT", `/admin/api/channels/${ch}/model-pin`, { model, mode: p.mode || "strict", sort: p.sort || "", upstreams, exclude: [...(p.exclude || [])] });
+      applyPinState(ch, model, r.pin);
+    } catch (e) { toast(e.message, true); }
+  }));
+  // 模式 / 排序
+  wrap.querySelectorAll('[data-act="pinp-mode"]').forEach((sel) => sel.addEventListener("change", async () => {
+    const { ch, model } = args(sel);
+    const p = ((STATE.channels.find((c) => c.id === ch) || {}).model_pins || {})[model] || {};
+    try {
+      const r = await api("PUT", `/admin/api/channels/${ch}/model-pin`, { model, mode: sel.value, sort: p.sort || "", upstreams: [...(p.upstreams || [])], exclude: [...(p.exclude || [])] });
+      applyPinState(ch, model, r.pin);
+    } catch (e) { toast(e.message, true); }
+  }));
+  wrap.querySelectorAll('[data-act="pinp-sort"]').forEach((sel) => sel.addEventListener("change", async () => {
+    const { ch, model } = args(sel);
+    const p = ((STATE.channels.find((c) => c.id === ch) || {}).model_pins || {})[model] || {};
+    try {
+      const r = await api("PUT", `/admin/api/channels/${ch}/model-pin`, { model, mode: p.mode || "strict", sort: sel.value, upstreams: [...(p.upstreams || [])], exclude: [...(p.exclude || [])] });
+      applyPinState(ch, model, r.pin);
+    } catch (e) { toast(e.message, true); }
+  }));
+  // 手工 slug：加为固定 / 加为排除
+  wrap.querySelectorAll('[data-act="pinp-add-up"], [data-act="pinp-add-ex"]').forEach((b) => b.addEventListener("click", async () => {
+    const { ch, model } = args(b);
+    const slug = ((slugInput(ch, model) || {}).value || "").trim();
+    if (!slug) { toast("先输入渠道 slug", true); return; }
+    const p = ((STATE.channels.find((c) => c.id === ch) || {}).model_pins || {})[model] || {};
+    let upstreams = [...(p.upstreams || [])], exclude = [...(p.exclude || [])];
+    if (b.dataset.act === "pinp-add-up") { exclude = exclude.filter((x) => x !== slug); if (!upstreams.includes(slug)) upstreams.push(slug); }
+    else { upstreams = upstreams.filter((x) => x !== slug); if (!exclude.includes(slug)) exclude.push(slug); }
+    try {
+      const r = await api("PUT", `/admin/api/channels/${ch}/model-pin`, { model, mode: p.mode || "strict", sort: p.sort || "", upstreams, exclude });
+      applyPinState(ch, model, r.pin);
+    } catch (e) { toast(e.message, true); }
+  }));
+  // 清除该模型固定配置（探测产物保留）
+  wrap.querySelectorAll('[data-act="pinp-clear"]').forEach((b) => b.addEventListener("click", async () => {
+    const { ch, model } = args(b);
+    try {
+      const r = await api("PUT", `/admin/api/channels/${ch}/model-pin`, { model });
+      applyPinState(ch, model, r.pin);
+      toast("已清除该模型的固定配置");
+    } catch (e) { toast(e.message, true); }
+  }));
+  // 探测：识别管线 + 收割内部渠道清单（结果立即落盘）
+  wrap.querySelectorAll('[data-act="pinp-probe"]').forEach((b) => b.addEventListener("click", async () => {
+    const { ch, model } = args(b);
     b.disabled = true;
     try {
-      const r = await api("POST", `/admin/api/channels/${editChannel.id}/probe-upstreams`, { model });
-      toast(`探测完成：管线 ${r.pipeline || "未知"}，发现 ${r.known.length} 个内部渠道（已落盘生效）`);
+      const r = await api("POST", `/admin/api/channels/${ch}/probe-upstreams`, { model });
+      const n = (r.known || []).length;
+      if (n) toast(`探测完成：管线 ${r.pipeline || "未知"}，发现 ${n} 个内部渠道（已落盘）`);
+      else toast("探测完成，但未发现内部渠道——上游未点名可用渠道，可手工输入渠道 slug", true);
       await loadState();
-      editChannel = (STATE.channels || []).find((c) => c.id === editChannel.id) || editChannel;
-      const s = pinStateOf(model);
-      Object.assign(s, { pipeline: r.pipeline, canonical_slug: r.canonical_slug, last_provider: r.last_provider, probed_at: Math.floor(Date.now() / 1000) });
-      s.known = [...r.known];
-      renderUpstreamPins();
+      renderPinPage();
     } catch (e) { toast(e.message, true); }
     finally { b.disabled = false; }
   }));
   // 验证：逐渠道测试，结果展示在该行
-  wrap.querySelectorAll('[data-act="pin-validate"]').forEach((b) => b.addEventListener("click", async () => {
-    if (!editChannel.id) { toast("请先保存渠道（验证需要已保存的渠道与启用 key）", true); return; }
-    const model = b.dataset.model;
+  wrap.querySelectorAll('[data-act="pinp-validate"]').forEach((b) => b.addEventListener("click", async () => {
+    const { ch, model } = args(b);
     b.disabled = true;
-    const out = wrap.querySelector(`.pin-model[data-model="${CSS.escape(model)}"] [data-act="pin-validate-out"]`);
+    const out = wrap.querySelector(`.pin-model[data-model="${CSS.escape(model)}"] [data-act="pinp-validate-out"]`);
     const label = { ok: "可用", limited: "限流", bad: "不可用", auth: "鉴权失败", unknown: "未知" };
     try {
-      const r = await api("POST", `/admin/api/channels/${editChannel.id}/validate-upstreams`, { model });
+      const r = await api("POST", `/admin/api/channels/${ch}/validate-upstreams`, { model });
       if (out) out.innerHTML = r.results.map((x) =>
         `<span class="chip"><span class="badge ${x.status === "ok" ? "on" : (x.status === "limited" ? "warn" : "off")}">${label[x.status] || x.status}</span>${esc(x.upstream)} ${x.ms}ms</span>`).join("");
     } catch (e) { toast(e.message, true); }
     finally { b.disabled = false; }
   }));
-  wrap.querySelector('[data-act="pin-add-model"]').addEventListener("click", () => {
-    const m = ($("#pinNewModel").value || "").trim();
-    if (!m) return;
-    pinStateOf(m);
-    pinsDirty = true;
-    renderUpstreamPins();
-  });
+  // 手工添加模型行（渠道未声明模型列表时）
+  wrap.querySelectorAll('[data-act="pinp-add-model"]').forEach((b) => b.addEventListener("click", () => {
+    const chID = b.dataset.ch;
+    const input = wrap.querySelector(`[data-act="pinp-model-input"][data-ch="${CSS.escape(chID)}"]`);
+    const model = (input.value || "").trim();
+    if (!model) { toast("先输入模型 ID", true); return; }
+    pinExtras[chID] = [...new Set([...(pinExtras[chID] || []), model])];
+    renderPinPage();
+  }));
 }
+
+$("#pinPageRefreshBtn").addEventListener("click", async () => {
+  try { await loadState(); renderPinPage(); toast("已刷新"); }
+  catch (e) { toast(e.message, true); }
+});
 
 // 代理池查找：按 ID（新格式引用）或 URL（旧内联格式）→ 池实体
 function poolById(id) { return ((STATE && STATE.proxy_pools) || []).find((p) => p.id === id); }
@@ -718,10 +779,6 @@ function openChannelEditor(ch) {
   renderKeyBlocks(ch.keys || []);
   renderModelChips();
   renderCoolingKeys(ch);
-  // 内部渠道固定草稿：懒加载继承已保存配置，随「保存渠道」一并落盘
-  pinsDraft = {};
-  pinsDirty = false;
-  renderUpstreamPins();
   $("#channelErr").textContent = "";
   $("#channelModal").classList.remove("hidden");
 }
@@ -837,7 +894,7 @@ function renderModelChips() {
     `<span class="chip">${esc(m)}${freeModelSet.has(m) ? '<i class="badge free">免费</i>' : ""}</span>`
   ).join("") || '<span class="muted" style="font-size:12px">（暂无模型：可手工填写，或保存后点「从上游拉取模型列表」）</span>';
 }
-$("#chModels").addEventListener("input", () => { renderModelChips(); renderUpstreamPins(); freeModelSet = new Set(); });
+$("#chModels").addEventListener("input", () => { renderModelChips(); freeModelSet = new Set(); });
 
 // ---- 弹窗通用交互：Esc 关闭、点击遮罩关闭 ----
 // 模态框统一由 .modal 容器承载；除内容卡片外的区域即遮罩。
@@ -1131,7 +1188,6 @@ $("#fetchApplyBtn").addEventListener("click", () => {
   $("#chModels").value = merged.join("\n");
   freeModelSet = fetchedFreeSet;
   renderModelChips();
-  renderUpstreamPins();
   $("#fetchPanel").classList.add("hidden");
   toast(`已启用 ${chosen.length} 个模型，请点「保存」写入配置`);
 });
@@ -1179,16 +1235,11 @@ function collectChannelForm() {
   const models = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
   const keys = $$("#chKeys .keyblock").map(collectKeyForm);
   const chProxy = collectChannelProxy();
+  // 内部渠道固定不在此编辑（独立「渠道固定」页）：保存渠道时原样携带，
+  // 避免整体替换渠道时清空已配置的 model_pins
   const modelPins = {};
-  const savedPins = editChannel.model_pins || {};
-  for (const [m, p] of Object.entries(savedPins)) {
-    if (p && (p.upstreams || []).length || (p.exclude || []).length || p.sort || p.pipeline || (p.known || []).length) {
-      modelPins[m] = JSON.parse(JSON.stringify(p));
-    }
-  }
-  for (const [m, d] of Object.entries(pinsDraft || {})) {
-    const has = (d.upstreams || []).length || (d.exclude || []).length || d.sort || d.pipeline || (d.known || []).length;
-    if (has) modelPins[m] = { ...modelPins[m], ...JSON.parse(JSON.stringify(d)) };
+  for (const [m, p] of Object.entries(editChannel.model_pins || {})) {
+    if (p) modelPins[m] = JSON.parse(JSON.stringify(p));
   }
   return {
     id: editChannel.id || "",

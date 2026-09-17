@@ -25,6 +25,7 @@
     <div class="brand">UniGate <span class="muted">通用网关</span></div>
     <nav class="tabs">
       <button data-tab="channels" class="tab active">渠道</button>
+      <button data-tab="pin" class="tab">渠道固定</button>
       <button data-tab="route" class="tab">路由</button>
       <button data-tab="test" class="tab">渠道测试</button>
       <button data-tab="gwkeys" class="tab">通用密钥</button>
@@ -54,7 +55,22 @@
     </section>
 
     <!-- 路由 -->
-    <section id="tab-route" class="tabpane hidden">
+    <section id="tab-pin" class="tabpane hidden">
+  <div class="row">
+    <h2>渠道固定</h2>
+    <button id="pinPageRefreshBtn" class="btn">刷新</button>
+  </div>
+  <p class="muted" style="margin:0 0 12px">
+    上游网关的一个模型可能内置多个上游渠道（如 Cline Pass 的 glm 背后随机路由到
+    alibaba/baseten 等）。这里为每个渠道的每个模型把请求钉到固定内部渠道：
+    <b>严格固定</b>按固定列表逐个独占尝试（注入 <code>provider.only</code> 或
+    <code>providerOptions.gateway.only</code>），<b>固定优先</b>注入完整 order 优先序。
+    「探测」发现该上游内置渠道清单并立即落盘，「验证」逐渠道测试；所有改动立即落盘生效。
+  </p>
+  <div id="pinChannels" class="route-list"></div>
+</section>
+
+<section id="tab-route" class="tabpane hidden">
       <div class="row">
         <h2>路由</h2>
         <label class="inline" title="渠道未显式配置「账号调度」时使用的默认模式（保存后立即生效，渠道可单独覆盖）：
@@ -309,13 +325,6 @@
         </div>
       </div>
       <div id="chModelList" class="chips"></div>
-      <div id="chPinSection" style="margin-top:10px">
-        <div class="row" style="margin-bottom:2px">
-          <b style="font-size:14px">内部渠道固定（按模型）</b>
-          <span class="muted" style="font-size:12px">上游一个模型可能内置多个上游渠道、请求时随机路由；下面为每个模型单独固定内部渠道（严格固定=逐个独占尝试，固定优先=order 优先序）。「探测」发现该上游内置渠道清单并立即落盘，「验证」逐渠道测试；固定列表随本弹窗「保存」一并写入配置。</span>
-        </div>
-        <div id="chUpstreamPins"></div>
-      </div>
       <div id="fetchPanel" class="fetch-panel hidden">
         <div class="fetch-panel-head">
           <span class="muted" style="font-size:12px">候选模型（勾选启用，默认勾选当前已启用项）</span>

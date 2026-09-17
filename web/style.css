@@ -138,6 +138,15 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 }
 .chip.clickable { cursor: pointer; }
 .chip.clickable:hover { border-color: var(--accent); color: var(--accent); }
+/* 内部渠道固定编辑器（渠道页弹窗） */
+.pin-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pin-row label.inline { margin: 0; }
+.pin-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-height: 24px; margin: 4px 0; }
+.chip-btn {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font: inherit; font-size: 12px; padding: 0 3px; border-radius: 4px;
+}
+.chip-btn:hover { color: var(--text); background: var(--border); }
 /* 测试清单中已选中的模型 chip：高亮并标记可移除 */
 .chip-on { border-color: var(--accent); color: var(--accent); background: rgba(79,140,255,.12); }
 

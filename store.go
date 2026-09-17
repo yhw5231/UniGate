@@ -137,21 +137,22 @@ type UpKey struct {
 
 // Channel 一个上游渠道（OpenAI 兼容供应商）。
 type Channel struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	Group         string            `json:"group,omitempty"`          // 自定义分组标签（仅用于 WebUI 归类/过滤，空为未分组）
-	BaseURL       string            `json:"base_url"`                 // 如 https://api.cline.bot/api/v1
-	EndpointType  string            `json:"endpoint_type,omitempty"`  // 上游对话端点类型："chat"（默认，/chat/completions）；"responses"（OpenAI Responses API /responses）
-	ModelsURL     string            `json:"models_url,omitempty"`     // 模型列表端点；默认 BaseURL + /models
-	Models        []string          `json:"models,omitempty"`         // 静态模型列表（用于 /v1/models 聚合与路由过滤）
-	Headers       map[string]string `json:"headers,omitempty"`        // 渠道级自定义请求头
-	Rewrite       bool              `json:"rewrite_reasoning"`        // reasoning -> reasoning_content 改写（Cline 等需要）
-	CooldownScope string            `json:"cooldown_scope,omitempty"` // 冷却粒度："" / "key" 按 key 跨模型共享（默认）；"key_model" 按 (key,model)
-	Schedule      string            `json:"schedule,omitempty"`       // 账号调度："" 跟随全局默认；"failover" 故障转移；"round_robin" 顺序轮询
-	AutoProbe     bool              `json:"auto_probe,omitempty"`     // 自动探测：key 冷却恢复时、正常状态连续 8h 无调用时，自动发加法题验证账号状态（probe.go）
-	Proxy         *ProxySpec        `json:"proxy,omitempty"`          // 渠道级代理（如代理池）：未单独配置代理的 key 全部继承，每个 key 独立租约/出口 IP
-	Enabled       bool              `json:"enabled"`
-	Keys          []*UpKey          `json:"keys"`
+	ID            string                       `json:"id"`
+	Name          string                       `json:"name"`
+	Group         string                       `json:"group,omitempty"`          // 自定义分组标签（仅用于 WebUI 归类/过滤，空为未分组）
+	BaseURL       string                       `json:"base_url"`                 // 如 https://api.cline.bot/api/v1
+	EndpointType  string                       `json:"endpoint_type,omitempty"`  // 上游对话端点类型："chat"（默认，/chat/completions）；"responses"（OpenAI Responses API /responses）
+	ModelsURL     string                       `json:"models_url,omitempty"`     // 模型列表端点；默认 BaseURL + /models
+	Models        []string                     `json:"models,omitempty"`         // 静态模型列表（用于 /v1/models 聚合与路由过滤）
+	Headers       map[string]string            `json:"headers,omitempty"`        // 渠道级自定义请求头
+	Rewrite       bool                         `json:"rewrite_reasoning"`        // reasoning -> reasoning_content 改写（Cline 等需要）
+	CooldownScope string                       `json:"cooldown_scope,omitempty"` // 冷却粒度："" / "key" 按 key 跨模型共享（默认）；"key_model" 按 (key,model)
+	Schedule      string                       `json:"schedule,omitempty"`       // 账号调度："" 跟随全局默认；"failover" 故障转移；"round_robin" 顺序轮询
+	AutoProbe     bool                         `json:"auto_probe,omitempty"`     // 自动探测：key 冷却恢复时、正常状态连续 8h 无调用时，自动发加法题验证账号状态（probe.go）
+	Proxy         *ProxySpec                   `json:"proxy,omitempty"`          // 渠道级代理（如代理池）：未单独配置代理的 key 全部继承，每个 key 独立租约/出口 IP
+	ModelPins     map[string]*ModelUpstreamPin `json:"model_pins,omitempty"`     // 模型 → 上游内部渠道固定（upstreampin.go）
+	Enabled       bool                         `json:"enabled"`
+	Keys          []*UpKey                     `json:"keys"`
 }
 
 // endpointChat / endpointResponses 渠道对话端点类型。
@@ -345,6 +346,80 @@ func (c *Channel) keyByID(id string) *UpKey {
 		}
 	}
 	return nil
+}
+
+// 上游渠道内部的模型固定模式（对标 dsh-cline-pass 的 pinMode）。
+const (
+	upstreamPinPreferred = "preferred" // 优先序：一条请求内给出完整 order，上游按序自选
+	upstreamPinStrict    = "strict"    // 严格（默认）：按固定列表逐个内部渠道独占尝试（only=[u]）
+)
+
+// 上游管线类型（探测识别）：注入固定字段的写法因管线而异。
+const (
+	pipelineDirect  = "direct"  // OpenRouter 型：顶层 provider.only/order/sort
+	pipelinePlanner = "planner" // Vercel AI Gateway 型：providerOptions.gateway.only/order/sort
+)
+
+// normalizeUpstreamPinMode 归一化固定模式（"" 视为 strict，与 dsh-cline-pass 默认一致）。
+func normalizeUpstreamPinMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), upstreamPinPreferred) {
+		return upstreamPinPreferred
+	}
+	return upstreamPinStrict
+}
+
+// ModelUpstreamPin 单个上游渠道内、单个模型的「内部渠道固定」配置。
+// 上游网关（如 Cline Pass）的一个模型背后常内置多个上游渠道（provider），
+// 请求时由上游随机路由；此配置让网关在转发该渠道的该模型请求时注入
+// provider（direct 管线）或 providerOptions.gateway（planner 管线）字段，
+// 把上游钉到固定渠道：strict 按列表逐个独占尝试（only=[u]），preferred 给出
+// 完整优先序（order）。Upstreams/Exclude/Sort 为用户配置，其余为探测产物
+// （探测可随时重建，持久化只为 WebUI 展示与勾选）。
+type ModelUpstreamPin struct {
+	Upstreams []string `json:"upstreams,omitempty"` // 固定的内部渠道（provider slug）有序表
+	Exclude   []string `json:"exclude,omitempty"`   // 排除的内部渠道（编译进 allowlist，上游不认 exclude 字段）
+	Mode      string   `json:"mode,omitempty"`      // strict（默认）/ preferred
+	Sort      string   `json:"sort,omitempty"`      // cost / ttft / tps（direct 管线映射 price/latency/throughput），空 = 不排序
+
+	// ---- 探测产物 ----
+	Pipeline      string   `json:"pipeline,omitempty"`       // direct / planner（"" = 未探测或不支持）
+	Known         []string `json:"known,omitempty"`          // 探测发现的全部内部渠道
+	CanonicalSlug string   `json:"canonical_slug,omitempty"` // 上游的规范模型 slug
+	LastProvider  string   `json:"last_provider,omitempty"`  // 最近一次探测实际服务的内部渠道
+	ProbedAt      int64    `json:"probed_at,omitempty"`      // 最近探测时间（unix 秒）
+}
+
+// normalize 清理固定配置：去重保序、mode/sort 归一化。全部字段为空时返回 false
+//（调用方据此删除该条目）。
+func (p *ModelUpstreamPin) normalize() bool {
+	p.Mode = normalizeUpstreamPinMode(p.Mode)
+	p.Upstreams = normalizeModelList(p.Upstreams)
+	p.Exclude = normalizeModelList(p.Exclude)
+	p.Known = normalizeModelList(p.Known)
+	p.Pipeline = strings.TrimSpace(p.Pipeline)
+	if p.Pipeline != pipelineDirect && p.Pipeline != pipelinePlanner {
+		p.Pipeline = ""
+	}
+	p.CanonicalSlug = strings.TrimSpace(p.CanonicalSlug)
+	p.LastProvider = strings.TrimSpace(p.LastProvider)
+	switch strings.ToLower(strings.TrimSpace(p.Sort)) {
+	case "":
+		p.Sort = ""
+	case "none":
+		p.Sort = ""
+	default:
+		p.Sort = strings.ToLower(strings.TrimSpace(p.Sort))
+	}
+	return len(p.Upstreams) > 0 || len(p.Exclude) > 0 || p.Sort != "" ||
+		p.Pipeline != "" || len(p.Known) > 0 || p.CanonicalSlug != "" || p.LastProvider != ""
+}
+
+// upstreamPinFor 返回该渠道上某模型的固定配置（无则 nil）。
+func (c *Channel) upstreamPinFor(model string) *ModelUpstreamPin {
+	if c == nil || model == "" {
+		return nil
+	}
+	return c.ModelPins[model]
 }
 
 // GWKey 下游通用 key（供客户端调用本网关）。
@@ -604,6 +679,15 @@ func normalizeChannel(ch *Channel) error {
 	if ch.Keys == nil {
 		ch.Keys = []*UpKey{}
 	}
+	// 模型固定配置归一化：非法/全空的条目直接删除
+	for m, p := range ch.ModelPins {
+		if p == nil || !p.normalize() {
+			delete(ch.ModelPins, m)
+		}
+	}
+	if len(ch.ModelPins) == 0 {
+		ch.ModelPins = nil
+	}
 	for _, k := range ch.Keys {
 		if err := normalizeUpKey(k); err != nil {
 			return fmt.Errorf("key %q: %w", k.Name, err)
@@ -858,6 +942,8 @@ func (s *GatewayStore) PutSettings(set *GatewaySettings) error {
 	s.data.Settings = set
 	return s.saveLocked()
 }
+
+// PutModelPin 已移除：模型固定上游渠道改挂在渠道上（见 Channel.ModelPins 与 upstreampin.go）。
 
 // FindUpKey 按 keyID 全局查找（返回渠道 + key 快照）。
 func (s *GatewayStore) FindUpKey(keyID string) (*Channel, *UpKey, bool) {

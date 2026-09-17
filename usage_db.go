@@ -192,16 +192,20 @@ func (db *UsageDB) Cleanup() {
 }
 
 // cleanupLocked 丢弃保留期外事件，并裁剪到 maxRecords（调用方需持锁）。
+// 保留期清理走 time 索引；条数上限裁剪用 id 阈值（AUTOINCREMENT 单调递增，
+// 插入序即时间序）：DELETE WHERE id <= max(id)-N 是索引范围删除，代价与删除
+// 行数成正比。原 `NOT IN (SELECT ... ORDER BY time DESC LIMIT N)` 写法在近满
+// 表上每次清理都要全表扫描（十万行级、数百毫秒），而清理持有数据库互斥锁，
+// 期间所有请求的日志写入都被阻塞——用量表越满、服务器越卡。
 func (db *UsageDB) cleanupLocked() {
 	if db.db == nil {
 		return
 	}
 	cutoff := time.Now().AddDate(0, 0, -db.retentionDays).UnixNano()
 	_, _ = db.db.Exec(`DELETE FROM usage_events WHERE time < ?`, cutoff)
-	// 只保留最近 maxRecords 条（按 time 降序取前 N，删除其余）
 	if db.maxRecords > 0 {
-		_, _ = db.db.Exec(`DELETE FROM usage_events WHERE id NOT IN (
-			SELECT id FROM usage_events ORDER BY time DESC, id DESC LIMIT ?)`, db.maxRecords)
+		_, _ = db.db.Exec(`DELETE FROM usage_events WHERE id <=
+			(SELECT COALESCE(MAX(id),0) FROM usage_events) - ?`, int64(db.maxRecords))
 	}
 }
 

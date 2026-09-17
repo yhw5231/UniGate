@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -88,15 +89,27 @@ func verifyToken(token string) (string, error) {
 }
 
 // secret 返回签名密钥：优先 TOKEN_SECRET，否则进程内随机密钥。
+// 文件密钥只读一次并缓存（密钥文件运行期不会变化；此前每次验证 token 都读
+// 一次盘，高 QPS 下是无谓的磁盘 IO 放大）。
 func secret() string {
-	if s := getenv("TOKEN_SECRET", ""); s != "" {
-		return s
-	}
-	if s, err := loadOrCreateTokenSecret(cfg.TokenSecretPath); err == nil {
-		return s
-	}
-	return defaultTokenSecret
+	secretOnce.Do(func() {
+		if s := getenv("TOKEN_SECRET", ""); s != "" {
+			cachedSecret = s
+			return
+		}
+		if s, err := loadOrCreateTokenSecret(cfg.TokenSecretPath); err == nil {
+			cachedSecret = s
+			return
+		}
+		cachedSecret = defaultTokenSecret
+	})
+	return cachedSecret
 }
+
+var (
+	secretOnce   sync.Once
+	cachedSecret string
+)
 
 // handleLogin 处理 POST /login。连续失败达阈值后按用户名/IP 锁定（429）。
 func handleLogin(w http.ResponseWriter, r *http.Request) {

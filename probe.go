@@ -64,8 +64,13 @@ func activityKey(keyID, model string) string {
 	return keyID + "\x00" + model
 }
 
-// noteAt 记录 key 的调用时刻（note 的可注入时间版本，测试用）。model 非空时
-// 同时刷新 key 级与 (key, model) 级计时。
+// activityMaxEntries 计时线条目软阈值：越过时做一次维护（清理长时间未更新的
+// 计时线，仍超则随机逐出到一半）。model 部分来自请求体里的任意字符串（下游
+// 可对一个 gw key 发无限不同的模型名），不做上限的话表随请求多样性无限增长。
+// 逐出到一半（而非逐出一条）保证维护以摊销 O(1)/写入 的成本触发；基线丢失
+// 只是让空闲探测重新建立计时起点，无副作用。
+const activityMaxEntries = 65536
+
 func (a *keyActivity) noteAt(keyID, model string, t time.Time) {
 	if keyID == "" {
 		return
@@ -75,6 +80,32 @@ func (a *keyActivity) noteAt(keyID, model string, t time.Time) {
 	a.last[keyID] = t
 	if model != "" {
 		a.last[activityKey(keyID, model)] = t
+	}
+	if len(a.last) <= activityMaxEntries {
+		return
+	}
+	a.pruneLocked(t)
+	if n := len(a.last); n > activityMaxEntries {
+		target := n / 2
+		for k := range a.last {
+			if len(a.last) <= target {
+				break
+			}
+			delete(a.last, k)
+		}
+	}
+}
+
+// pruneLocked 清理长时间未更新的计时线（调用方持锁）。
+func (a *keyActivity) pruneLocked(now time.Time) {
+	cut := now.Add(-24 * time.Hour)
+	if idle := currentPolicy().ProbeIdleInterval; idle > 24*time.Hour {
+		cut = now.Add(-2 * idle)
+	}
+	for k, t := range a.last {
+		if t.Before(cut) {
+			delete(a.last, k)
+		}
 	}
 }
 

@@ -20,6 +20,13 @@ type loginLockout struct {
 	until    time.Time // 锁定到期（零值 = 未锁定）
 }
 
+// loginThrottleMax 防爆破表条目软阈值：越过时做一次维护（过期清理 + 必要时
+// 随机逐出到一半）。公网暴露时撞库者常伪造 X-Real-IP 轮换来源 IP，每个新
+// IP 都建条目且无后续查询触发惰性清理——不设上限的话表随时间无限增长。
+// 逐出到一半（而非逐出一条）保证维护以摊销 O(1)/写入 的成本触发；逐出
+// 等价于重置该来源的失败计数（放宽限流），安全上是可接受的精度损失。
+const loginThrottleMax = 10000
+
 // loginThrottle 登录防爆破表。
 type loginThrottle struct {
 	mu    sync.Mutex
@@ -78,6 +85,29 @@ func (t *loginThrottle) fail(key string) {
 		d = time.Hour
 	}
 	e.until = now.Add(d)
+	// 防膨胀（见 loginThrottleMax）：清理过期条目，仍超则随机逐出到一半
+	if len(t.state) <= loginThrottleMax {
+		return
+	}
+	t.sweepLocked(now)
+	if n := len(t.state); n > loginThrottleMax {
+		target := n / 2
+		for k := range t.state {
+			if len(t.state) <= target {
+				break
+			}
+			delete(t.state, k)
+		}
+	}
+}
+
+// sweepLocked 清理已过期（既未锁定、计数窗口也结束）的条目（调用方持锁）。
+func (t *loginThrottle) sweepLocked(now time.Time) {
+	for k, e := range t.state {
+		if now.After(e.until) && e.windowAt.Add(cfg.LoginFailWindow).Before(now) {
+			delete(t.state, k)
+		}
+	}
 }
 
 // ok 清除计数（登录成功）。

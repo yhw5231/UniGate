@@ -424,9 +424,16 @@ func (m *LeaseManager) groupOnLeaseLocked(poolURL, leaseID, group, excludeKey st
 	return false
 }
 
-// recordAssignLocked 记录/覆盖分配（调用方持有写锁）。
+// recordAssignLocked 记录/覆盖分配（调用方持有写锁）。内容未变化时不落盘：
+// 此前每次 Ensure（即每个走池请求）都会重写分配表文件（JSON 序列化 + 临时
+// 文件 + rename），持锁做同步磁盘 IO，高并发下把全部走池请求串行在磁盘上。
 func (m *LeaseManager) recordAssignLocked(poolURL, keyID, leaseID, group string, shared bool) {
-	m.assigns[assignKey(poolURL, keyID)] = &leaseAssign{LeaseID: leaseID, Group: group, Shared: shared}
+	k := assignKey(poolURL, keyID)
+	if a, ok := m.assigns[k]; ok &&
+		a.LeaseID == leaseID && a.Group == group && a.Shared == shared {
+		return
+	}
+	m.assigns[k] = &leaseAssign{LeaseID: leaseID, Group: group, Shared: shared}
 	m.saveAssignsLocked()
 }
 

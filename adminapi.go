@@ -34,6 +34,9 @@ func adminAPIHandler() http.Handler {
 	mux.HandleFunc("POST /admin/api/cooling/clear-model", handleAdminClearCoolingModel)
 	mux.HandleFunc("POST /admin/api/cooling/clear-all", handleAdminClearCoolingAll)
 	mux.HandleFunc("GET /admin/api/route", handleAdminRoute)
+	mux.HandleFunc("PUT /admin/api/channels/{id}/model-pin", handleAdminPutModelUpstreamPin)
+	mux.HandleFunc("POST /admin/api/channels/{id}/probe-upstreams", handleAdminProbeUpstreams)
+	mux.HandleFunc("POST /admin/api/channels/{id}/validate-upstreams", handleAdminValidateUpstreams)
 	mux.HandleFunc("POST /admin/api/channels/{id}/fetch-models", handleAdminFetchModels)
 	mux.HandleFunc("GET /admin/api/requests", handleAdminRequests)
 	mux.HandleFunc("GET /admin/api/errors", handleAdminErrors)
@@ -196,6 +199,277 @@ func handleAdminClearCoolingAll(w http.ResponseWriter, r *http.Request) {
 // 可带 ?model=xxx 只看单个模型。
 func handleAdminRoute(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, routeStatusData(strings.TrimSpace(r.URL.Query().Get("model"))))
+}
+
+// ---- 上游内部渠道固定（upstreampin.go）----
+
+// upstreamPinBody PUT /admin/api/channels/{id}/model-pin 的请求体。
+// upstreams/exclude/sort 全空 = 清除该模型的固定配置（保留探测产物）。
+type upstreamPinBody struct {
+	Model     string   `json:"model"`
+	Mode      string   `json:"mode,omitempty"`      // strict（默认）/ preferred
+	Upstreams []string `json:"upstreams,omitempty"` // 固定的内部渠道有序表
+	Exclude   []string `json:"exclude,omitempty"`   // 排除的内部渠道
+	Sort      string   `json:"sort,omitempty"`      // cost / ttft / tps / none
+}
+
+// pinChannelForModel 取出渠道快照并校验支持内部渠道固定（chat 端点、模型非空）。
+func pinChannelForModel(w http.ResponseWriter, channelID, model string) (*Channel, bool) {
+	ch := findChannel(channelID)
+	if ch == nil {
+		writeJSONError(w, http.StatusNotFound, "channel not found", "not_found")
+		return nil, false
+	}
+	if ch.EndpointType == endpointResponses {
+		writeJSONError(w, http.StatusBadRequest, "responses 端点渠道不支持内部渠道固定（探测/注入只适用于 chat 端点）", "bad_request")
+		return nil, false
+	}
+	if strings.TrimSpace(model) == "" {
+		writeJSONError(w, http.StatusBadRequest, "model required", "bad_request")
+		return nil, false
+	}
+	return ch, true
+}
+
+// pickChannelKey 指定 key 或第一个启用的 key（无则 nil）。
+func pickChannelKey(ch *Channel, keyID string) *UpKey {
+	if keyID != "" {
+		return ch.keyByID(keyID)
+	}
+	for _, k := range ch.Keys {
+		if k.Enabled {
+			return k
+		}
+	}
+	return nil
+}
+
+// handleAdminPutModelUpstreamPin 保存/清除渠道上某模型的内部渠道固定配置：
+// body {model, mode, upstreams, exclude, sort}（upstreams/exclude/sort 全空 = 清除，
+// 探测产物保留）。保存立即生效（路由每请求实时取快照）。
+func handleAdminPutModelUpstreamPin(w http.ResponseWriter, r *http.Request) {
+	var body upstreamPinBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
+		return
+	}
+	ch, ok := pinChannelForModel(w, r.PathValue("id"), body.Model)
+	if !ok {
+		return
+	}
+	model := strings.TrimSpace(body.Model)
+	if ch.ModelPins == nil {
+		ch.ModelPins = map[string]*ModelUpstreamPin{}
+	}
+	pin := ch.ModelPins[model]
+	if pin == nil {
+		pin = &ModelUpstreamPin{}
+	}
+	cleared := len(body.Upstreams) == 0 && len(body.Exclude) == 0 && strings.TrimSpace(body.Sort) == ""
+	if cleared {
+		// 清除固定配置，保留探测产物
+		pin.Upstreams, pin.Exclude, pin.Sort = nil, nil, ""
+	} else {
+		pin.Mode = normalizeUpstreamPinMode(body.Mode)
+		pin.Upstreams = normalizeModelList(body.Upstreams)
+		pin.Exclude = normalizeModelList(body.Exclude)
+		pin.Sort = normalizeSortValue(body.Sort)
+	}
+	if pin.normalize() {
+		ch.ModelPins[model] = pin
+	} else {
+		delete(ch.ModelPins, model)
+	}
+	if err := store.PutChannel(ch); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
+		return
+	}
+	log.Printf("admin upstream pin %s: channel %q model %q mode=%s pinned=%v excluded=%v",
+		map[bool]string{true: "cleared", false: "saved"}[cleared],
+		ch.Name, model, pin.Mode, pin.Upstreams, pin.Exclude)
+	writeJSON(w, http.StatusOK, map[string]any{"channel_id": ch.ID, "model": model, "pin": pin})
+}
+
+// handleAdminProbeUpstreams 探测渠道上某模型的内部渠道：
+// body {model, key_id?}。发两条小请求——正常请求读 routing（管线类型/实际
+// 服务渠道），only 钉到 __probe__ 的请求从上游报错里收割全部可用渠道；
+// 结果写回渠道的 ModelPins 探测产物（固定配置原样保留）。
+func handleAdminProbeUpstreams(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Model string `json:"model"`
+		KeyID string `json:"key_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
+		return
+	}
+	ch, ok := pinChannelForModel(w, r.PathValue("id"), body.Model)
+	if !ok {
+		return
+	}
+	k := pickChannelKey(ch, strings.TrimSpace(body.KeyID))
+	if k == nil {
+		writeJSONError(w, http.StatusBadRequest, "channel has no enabled key", "bad_request")
+		return
+	}
+	model := strings.TrimSpace(body.Model)
+	pin, err := probeChannelModel(ch, k, model)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "probe failed: "+err.Error(), "upstream_error")
+		return
+	}
+	if ch.ModelPins == nil {
+		ch.ModelPins = map[string]*ModelUpstreamPin{}
+	}
+	ch.ModelPins[model] = pin
+	if err := store.PutChannel(ch); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "save channel: "+err.Error(), "internal")
+		return
+	}
+	log.Printf("admin probed upstreams: channel %q model %q pipeline=%s last=%s known=%v",
+		ch.Name, model, pin.Pipeline, pin.LastProvider, pin.Known)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"channel_id":     ch.ID,
+		"model":          model,
+		"pipeline":       pin.Pipeline,
+		"canonical_slug": pin.CanonicalSlug,
+		"last_provider":  pin.LastProvider,
+		"known":          pin.Known,
+		"pin":            pin,
+	})
+}
+
+// handleAdminValidateUpstreams 逐个测试内部渠道：body {model, key_id?,
+// upstreams?}（缺省用探测到的 Known）。每个渠道发一条 only=[u] 的小请求，
+// 按上游响应分类（ok/limited/bad/auth/unknown），结果随响应返回不落盘。
+func handleAdminValidateUpstreams(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Model     string   `json:"model"`
+		KeyID     string   `json:"key_id"`
+		Upstreams []string `json:"upstreams,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
+		return
+	}
+	ch, ok := pinChannelForModel(w, r.PathValue("id"), body.Model)
+	if !ok {
+		return
+	}
+	k := pickChannelKey(ch, strings.TrimSpace(body.KeyID))
+	if k == nil {
+		writeJSONError(w, http.StatusBadRequest, "channel has no enabled key", "bad_request")
+		return
+	}
+	model := strings.TrimSpace(body.Model)
+	pin := ch.upstreamPinFor(model)
+	targets := normalizeModelList(body.Upstreams)
+	if len(targets) == 0 && pin != nil {
+		targets = pin.Known
+	}
+	if len(targets) == 0 {
+		targets = pin.Upstreams
+	}
+	if len(targets) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "no known upstreams; run probe first or pass upstreams", "bad_request")
+		return
+	}
+	pipeline := ""
+	if pin != nil {
+		pipeline = pin.Pipeline
+	}
+	results := make([]map[string]any, 0, len(targets))
+	summary := map[string]int{}
+	for _, u := range targets {
+		res := validateUpstream(ch, k, model, pipeline, u)
+		results = append(results, res)
+		summary[res["status"].(string)]++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"channel_id": ch.ID,
+		"model":      model,
+		"results":    results,
+		"summary":    summary,
+	})
+}
+
+// validateUpstream 用 only=[u] 的小请求测试单个内部渠道并分类结果。
+func validateUpstream(ch *Channel, k *UpKey, model, pipeline, upstream string) map[string]any {
+	reqBody := injectUpstreamPin(probeRequestBody(model, "hi"), pipeline, upstream, nil, "", nil)
+	if reqBody == nil {
+		reqBody = probeRequestBody(model, "hi")
+	}
+	cand := candidate{ch: ch, k: k}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.TestTimeout)
+	defer cancel()
+	start := time.Now()
+	ans, err := sendProbeChat(ctx, &cand, reqBody)
+	ms := time.Since(start).Milliseconds()
+	res := map[string]any{"upstream": upstream, "ms": ms}
+	if err != nil {
+		res["status"] = "unknown"
+		res["note"] = truncate(err.Error(), 200)
+		return res
+	}
+	status, note := classifyUpstreamResponse(ans)
+	res["status"] = status
+	if note != "" {
+		res["note"] = truncate(note, 200)
+	}
+	return res
+}
+
+// classifyUpstreamResponse 按（可能错误的）响应体分类内部渠道状态
+// （对标 dsh-cline-pass 的 classifyUpstreamError）。
+func classifyUpstreamResponse(body []byte) (status, note string) {
+	var payload struct {
+		Error   json.RawMessage `json:"error"`
+		Choices []json.RawMessage `json:"choices"`
+	}
+	if json.Unmarshal(body, &payload) == nil && len(payload.Choices) > 0 {
+		return "ok", ""
+	}
+	note = upstreamErrorText(payload.Error)
+	if note == "" {
+		note = strings.TrimSpace(string(body))
+	}
+	if note == "" {
+		return "unknown", ""
+	}
+	lower := strings.ToLower(note)
+	switch {
+	case strings.Contains(lower, "empty response content"):
+		return "ok", note
+	case strings.Contains(lower, "429"), strings.Contains(lower, "rate-limited"),
+		strings.Contains(lower, "rate limited"), strings.Contains(lower, "temporarily rate"):
+		return "limited", note
+	case strings.Contains(lower, "invalid_request"), strings.Contains(lower, "modelid"),
+		strings.Contains(lower, "no allowed providers"), strings.Contains(lower, "no available providers"),
+		strings.Contains(lower, "not found"), strings.Contains(lower, "unsupported"):
+		return "bad", note
+	case strings.Contains(lower, "unauthorized"), strings.Contains(lower, "re-authenticate"),
+		strings.Contains(lower, "401"):
+		return "auth", note
+	}
+	return "unknown", note
+}
+
+// upstreamErrorText 从 error 字段提取可读文本（字符串或 {message:...}）。
+func upstreamErrorText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var obj struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &obj) == nil && obj.Message != "" {
+		return obj.Message
+	}
+	return strings.TrimSpace(string(raw))
 }
 
 // handleAdminPutChannel 新增/整体更新渠道（含内嵌 keys），随后按全量配置

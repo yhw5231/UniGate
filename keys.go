@@ -40,6 +40,14 @@ func (c *Cooldowns) IsCooling(keyID, model string) bool {
 	return ok && time.Now().Before(until)
 }
 
+// cooldownSoftCap 冷却表条目软阈值：越过时做一次维护（过期清理 + 必要时
+// 随机逐出到一半）。冷却模型部分来自请求体里的任意字符串，对抗性请求或
+// 上游 429 文案给出超长冷却都可能让未过期条目持续累积——不设上限的话表
+// 随请求多样性无限增长。逐出条目最坏影响是该 (key, model) 提前恢复路由，
+// 下次请求撞 429 会重新记冷却；逐出到一半（而非逐出一条）保证维护以
+// 摊销 O(1)/写入 的成本触发（否则每次写入都会全表扫描，越满越卡）。
+const cooldownSoftCap = 10000
+
 // Mark 记录冷却（dur <=0 时忽略）。
 func (c *Cooldowns) Mark(keyID, model string, dur time.Duration) {
 	if dur <= 0 {
@@ -48,9 +56,18 @@ func (c *Cooldowns) Mark(keyID, model string, dur time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.until[cooldownPair{keyID, model}] = time.Now().Add(dur)
-	// 防膨胀：条目过多时清理已过期项
-	if len(c.until) > 10000 {
-		c.pruneLocked()
+	if len(c.until) <= cooldownSoftCap {
+		return
+	}
+	c.pruneLocked()
+	if n := len(c.until); n > cooldownSoftCap {
+		target := n / 2
+		for k := range c.until {
+			if len(c.until) <= target {
+				break
+			}
+			delete(c.until, k)
+		}
 	}
 }
 

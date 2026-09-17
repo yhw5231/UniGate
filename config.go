@@ -54,6 +54,7 @@ type Config struct {
 
 	// 上游传输
 	UpstreamHeaderTimeout time.Duration
+	UpstreamReadIdle      time.Duration // 上游响应读取静默超时（失联兜底；默认 10m，0 关闭）
 
 	// 流式保活：等待上游首包/流静默期间向下游发 SSE 注释心跳的间隔
 	// （默认 15s，0 = 关闭）。须低于下游反代/客户端的空闲超时（常见 60s）
@@ -158,6 +159,7 @@ func loadConfig() Config {
 		DefaultSchedule:   normalizeScheduleDefault(getenv("DEFAULT_SCHEDULE", "")),
 
 		UpstreamHeaderTimeout: durationEnv("UPSTREAM_HEADER_TIMEOUT", 10*time.Minute),
+		UpstreamReadIdle:      durationEnv("UPSTREAM_READ_IDLE_TIMEOUT", 10*time.Minute),
 
 		KeepaliveInterval: durationEnv("KEEPALIVE_INTERVAL", 15*time.Second),
 

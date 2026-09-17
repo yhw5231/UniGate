@@ -8,7 +8,31 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
+
+// idleTimeoutReader 包装上游响应体：每次 Read 武装一个看门狗，连续 idle 没有
+// 任何字节返回（上游失联，TCP 半开 / NAT 静默回收等）就关闭底层连接强制结束
+// 阻塞中的 Read，调用方把错误当普通上游故障处理（路由层换 key，转发层结束
+// 该流）。idle 来自 cfg.UpstreamReadIdle（UPSTREAM_READ_IDLE_TIMEOUT，默认
+// 10m，0 = 关闭）；须大于最长上游思考时间（LLM 首包可达数分钟），流式期间
+// 任何字节都会重置计时。
+type idleTimeoutReader struct {
+	rc   io.ReadCloser
+	idle time.Duration
+}
+
+func (r *idleTimeoutReader) Read(p []byte) (int, error) {
+	if r.idle <= 0 {
+		return r.rc.Read(p)
+	}
+	timer := time.AfterFunc(r.idle, func() { _ = r.rc.Close() })
+	n, err := r.rc.Read(p)
+	timer.Stop()
+	return n, err
+}
+
+func (r *idleTimeoutReader) Close() error { return r.rc.Close() }
 
 // extractModel 从请求体解析 model 字段（用于按 (key, model) 计算冷却）。
 func extractModel(raw []byte) string {

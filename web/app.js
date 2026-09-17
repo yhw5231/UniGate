@@ -329,6 +329,10 @@ function renderChannels() {
     const modelLine = (ch.models || []).length
       ? `<div class="key-line"><span class="pname">模型 ${ch.models.length} 个：${esc(ch.models.slice(0, 4).join("、"))}${ch.models.length > 4 ? " …" : ""}</span></div>`
       : "";
+    const pinnedModels = Object.keys(ch.model_pins || {}).filter((m) => {
+      const p = ch.model_pins[m];
+      return p && ((p.upstreams || []).length || (p.exclude || []).length || p.sort);
+    }).length;
     return `<div class="channel-card" data-id="${esc(ch.id)}">
       <div class="head">
         <span class="badge ${ch.enabled ? "on" : "off"}">${ch.enabled ? "启用" : "停用"}</span>
@@ -341,8 +345,10 @@ function renderChannels() {
         ${ch.schedule === "round_robin" ? '<span class="badge info" title="每次请求从下一个 key 开始轮流分配">顺序轮询</span>' : ""}
         ${ch.auto_probe ? '<span class="badge info" title="key 冷却恢复/连续 8 小时无调用时自动发加法题验证账号状态">自动探测</span>' : ""}
         ${ch.proxy && ch.proxy.kind ? '<span class="badge info">渠道代理</span>' : ""}
+        ${pinnedModels ? `<span class="badge info" title="该渠道有模型的内部渠道被固定（请求注入 provider.only/order，不再随机路由）">已固定 ${pinnedModels} 个模型</span>` : ""}
         ${coolingN ? `<span class="badge warn">${coolingN} 个 key 冷却中</span>` : ""}
         <span class="spacer"></span>
+        ${ch.endpoint_type !== "responses" ? `<button class="btn small" data-act="pin">内部渠道固定</button>` : ""}
         <button class="btn small" data-act="edit">编辑</button>
         <button class="btn small danger" data-act="del">删除</button>
       </div>
@@ -354,6 +360,10 @@ function renderChannels() {
   wrap.querySelectorAll('[data-act="edit"]').forEach((b) => b.addEventListener("click", () => {
     const id = b.closest(".channel-card").dataset.id;
     openChannelEditor(JSON.parse(JSON.stringify(chans.find((c) => c.id === id))));
+  }));
+  wrap.querySelectorAll('[data-act="pin"]').forEach((b) => b.addEventListener("click", () => {
+    const id = b.closest(".channel-card").dataset.id;
+    openUpstreamPinModal(chans.find((c) => c.id === id));
   }));
   wrap.querySelectorAll('[data-act="del"]').forEach((b) => b.addEventListener("click", async () => {
     const id = b.closest(".channel-card").dataset.id;
@@ -380,6 +390,202 @@ function renderChannels() {
 }
 $("#channelSearch").addEventListener("input", renderChannels);
 $("#channelGroupFilter").addEventListener("change", renderChannels);
+
+// ---- 内部渠道固定（upstreampin）----
+// 渠道级设置：模型 → 该上游内部的渠道（provider）固定列表 + strict/preferred +
+// 排除 + 排序。探测（probe）发现内部渠道清单，验证（validate）逐个测试。
+let pinChannel = null; // 正在编辑的渠道对象
+const pinDraft = { model: "", mode: "strict", sort: "", upstreams: [], exclude: [], known: [] };
+
+function openUpstreamPinModal(ch) {
+  pinChannel = ch;
+  $("#pinModalTitle").textContent = "内部渠道固定 · " + ch.name;
+  $("#pinErr").textContent = "";
+  $("#pinValidateOut").innerHTML = "";
+  $("#pinProbeInfo").textContent = "";
+  $("#pinCustomSlug").value = "";
+  // 模型下拉：渠道声明模型 + 已有固定配置的模型
+  const models = [...new Set([...(ch.models || []), ...Object.keys(ch.model_pins || [])])];
+  const sel = $("#pinModel");
+  sel.innerHTML = '<option value="">选择模型…</option>' + models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join("");
+  $("#pinModelCustom").value = "";
+  pinDraft.model = models[0] || "";
+  sel.value = pinDraft.model;
+  if (!models.length) {
+    $("#pinProbeInfo").textContent = "该渠道未声明模型列表：在上面的输入框输入模型 ID（需与上游一致）。";
+  }
+  loadPinDraft();
+  $("#pinModal").classList.remove("hidden");
+}
+
+// loadPinDraft 把渠道上该模型现有的固定配置载入草稿并渲染
+function loadPinDraft() {
+  const p = pinDraft.model ? (pinChannel.model_pins || {})[pinDraft.model] : null;
+  pinDraft.mode = p && p.mode === "preferred" ? "preferred" : "strict";
+  pinDraft.sort = (p && p.sort) || "";
+  pinDraft.upstreams = [...((p && p.upstreams) || [])];
+  pinDraft.exclude = [...((p && p.exclude) || [])];
+  pinDraft.known = [...((p && p.known) || [])];
+  $("#pinMode").value = pinDraft.mode;
+  $("#pinSort").value = pinDraft.sort;
+  renderPinState();
+}
+
+// currentPinModel 编辑器当前作用的模型 ID（下拉优先，回退手输）
+function currentPinModel() {
+  return ($("#pinModel").value || $("#pinModelCustom").value || "").trim();
+}
+
+// renderPinState 渲染探测信息、已知渠道与固定/排除 chips
+function renderPinState() {
+  const p = pinDraft.model ? (pinChannel.model_pins || {})[pinDraft.model] : null;
+  if (p && p.pipeline) {
+    $("#pinProbeInfo").innerHTML =
+      `管线 <b>${esc(p.pipeline)}</b>` +
+      (p.last_provider ? ` · 最近实际服务 <b>${esc(p.last_provider)}</b>` : "") +
+      (p.canonical_slug ? ` · 模型 slug <code>${esc(p.canonical_slug)}</code>` : "") +
+      (p.probed_at ? ` · 探测于 ${new Date(p.probed_at * 1000).toLocaleString()}` : "（未探测）");
+  } else {
+    $("#pinProbeInfo").textContent = "尚未探测：点「探测内部渠道」识别管线并发现可用渠道（也可手工输入 slug）。";
+  }
+  const knownWrap = $("#pinKnownWrap");
+  const known = [...new Set([...pinDraft.known, ...pinDraft.upstreams, ...pinDraft.exclude])];
+  if (known.length) {
+    knownWrap.classList.remove("hidden");
+    knownWrap.innerHTML = `<span class="muted">已知内部渠道（点击加为固定 / Shift+点击加为排除）：</span>` +
+      known.map((k) => {
+        const cls = pinDraft.upstreams.includes(k) ? "info" : (pinDraft.exclude.includes(k) ? "warn" : "");
+        return `<span class="chip clickable" data-slug="${esc(k)}" data-pin-kind="${cls || "new"}"><span class="badge ${cls}">${esc(k)}</span></span>`;
+      }).join("");
+    knownWrap.querySelectorAll(".chip.clickable").forEach((chip) => chip.addEventListener("click", (e) => {
+      const slug = chip.dataset.slug;
+      if (e.shiftKey) { togglePinList("exclude", slug); } else { togglePinList("upstreams", slug); }
+    }));
+  } else {
+    knownWrap.classList.add("hidden");
+    knownWrap.innerHTML = "";
+  }
+  const chipBtn = (list, i, slug) => {
+    const up = list === "upstreams" && i > 0 ? `<button class="chip-btn" data-pin-act="move" data-list="upstreams" data-idx="${i}" data-dir="-1" title="上移">↑</button>` : "";
+    const down = list === "upstreams" && i < pinDraft.upstreams.length - 1 ? `<button class="chip-btn" data-pin-act="move" data-list="upstreams" data-idx="${i}" data-dir="1" title="下移">↓</button>` : "";
+    return `<span class="chip">${esc(slug)}${up}${down}<button class="chip-btn" data-pin-act="remove" data-list="${list}" data-idx="${i}" title="移除">×</button></span>`;
+  };
+  $("#pinUpstreamChips").innerHTML = pinDraft.upstreams.map((s, i) => chipBtn("upstreams", i, s)).join("") || '<span class="muted">（无——不固定，上游随机路由）</span>';
+  $("#pinExcludeChips").innerHTML = pinDraft.exclude.map((s, i) => chipBtn("exclude", i, s)).join("") || '<span class="muted">（无）</span>';
+  $("#pinUpstreamChips").querySelectorAll('[data-pin-act]').forEach((b) => b.addEventListener("click", () => {
+    const i = Number(b.dataset.idx);
+    if (b.dataset.pinAct === "remove") {
+      pinDraft[b.dataset.list].splice(i, 1);
+    } else {
+      const j = i + Number(b.dataset.dir);
+      [pinDraft.upstreams[i], pinDraft.upstreams[j]] = [pinDraft.upstreams[j], pinDraft.upstreams[i]];
+    }
+    renderPinState();
+  }));
+  $("#pinExcludeChips").querySelectorAll('[data-pin-act]').forEach((b) => b.addEventListener("click", () => {
+    pinDraft.exclude.splice(Number(b.dataset.idx), 1);
+    renderPinState();
+  }));
+}
+
+// togglePinList 把 slug 在指定列表中加入/移出（互斥：一个渠道不会同时固定与排除）
+function togglePinList(list, slug) {
+  const other = list === "upstreams" ? "exclude" : "upstreams";
+  pinDraft[other] = pinDraft[other].filter((s) => s !== slug);
+  const arr = pinDraft[list];
+  const at = arr.indexOf(slug);
+  if (at >= 0) { arr.splice(at, 1); } else { arr.push(slug); }
+  renderPinState();
+}
+
+$("#pinModel").addEventListener("change", () => {
+  pinDraft.model = $("#pinModel").value;
+  $("#pinModelCustom").value = "";
+  $("#pinValidateOut").innerHTML = "";
+  loadPinDraft();
+});
+$("#pinMode").addEventListener("change", () => { pinDraft.mode = $("#pinMode").value; });
+$("#pinSort").addEventListener("change", () => { pinDraft.sort = $("#pinSort").value; });
+
+$("#pinAddPinnedBtn").addEventListener("click", () => {
+  const slug = ($("#pinCustomSlug").value || "").trim();
+  if (!slug) { toast("先输入渠道 slug", true); return; }
+  pinDraft.exclude = pinDraft.exclude.filter((s) => s !== slug);
+  if (!pinDraft.upstreams.includes(slug)) pinDraft.upstreams.push(slug);
+  $("#pinCustomSlug").value = "";
+  renderPinState();
+});
+$("#pinAddExcludeBtn").addEventListener("click", () => {
+  const slug = ($("#pinCustomSlug").value || "").trim();
+  if (!slug) { toast("先输入渠道 slug", true); return; }
+  pinDraft.upstreams = pinDraft.upstreams.filter((s) => s !== slug);
+  if (!pinDraft.exclude.includes(slug)) pinDraft.exclude.push(slug);
+  $("#pinCustomSlug").value = "";
+  renderPinState();
+});
+
+// 探测：识别管线 + 收割内部渠道清单（结果写回渠道探测产物并载入草稿）
+$("#pinProbeBtn").addEventListener("click", async () => {
+  const model = currentPinModel();
+  if (!model) { toast("先选择或输入模型 ID", true); return; }
+  $("#pinErr").textContent = "";
+  $("#pinProbeBtn").disabled = true;
+  try {
+    const r = await api("POST", `/admin/api/channels/${pinChannel.id}/probe-upstreams`, { model });
+    toast(`探测完成：管线 ${r.pipeline || "未知"}，发现 ${r.known.length} 个内部渠道`);
+    await loadState(); // 刷新 STATE 里的渠道（探测产物已落盘）
+    pinChannel = (STATE.channels || []).find((c) => c.id === pinChannel.id) || pinChannel;
+    pinDraft.model = model;
+    loadPinDraft();
+  } catch (e) { $("#pinErr").textContent = e.message; }
+  finally { $("#pinProbeBtn").disabled = false; }
+});
+
+// 验证：逐个内部渠道发固定小请求并按响应分类
+$("#pinValidateBtn").addEventListener("click", async () => {
+  const model = currentPinModel();
+  if (!model) { toast("先选择或输入模型 ID", true); return; }
+  $("#pinErr").textContent = "";
+  $("#pinValidateBtn").disabled = true;
+  const label = { ok: "可用", limited: "限流", bad: "不可用", auth: "鉴权失败", unknown: "未知" };
+  try {
+    const r = await api("POST", `/admin/api/channels/${pinChannel.id}/validate-upstreams`, { model });
+    $("#pinValidateOut").innerHTML = r.results.map((x) =>
+      `<span class="chip"><span class="badge ${x.status === "ok" ? "on" : (x.status === "limited" ? "warn" : "off")}">${label[x.status] || x.status}</span>${esc(x.upstream)} · ${x.ms}ms${x.note ? ` <span class="muted" title="${esc(x.note)}">详情</span>` : ""}</span>`
+    ).join("");
+  } catch (e) { $("#pinErr").textContent = e.message; }
+  finally { $("#pinValidateBtn").disabled = false; }
+});
+
+// 保存 / 清除
+$("#pinSaveBtn").addEventListener("click", async () => {
+  const model = currentPinModel();
+  if (!model) { toast("先选择或输入模型 ID", true); return; }
+  $("#pinErr").textContent = "";
+  try {
+    await api("PUT", `/admin/api/channels/${pinChannel.id}/model-pin`, {
+      model,
+      mode: $("#pinMode").value,
+      upstreams: pinDraft.upstreams,
+      exclude: pinDraft.exclude,
+      sort: $("#pinSort").value,
+    });
+    toast("内部渠道固定已保存并生效");
+    await loadState();
+    closeModal($("#pinModal"));
+  } catch (e) { $("#pinErr").textContent = e.message; }
+});
+$("#pinClearBtn").addEventListener("click", async () => {
+  const model = currentPinModel();
+  if (!model) { toast("先选择或输入模型 ID", true); return; }
+  try {
+    await api("PUT", `/admin/api/channels/${pinChannel.id}/model-pin`, { model });
+    toast("已清除该模型的固定配置");
+    await loadState();
+    pinChannel = (STATE.channels || []).find((c) => c.id === pinChannel.id) || pinChannel;
+    loadPinDraft();
+  } catch (e) { $("#pinErr").textContent = e.message; }
+});
 
 // 代理池查找：按 ID（新格式引用）或 URL（旧内联格式）→ 池实体
 function poolById(id) { return ((STATE && STATE.proxy_pools) || []).find((p) => p.id === id); }

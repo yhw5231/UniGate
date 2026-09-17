@@ -40,6 +40,18 @@ import (
 type candidate struct {
 	ch *Channel
 	k  *UpKey
+	// pinBody 非空 = 渠道固定注入后的请求体（发往上游时优先于原始 body）；
+	// pinName 为该候选固定的内部渠道（provider slug），空 = 未固定（自动路由）。
+	pinBody []byte
+	pinName string
+}
+
+// requestBody 返回发往上游的请求体：渠道固定注入体优先。
+func (c *candidate) requestBody(raw []byte) []byte {
+	if c.pinBody != nil {
+		return c.pinBody
+	}
+	return raw
 }
 
 // cooldownModel 返回冷却键中 model 部分的取值：渠道粒度为 "key_model" 时按
@@ -81,7 +93,11 @@ func endsWithChatCompletions(s string) bool {
 //   - failover（默认）：按渠道顺序 + key 顺序，靠前的 key 用满才轮到后面；
 //   - round_robin：每个渠道把 key 列表从递增游标处旋转一轮（保序），
 //     请求在账号间轮流分配，均摊用量。游标按渠道 ID 记忆（内存态，重启归零）。
-func buildCandidates(model string) []candidate {
+//
+// 渠道配置了模型固定（ModelPins，见 upstreampin.go）时，每个 (渠道, key)
+// 按固定列表展开为多个候选（每个候选注入对应的内部渠道固定请求体），
+// strict 模式按固定顺序逐个内部渠道独占尝试。
+func buildCandidates(model string, rawBody []byte) []candidate {
 	snap := store.Snapshot()
 	def := currentPolicy().DefaultSchedule
 	var out []candidate
@@ -97,9 +113,17 @@ func buildCandidates(model string) []candidate {
 			keys = rotateKeysRR(ch.ID, keys)
 		}
 		for _, k := range keys {
-			if k.Enabled {
-				out = append(out, candidate{ch: ch, k: k})
+			if !k.Enabled {
+				continue
 			}
+			if att := buildUpstreamPinAttempts(ch, model, rawBody); att != nil {
+				// 有固定配置：按固定列表展开（strict 每个内部渠道一个候选）
+				for _, pa := range att {
+					out = append(out, candidate{ch: ch, k: k, pinBody: pa.body, pinName: pa.upstream})
+				}
+				continue
+			}
+			out = append(out, candidate{ch: ch, k: k})
 		}
 	}
 	return out
@@ -208,7 +232,7 @@ func applyCustomHeaders(req *http.Request, headers map[string]string) {
 // 每个候选的尝试结果（含跳过原因）都会追加到请求日志的错误信息，便于在
 // WebUI 上直接回答「为什么 502」：哪个 key 因什么失败、冷却了多久。
 func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream bool, model string) *candidate {
-	cands := buildCandidates(model)
+	cands := buildCandidates(model, rawBody)
 	if len(cands) == 0 {
 		writeJSONError(w, http.StatusBadGateway, "no enabled upstream key available", "no_upstream")
 		return nil
@@ -247,8 +271,12 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 		}
 	}
 	recordTrace := func(cand *candidate, event, detail string) {
+		name := cand.k.Name + "@" + cand.ch.Name
+		if cand.pinName != "" {
+			name += "[" + cand.pinName + "]"
+		}
 		trace = append(trace, attemptTrace{
-			Key:   cand.k.Name + "@" + cand.ch.Name,
+			Key:   name,
 			Model: model,
 			Event: event,
 			Err:   detail,
@@ -558,9 +586,9 @@ func peekUpstreamError(r *http.Request, resp *http.Response) {
 //（含 Authorization / Content-Type / UA / Accept），无同名新增。
 // 渠道端点类型为 responses 时，先把 chat/completions 请求体转换为 Responses API 格式。
 func doUpstreamRequest(ctx context.Context, client *http.Client, cand *candidate, rawBody []byte, stream bool, srcHeader http.Header) (*http.Response, error) {
-	body := rawBody
+	body := cand.requestBody(rawBody)
 	if cand.ch.EndpointType == endpointResponses {
-		body = chatToResponsesRequest(rawBody)
+		body = chatToResponsesRequest(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cand.chatTarget(), bytes.NewReader(body))
 	if err != nil {
@@ -585,7 +613,14 @@ func doUpstreamRequest(ctx context.Context, client *http.Client, cand *candidate
 		req.Header.Set("Accept", "application/json")
 	}
 	applyCustomHeaders(req, cand.ch.Headers)
-	return client.Do(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// 上游失联兜底：读取静默超时后关闭连接，Read 不再无限阻塞
+	//（TCP 半开 / NAT 静默回收会让响应体读取永久挂起，goroutine 与连接泄漏）
+	resp.Body = &idleTimeoutReader{rc: resp.Body, idle: cfg.UpstreamReadIdle}
+	return resp, nil
 }
 
 // ---- 路由视图（WebUI「路由」页：按模型展示候选 key 与实时状态）----

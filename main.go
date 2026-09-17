@@ -67,10 +67,17 @@ func main() {
 		}
 	}
 
+	// 服务端空闲 keep-alive 连接必须设超时：ReadTimeout/IdleTimeout 均为零时
+	// Go 对空闲连接永不回收，死掉/异常的客户端连接（每个占一个 goroutine 与
+	// 读写缓冲）会随时间累积。只影响「请求之间」的空闲复用，不影响在途的
+	// 长流式响应（SSE 转发期间 IdleTimeout 不计时）。
+	const serverIdleTimeout = 2 * time.Minute
+
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           statsMiddleware(gatewayHandler),
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       serverIdleTimeout,
 	}
 	if webUIMerged() {
 		srv.Handler = statsMiddleware(rootHandler)
@@ -83,6 +90,7 @@ func main() {
 		Addr:              ":" + cfg.WebUIPort,
 		Handler:           statsMiddleware(managementHandler),
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       serverIdleTimeout,
 	}
 	go func() {
 		if err := uiSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

@@ -105,15 +105,25 @@ func transportFor(r *ProxyRoute) *http.Transport {
 type transportCache struct {
 	mu  sync.Mutex
 	trs map[string]*http.Transport
+	// lru 记录最近使用顺序（尾部最近）；缓存按条目数上限淘汰，淘汰时关闭
+	// 该 transport 的空闲连接（释放其持有的 socket 与内存）。
+	lru []string
+	max int
 }
 
-var globalTransportCache = &transportCache{trs: map[string]*http.Transport{}}
+// transportCacheMax transport 缓存上限。ipv6pool 租约轮换会生成
+// socks5://user:<leaseID>@host:port 形式的无限多路由——不设上限的话每个
+// 租约一个 Transport（含空闲连接池）随时间累积，内存与 fd 越占越多。
+const transportCacheMax = 256
+
+var globalTransportCache = &transportCache{trs: map[string]*http.Transport{}, max: transportCacheMax}
 
 func (tc *transportCache) get(r *ProxyRoute) *http.Transport {
 	k := r.key()
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if tr, ok := tc.trs[k]; ok {
+		tc.touchLocked(k)
 		return tr
 	}
 	tr := &http.Transport{
@@ -138,8 +148,38 @@ func (tc *transportCache) get(r *ProxyRoute) *http.Transport {
 			}
 		}
 	}
+	if len(tc.trs) >= tc.max {
+		tc.evictOldestLocked()
+	}
 	tc.trs[k] = tr
+	tc.lru = append(tc.lru, k)
 	return tr
+}
+
+// touchLocked 把 key 移到 LRU 尾部（调用方持锁）。
+func (tc *transportCache) touchLocked(k string) {
+	for i, v := range tc.lru {
+		if v == k {
+			tc.lru = append(tc.lru[:i], tc.lru[i+1:]...)
+			tc.lru = append(tc.lru, k)
+			return
+		}
+	}
+}
+
+// evictOldestLocked 淘汰最久未用的 transport 并关闭其空闲连接（调用方持锁）。
+// 关闭空闲连接即释放该 transport 缓存的 socket；在途请求不受影响（连接在
+// 完成后不会归还给已分离的 transport）。
+func (tc *transportCache) evictOldestLocked() {
+	if len(tc.lru) == 0 {
+		return
+	}
+	oldest := tc.lru[0]
+	tc.lru = tc.lru[1:]
+	if tr, ok := tc.trs[oldest]; ok {
+		tr.CloseIdleConnections()
+		delete(tc.trs, oldest)
+	}
 }
 
 // newUpstreamClient 构造访问上游的 HTTP client。LLM 非流式响应可能要数分钟才回包，

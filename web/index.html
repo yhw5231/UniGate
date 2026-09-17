@@ -402,6 +402,69 @@
   </div>
 </div>
 
+<div id="pinModal" class="modal hidden">
+  <div class="modal-card" style="max-width:760px">
+    <div class="modal-head">
+      <h3 id="pinModalTitle">内部渠道固定</h3>
+      <button class="btn ghost" data-close="pinModal">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" style="font-size:12px;margin:0 0 8px">
+        上游网关的一个模型可能内置多个上游渠道（请求时随机路由）。这里把该渠道的指定模型
+        钉到固定内部渠道：请求时注入 <code>provider.only/order</code>（OpenRouter 型）或
+        <code>providerOptions.gateway.*</code>（AI Gateway 型），不再由上游随机路由。
+      </p>
+      <div class="pin-row">
+        <label class="inline">模型
+          <select id="pinModel" style="width:auto;max-width:260px"></select>
+        </label>
+        <input id="pinModelCustom" placeholder="或输入模型 ID…" style="width:220px">
+        <button class="btn small" id="pinProbeBtn" title="发两条小请求：识别管线类型（OpenRouter/AI Gateway）、实际服务的渠道，并把 only 钉到不存在渠道让上游报出全部可用渠道">探测内部渠道</button>
+        <button class="btn small" id="pinValidateBtn" title="对每个已知内部渠道发一条固定小请求，验证其可用性">验证可用性</button>
+      </div>
+      <p class="muted" id="pinProbeInfo" style="font-size:12px;margin:6px 0"></p>
+      <div id="pinKnownWrap" class="pin-chips hidden">
+        <span class="muted">已知内部渠道（点击加为固定 / Shift+点击加为排除）：</span>
+      </div>
+      <div id="pinValidateOut" class="pin-chips"></div>
+      <div class="pin-row" style="margin-top:8px">
+        <label class="inline">模式
+          <select id="pinMode" style="width:auto">
+            <option value="strict" title="按固定列表顺序逐个内部渠道独占尝试（only=[渠道]），失败切换下一个">严格固定（逐个独占）</option>
+            <option value="preferred" title="一条请求给出完整优先序（order=[…]），由上游按序自选">固定优先（order 优先序）</option>
+          </select>
+        </label>
+        <label class="inline">排序
+          <select id="pinSort" style="width:auto">
+            <option value="">不排序</option>
+            <option value="cost">价格最低（cost/price）</option>
+            <option value="ttft">首字最快（ttft/latency）</option>
+            <option value="tps">吞吐最高（tps/throughput）</option>
+          </select>
+        </label>
+      </div>
+      <div class="pin-chips" style="margin-top:6px"><span class="muted">固定顺序：</span><span id="pinUpstreamChips"></span></div>
+      <div class="pin-chips"><span class="muted">排除：</span><span id="pinExcludeChips"></span></div>
+      <div class="pin-row" style="margin-top:4px">
+        <input id="pinCustomSlug" placeholder="手工添加渠道 slug（如 alibaba）…" style="width:240px">
+        <button class="btn small" id="pinAddPinnedBtn">加为固定</button>
+        <button class="btn small" id="pinAddExcludeBtn">加为排除</button>
+      </div>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">
+        「排除」编译为 allowlist（上游不认 exclude 字段），需要先探测到内部渠道清单才生效。
+        保存立即生效，无需重启。
+      </p>
+      <span id="pinErr" class="err"></span>
+    </div>
+    <div class="modal-foot">
+      <button class="btn danger" id="pinClearBtn" title="清除该模型的固定配置（探测产物保留）">清除固定</button>
+      <span class="spacer"></span>
+      <button class="btn" data-close="pinModal">取消</button>
+      <button class="btn primary" id="pinSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
 <script src="/app.js"></script>
 </body>
 </html>

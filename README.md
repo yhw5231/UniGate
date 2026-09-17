@@ -37,6 +37,12 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
   冷却与一键清空全部冷却。
 - **故障转移**：单请求内自动换下一个 key/渠道；按渠道冷却粒度（默认按 key，可选按
   (key, model)）跳过故障 key。
+- **固定模型渠道**（渠道级 `model_pins`）：上游网关的一个模型可能内置多个上游
+  渠道（如 Cline Pass 的 glm 背后随机路由到 alibaba/baseten 等）。为渠道的指定模型
+  固定内部渠道：请求时注入 `provider.only/order`（OpenRouter 型）或
+  `providerOptions.gateway.*`（AI Gateway 型），不再让上游随机路由；支持**探测**
+  （自动发现模型背后的全部内部渠道与管线类型）与**逐渠道验证**（详见
+  「故障转移与冷却策略」）。
 - **账号自动探测**（渠道可选）：开启后网关定时向上游发一道**随机 5 位数加法题**
   验证账号状态——key **冷却恢复时**探测一次（按 (key, model) 冷却的渠道探测恢复的
   那个模型；上游仍 429 则按其明确到期时间重新冷却），正常状态**连续无调用达到空闲
@@ -419,6 +425,40 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 WebUI「设置」页「默认账号调度」或「路由」页顶部下拉（保存立即生效），环境变量
 `DEFAULT_SCHEDULE` 提供默认值。
 
+**固定模型渠道**（渠道级设置，WebUI「渠道」页每个渠道的「内部渠道固定」按钮，持久化为
+`gateway.json` 中渠道的 `model_pins`）：上游网关（如 Cline Pass）的一个模型背后常内置
+多个上游渠道（provider），请求时由上游**随机路由**。此设置把指定模型钉到固定内部渠道，
+语义对齐 dsh-cline-pass 的 per-model pin（`pinMode=strict/preferred` + `exclude` + `sort`）：
+
+| 模式 | 注入行为 |
+| --- | --- |
+| **严格固定**（`strict`，默认） | 按固定列表顺序，每个内部渠道一次独占尝试（注入 `only=[渠道]`），失败切换下一个固定渠道（再失败按正常故障转移换 key/渠道）——绝不路由到列表之外的渠道 |
+| **固定优先**（`preferred`） | 单次请求注入完整优先序 `order=[固定列表…]`，由上游按序自选（对标 `provider.order`） |
+
+注入写法按上游管线自动选择：**direct**（OpenRouter 型）写顶层 `provider.only/order/sort`；
+**planner**（Vercel AI Gateway 型）写 `providerOptions.gateway.only/order/sort`；管线未知时
+两种写法都注入（各管线忽略不认识的字段）。**排序**（`sort`，可选）：cost（价格）/ttft（首字
+延迟）/tps（吞吐），direct 管线自动映射为 price/latency/throughput。
+
+- **探测**（「探测内部渠道」按钮）：发两条小请求——正常请求从响应的
+  `provider_metadata.gateway.routing` 识别管线类型与实际服务的渠道；再把 only 钉到不存在的
+  渠道（`__probe__`），上游在花费 token 前报错并**点名全部可用渠道**（planner 文本
+  "Available providers are: …"，direct 为错误 JSON 的 `error.metadata.available_providers`）。
+  探测产物（管线/渠道清单/最近实际渠道）持久化在渠道的 `model_pins` 里供勾选，可随时重建；
+- **验证**（「验证可用性」按钮）：对每个已知内部渠道发一条固定小请求，按上游响应分类
+  （可用 / 限流 / 不可用 / 鉴权失败 / 未知）；
+- **排除**（`exclude`）编译进 allowlist（上游不认 exclude 字段）：需要先探测到渠道清单才
+  生效；固定与排除互斥（同一渠道不会既固定又排除）；
+- 保存立即生效（路由每请求实时取快照），无需重启；「渠道测试」等链路不受影响；
+- responses 端点渠道不支持（请求体会被 Responses API 转换重建，注入字段无法保留）。
+
+Admin API（均需管理员 token）：`PUT /admin/api/channels/{id}/model-pin` body
+`{"model":"<模型ID>","mode":"strict"|"preferred","upstreams":["<slug>"],"exclude":["<slug>"],"sort":"cost"}`
+（upstreams/exclude/sort 全空 = 清除固定，探测产物保留）；`POST
+/admin/api/channels/{id}/probe-upstreams` body `{"model":"<模型ID>","key_id?"}`；
+`POST /admin/api/channels/{id}/validate-upstreams` body `{"model":"<模型ID>","upstreams"?}`。
+渠道的 `model_pins` 随 `GET /admin/api/state` 一并返回。
+
 **账号自动探测**（渠道编辑页「自动探测」开关）：开启后后台调度器（每 30s 扫描）对渠道内
 的 key 发送真实对话请求——一道随机 5 位数 + 5 位数 + 5 位数的加法题（如
 `What is 12345 + 67890 + 13579?`）——用上游的真实响应判断账号状态。探测模型按渠道冷却
@@ -466,6 +506,7 @@ WebUI「设置」页「默认账号调度」或「路由」页顶部下拉（保
 | `ROTATE_AFTER_5XX` | `3` | 同一 key 连续 5xx 超过该次数自动换出口 IP（0 = 关闭；仅 ipv6pool key 生效；也可在 WebUI「设置」页修改） |
 | `DEFAULT_SCHEDULE` | `failover` | 默认账号调度（渠道未显式配置时使用）：`failover` 故障转移 / `round_robin` 顺序轮询；也可在 WebUI「设置」/「路由」页修改 |
 | `UPSTREAM_HEADER_TIMEOUT` | `10m` | 等待上游响应头超时（LLM 非流式可能较慢，勿设过小） |
+| `UPSTREAM_READ_IDLE_TIMEOUT` | `10m` | 上游响应**读取静默超时**：连续该时长未从上游读到任何字节（连接失联：TCP 半开、NAT 静默回收等）即关闭连接中止该候选，避免读取永久阻塞导致 goroutine/连接泄漏累积；须大于最长的上游思考时间，流式期间任何字节都会重置计时；0 = 关闭 |
 | `KEEPALIVE_INTERVAL` | `15s` | 流式转发心跳：等待上游首包/流静默期间，每该间隔向下游写一帧 SSE 注释（`: keepalive`），防下游反代按空闲超时（常见 60s）掐连接；0 = 关闭。首帧心跳会提前提交 200 + event-stream 头，此后路由彻底失败改用流内 `data: {"error":...}` 帧表达（也可在 WebUI「设置」页修改） |
 | `PROBE_IDLE_SEC` | `28800`（8h） | 自动探测的空闲探测间隔秒数：开启「自动探测」的渠道内，正常状态账号连续无调用该时长后发加法题验证账号状态（按 (Key,模型) 冷却的渠道逐模型检查）；0 = 关闭空闲探测，冷却恢复探测不受影响（也可在 WebUI「设置」页修改） |
 | `TEST_TIMEOUT` | `45s` | WebUI 渠道/key 测试的整体超时（默认低于常见反代 60s，避免测试被反代掐断成 504） |
@@ -501,6 +542,9 @@ WebUI「设置」页「默认账号调度」或「路由」页顶部下拉（保
 | `POST /admin/api/cooling/clear-model` | 按 (key, 模型) 精确解除一条冷却 `{key_id, model}` |
 | `POST /admin/api/cooling/clear-all` | 一键清空全部冷却（所有 key、所有模型粒度） |
 | `GET /admin/api/route?model=` | 路由视图：按模型聚合候选 (渠道, key) 与实时状态（`ok`/`cooling`/`disabled`，含剩余冷却毫秒），候选顺序即网关转发顺序 |
+| `PUT /admin/api/channels/{id}/model-pin` | 保存/清除渠道上某模型的内部渠道固定 `{model, mode: "strict"\|"preferred", upstreams: [slug], exclude: [slug], sort}`；upstreams/exclude/sort 全空 = 清除固定（探测产物保留）。保存立即生效 |
+| `POST /admin/api/channels/{id}/probe-upstreams` | 探测某模型的内部渠道 `{model, key_id?}`：识别管线（direct/planner）、实际服务渠道，并把 only 钉到 `__probe__` 让上游报出全部可用渠道；产物写回渠道 `model_pins` |
+| `POST /admin/api/channels/{id}/validate-upstreams` | 逐个内部渠道发固定小请求验证可用性 `{model, key_id?, upstreams?}`（缺省用探测到的清单），返回逐渠道分类（ok/limited/bad/auth/unknown） |
 | `GET /admin/api/usage?window=today\|24h\|7d\|30d\|all` | 用量统计（支持 `?user=&channel=&model=&key=`） |
 
 ## 渠道自定义请求头示例（Cline 渠道）

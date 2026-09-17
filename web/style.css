@@ -35,8 +35,8 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
 }
 .tab.active { background: var(--panel2); color: var(--text); }
 .spacer { flex: 1; }
-/* main 占满视口宽度：日志等表格页充分利用两侧空间，不在宽屏下留白。
-   卡片型内容（渠道列表）另行限宽，避免超宽屏下横向拉得过长。 */
+/* main 占满视口宽度：日志等表格页与渠道/路由等卡片页均自适应视口宽度，
+   宽屏下不再留白，key 冷却明细等长内容尽量单行铺开、不被挤换行。 */
 main { width: 100%; margin: 0 auto; padding: 20px 24px; }
 .row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .row h2 { margin: 0; font-size: 18px; }
@@ -113,10 +113,12 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 
 /* 渠道卡片 */
 .channel-list { display: flex; flex-direction: column; gap: 10px; }
-.channel-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; max-width: 1320px; }
-.channel-card .head { display: flex; align-items: center; gap: 10px; }
+/* 渠道卡片：宽度自适应页面（跟随 main 铺满视口），key 冷却徽标、可用模型
+   等长内容随视口宽尽量单行展开，窄窗口下再由 flex-wrap 收纳换行。 */
+.channel-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.channel-card .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .channel-card .head .name { font-weight: 700; font-size: 15px; }
-.badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; }
+.badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
 .badge.on { background: rgba(53,194,110,.15); color: var(--ok); }
 .badge.off { background: rgba(224,82,82,.15); color: var(--err); }
 .badge.info { background: rgba(79,140,255,.15); color: var(--accent); }
@@ -147,6 +149,13 @@ tr.tog-open .tr-toggle { color: var(--accent); }
   font: inherit; font-size: 12px; padding: 0 3px; border-radius: 4px;
 }
 .chip-btn:hover { color: var(--text); background: var(--border); }
+/* 渠道编辑弹窗内的「内部渠道固定」分区：每个模型一块 */
+.pin-model {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel2); padding: 8px 10px; margin: 6px 0;
+  display: flex; flex-direction: column; gap: 4px; font-size: 13px;
+}
+.pin-model .rk-name { font-weight: 600; }
 /* 测试清单中已选中的模型 chip：高亮并标记可移除 */
 .chip-on { border-color: var(--accent); color: var(--accent); background: rgba(79,140,255,.12); }
 
@@ -161,7 +170,7 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 .key-line .pname { color: var(--muted); font-size: 12px; }
 
 /* 路由页：按模型分组展示候选 key */
-.route-list { display: flex; flex-direction: column; gap: 10px; max-width: 1320px; }
+.route-list { display: flex; flex-direction: column; gap: 10px; }
 .route-model {
   background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
   padding: 10px 14px;

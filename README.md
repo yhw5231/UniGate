@@ -425,10 +425,12 @@ git pull && docker build -t unigate:local . && docker rm -f unigate
 WebUI「设置」页「默认账号调度」或「路由」页顶部下拉（保存立即生效），环境变量
 `DEFAULT_SCHEDULE` 提供默认值。
 
-**固定模型渠道**（渠道级设置，WebUI「渠道」页每个渠道的「内部渠道固定」按钮，持久化为
-`gateway.json` 中渠道的 `model_pins`）：上游网关（如 Cline Pass）的一个模型背后常内置
-多个上游渠道（provider），请求时由上游**随机路由**。此设置把指定模型钉到固定内部渠道，
-语义对齐 dsh-cline-pass 的 per-model pin（`pinMode=strict/preferred` + `exclude` + `sort`）：
+**固定模型渠道**（渠道级设置，WebUI「渠道」页编辑渠道弹窗内的「**内部渠道固定（按模型）**」
+分区——每个启用模型一行，可单独探测/验证/编辑；渠道卡片上的「内部渠道固定」按钮会直接
+打开编辑弹窗并定位到该分区。持久化为 `gateway.json` 中渠道的 `model_pins`）：上游网关
+（如 Cline Pass）的一个模型背后常内置多个上游渠道（provider），请求时由上游**随机路由**。
+此设置把指定模型钉到固定内部渠道，语义对齐 dsh-cline-pass 的 per-model pin
+（`pinMode=strict/preferred` + `exclude` + `sort`）：
 
 | 模式 | 注入行为 |
 | --- | --- |
@@ -440,16 +442,18 @@ WebUI「设置」页「默认账号调度」或「路由」页顶部下拉（保
 两种写法都注入（各管线忽略不认识的字段）。**排序**（`sort`，可选）：cost（价格）/ttft（首字
 延迟）/tps（吞吐），direct 管线自动映射为 price/latency/throughput。
 
-- **探测**（「探测内部渠道」按钮）：发两条小请求——正常请求从响应的
+- **探测**（每个模型行的「探测」按钮）：发两条小请求——正常请求从响应的
   `provider_metadata.gateway.routing` 识别管线类型与实际服务的渠道；再把 only 钉到不存在的
   渠道（`__probe__`），上游在花费 token 前报错并**点名全部可用渠道**（planner 文本
   "Available providers are: …"，direct 为错误 JSON 的 `error.metadata.available_providers`）。
-  探测产物（管线/渠道清单/最近实际渠道）持久化在渠道的 `model_pins` 里供勾选，可随时重建；
-- **验证**（「验证可用性」按钮）：对每个已知内部渠道发一条固定小请求，按上游响应分类
+  探测产物（管线/渠道清单/最近实际渠道）立即落盘到渠道的 `model_pins`，在「已知渠道」里
+  点击即可切换 固定→排除→移除；
+- **验证**（每个模型行的「验证」按钮）：对每个已知内部渠道发一条固定小请求，按上游响应分类
   （可用 / 限流 / 不可用 / 鉴权失败 / 未知）；
 - **排除**（`exclude`）编译进 allowlist（上游不认 exclude 字段）：需要先探测到渠道清单才
   生效；固定与排除互斥（同一渠道不会既固定又排除）；
-- 保存立即生效（路由每请求实时取快照），无需重启；「渠道测试」等链路不受影响；
+- 固定列表随编辑弹窗「保存渠道」一并写入配置；探测/验证立即落盘生效（路由每请求实时取
+  快照），无需重启；「渠道测试」等链路不受影响；
 - responses 端点渠道不支持（请求体会被 Responses API 转换重建，注入字段无法保留）。
 
 Admin API（均需管理员 token）：`PUT /admin/api/channels/{id}/model-pin` body

@@ -467,6 +467,52 @@ func TestProbeUpstreamsUpstreamError(t *testing.T) {
 	}
 }
 
+// TestProbeUpstreamsEmptyContentRetry 推理模型把 max_tokens 配额烧在思考上时，
+// 网关返回 "empty response content" 类错误体——去掉上限重试一次后应正常完成
+// 探测（对标 classifyUpstreamError 把该错误记为 ok）。
+func TestProbeUpstreamsEmptyContentRetry(t *testing.T) {
+	setupGateway(t)
+	okBody := `{"provider_metadata":{"gateway":{"routing":{"finalProvider":"alibaba"}}},"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}`
+	up := newScriptedUpstream(t, func(i int, body string) (int, string) {
+		var obj map[string]any
+		_ = json.Unmarshal([]byte(body), &obj)
+		if strings.Contains(body, "__probe__") {
+			return http.StatusBadRequest, `{"error":"invalid_request_error: No allowed providers available. Available providers are: Alibaba, Baseten."}`
+		}
+		if _, capped := obj["max_tokens"]; capped {
+			// 带 max_tokens 的探测：思考烧完配额、无正文
+			return http.StatusOK, `{"error":"empty response content"}`
+		}
+		return http.StatusOK, okBody
+	})
+	mustPutChannel(t, &Channel{Name: "cp", BaseURL: up.URL, Enabled: true, Models: []string{"glm-5.3"},
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	chID := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chID+"/probe-upstreams", `{"model":"glm-5.3"}`, adminToken(t)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("probe status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Pipeline string   `json:"pipeline"`
+		Known    []string `json:"known"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if out.Pipeline != pipelinePlanner || strings.Join(out.Known, ",") != "alibaba,baseten" {
+		t.Fatalf("pipeline=%q known=%v", out.Pipeline, out.Known)
+	}
+	// 调用次序：capped 探测（空内容错误）→ 去 cap 重试 → 收割
+	if up.calls() != 3 {
+		t.Fatalf("calls=%d, want 3", up.calls())
+	}
+	var retry map[string]any
+	_ = json.Unmarshal([]byte(up.body(1)), &retry)
+	if _, has := retry["max_tokens"]; has {
+		t.Fatalf("重试请求不应带 max_tokens: %s", up.body(1))
+	}
+}
+
 // ---- 探测（direct 管线）----
 
 // openRouterStub 把 OpenRouter 目录指到按路径路由的测试桩，避免探测测试触网。

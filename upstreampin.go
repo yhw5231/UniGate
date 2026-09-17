@@ -354,10 +354,19 @@ func probeChannelModel(ch *Channel, k *UpKey, model string) (*ModelUpstreamPin, 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TestTimeout)
 	defer cancel()
 
-	// 1) 正常小请求：读 routing（管线 / 实际服务的渠道 / 备选列表 / tier-0）
+	// 1) 正常小请求：读 routing（管线 / 实际服务的渠道 / 备选列表 / tier-0）。
+	// 先带 max_tokens 上限控制探测开销；推理模型可能把配额全部烧在思考上，
+	// 网关返回 "empty response content" 类错误体（对标 classifyUpstreamError
+	// 把它记为 ok）——去掉上限重试一次再定论。
 	ans, err := sendProbeChat(ctx, &cand, probeRequestBody(model, "Reply with the word OK", probeAskTokens))
 	if err != nil {
 		return nil, err
+	}
+	if _, failed := probeErrorMessage(ans); failed {
+		ans, err = sendProbeChat(ctx, &cand, probeRequestBody(model, "Reply with the word OK", 0))
+		if err != nil {
+			return nil, err
+		}
 	}
 	if msg, failed := probeErrorMessage(ans); failed {
 		// 上游明确报错（模型不存在/限流/鉴权失败）：探测到此为止，把上游的
@@ -399,17 +408,33 @@ func probeChannelModel(ch *Channel, k *UpKey, model string) (*ModelUpstreamPin, 
 
 // probeErrorMessage 判定响应体是否为上游错误（有 error 且无 choices），
 // 是则返回可读文本。对标 probe() 的失败分支：模型不存在/限流/鉴权失败时
-// 探测直接失败，而不是带着空结果"成功"返回。
+// 探测直接失败，而不是带着空结果"成功"返回。仅认字符串错误和
+// {message:...} 形态——null/空对象/空串/其他结构不算错误（宁可不报，
+// 也不能把成功响应误判成失败）。
 func probeErrorMessage(body []byte) (string, bool) {
 	var payload struct {
 		Error   json.RawMessage   `json:"error"`
 		Choices []json.RawMessage `json:"choices"`
 	}
-	if json.Unmarshal(body, &payload) != nil || len(payload.Choices) > 0 || len(payload.Error) == 0 {
+	if json.Unmarshal(body, &payload) != nil || len(payload.Choices) > 0 {
 		return "", false
 	}
-	if msg := upstreamErrorText(payload.Error); msg != "" {
-		return msg, true
+	raw := payload.Error
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", false
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		if strings.TrimSpace(s) == "" {
+			return "", false
+		}
+		return s, true
+	}
+	var obj struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &obj) == nil && strings.TrimSpace(obj.Message) != "" {
+		return obj.Message, true
 	}
 	return "", false
 }

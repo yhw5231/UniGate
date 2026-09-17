@@ -400,9 +400,9 @@ func handleAdminValidateUpstreams(w http.ResponseWriter, r *http.Request) {
 
 // validateUpstream 用 only=[u] 的小请求测试单个内部渠道并分类结果。
 func validateUpstream(ch *Channel, k *UpKey, model, pipeline, upstream string) map[string]any {
-	reqBody := injectUpstreamPin(probeRequestBody(model, "hi"), pipeline, upstream, nil, "", nil)
+	reqBody := injectUpstreamPin(probeRequestBody(model, "hi", probeHarvestTokens), pipeline, upstream, nil, "", nil)
 	if reqBody == nil {
-		reqBody = probeRequestBody(model, "hi")
+		reqBody = probeRequestBody(model, "hi", probeHarvestTokens)
 	}
 	cand := candidate{ch: ch, k: k}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TestTimeout)

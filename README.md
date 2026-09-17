@@ -443,10 +443,15 @@ WebUI「设置」页「默认账号调度」或「路由」页顶部下拉（保
 两种写法都注入（各管线忽略不认识的字段）。**排序**（`sort`，可选）：cost（价格）/ttft（首字
 延迟）/tps（吞吐），direct 管线自动映射为 price/latency/throughput。
 
-- **探测**（每个模型行的「探测」按钮）：发两条小请求——正常请求从响应的
-  `provider_metadata.gateway.routing` 识别管线类型与实际服务的渠道；再把 only 钉到不存在的
-  渠道（`__probe__`），上游在花费 token 前报错并**点名全部可用渠道**（planner 文本
-  "Available providers are: …"，direct 为错误 JSON 的 `error.metadata.available_providers`）。
+- **探测**（每个模型行的「探测」按钮）：发两条（管线未知时至多三条）小请求——正常请求从响应的
+  `provider_metadata.gateway.routing` 识别管线类型与实际服务的渠道（真实网关把路由块挂在
+  响应**顶层**，message/choice 级一并兼容）；再把 only 钉到不存在的渠道（`__probe__`），
+  上游在花费 token 前报错并**点名全部可用渠道**（planner 文本
+  "Available providers are: …"，direct 为错误 JSON 的 `error.metadata.available_providers`；
+  每条收割请求只带当前管线那一种写法，管线未知时按 planner → direct 各发一次干净请求）。
+  direct 管线另从 OpenRouter 公开目录补充该模型的全部渠道；planner 的 tier-0 提示
+  （`planningReasoning` 里 "… won tier 0 over …" 点名的渠道）一并并入已知渠道。
+  上游对正常小请求明确报错（模型不存在/限流/鉴权失败）时探测直接失败并展示上游错误。
   探测产物（管线/渠道清单/最近实际渠道）立即落盘到渠道的 `model_pins`，在「已知渠道」里
   点击即可切换 固定→排除→移除；
 - **验证**（每个模型行的「验证」按钮）：对每个已知内部渠道发一条固定小请求，按上游响应分类

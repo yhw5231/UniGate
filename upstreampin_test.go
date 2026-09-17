@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -303,13 +304,16 @@ func TestUpstreamPinModelScoped(t *testing.T) {
 
 // ---- 探测（planner 管线）----
 
+// TestProbeUpstreamsPlannerPipeline 按真实 Cline Pass 线上形态 mock：路由块挂在
+// 响应顶层 provider_metadata（message 里只有 role/content）；收割报错是纯字符串
+// error。管线识别、收割、tier-0 提示、max_tokens、单一写法注入全部按此验证。
 func TestProbeUpstreamsPlannerPipeline(t *testing.T) {
 	setupGateway(t)
 	up := newScriptedUpstream(t, func(i int, body string) (int, string) {
 		if strings.Contains(body, "__probe__") {
-			return http.StatusBadRequest, `{"error":{"message":"Invalid provider __probe__. Available providers are: Alibaba, Baseten, GL."}}`
+			return http.StatusBadRequest, `{"error":"invalid_request_error: No allowed providers available. Available providers are: Alibaba, Baseten."}`
 		}
-		return http.StatusOK, `{"choices":[{"message":{"content":"OK","provider_metadata":{"gateway":{"routing":{"finalProvider":"alibaba","canonicalSlug":"glm-5.3","fallbacksAvailable":["Baseten"]}}}}}]}`
+		return http.StatusOK, `{"provider_metadata":{"gateway":{"routing":{"finalProvider":"alibaba","canonicalSlug":"z-ai/glm-5.3","planningReasoning":"alibaba won tier 0 over baseten and Novita"}}},"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"total_tokens":4}}`
 	})
 	mustPutChannel(t, &Channel{Name: "cp", BaseURL: up.URL, Enabled: true, Models: []string{"glm-5.3"},
 		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
@@ -331,21 +335,166 @@ func TestProbeUpstreamsPlannerPipeline(t *testing.T) {
 	if out.Pipeline != pipelinePlanner || out.LastProvider != "alibaba" {
 		t.Fatalf("pipeline=%q last=%q", out.Pipeline, out.LastProvider)
 	}
-	if strings.Join(out.Known, ",") != "alibaba,baseten,gl" {
+	// 收割清单 + tier-0 提示（baseten/novita 来自 planningReasoning）
+	if strings.Join(out.Known, ",") != "alibaba,baseten,novita" {
 		t.Fatalf("known = %v", out.Known)
 	}
 	// 探测产物写回渠道
 	snap := store.Snapshot().Channels[0]
 	pin := snap.ModelPins["glm-5.3"]
-	if pin == nil || pin.Pipeline != pipelinePlanner || len(pin.Known) != 3 || pin.LastProvider != "alibaba" || pin.CanonicalSlug != "glm-5.3" {
+	if pin == nil || pin.Pipeline != pipelinePlanner || len(pin.Known) != 3 || pin.LastProvider != "alibaba" || pin.CanonicalSlug != "z-ai/glm-5.3" {
 		t.Fatalf("persisted pin: %+v", pin)
+	}
+	// 探测请求体带 max_tokens（对标 probe=256）
+	var ask map[string]any
+	_ = json.Unmarshal([]byte(up.body(0)), &ask)
+	if ask["max_tokens"] != float64(256) {
+		t.Fatalf("probe max_tokens = %v", ask["max_tokens"])
+	}
+	// 收割请求：干净单一写法（仅 providerOptions.gateway.only，无顶层 provider），
+	// max_tokens 对齐 harvest=16
+	var harvest map[string]any
+	_ = json.Unmarshal([]byte(up.body(1)), &harvest)
+	if _, ok := harvest["provider"]; ok {
+		t.Fatalf("planner 收割不应带顶层 provider: %s", up.body(1))
+	}
+	gw := harvest["providerOptions"].(map[string]any)["gateway"].(map[string]any)
+	if fmt.Sprint(gw["only"]) != "[__probe__]" {
+		t.Fatalf("harvest gateway.only = %v", gw["only"])
+	}
+	if harvest["max_tokens"] != float64(16) {
+		t.Fatalf("harvest max_tokens = %v", harvest["max_tokens"])
+	}
+}
+
+// TestProbeUpstreamsUnknownPipeline 管线未知（响应无任何路由信息）时，收割按
+// planner → direct 各发一次干净请求：第一条（gateway-only）就点到清单则止。
+// 两种写法混入同一请求的旧形态会命中 mock 的混合分支（上游不点名）而拿不到清单。
+func TestProbeUpstreamsUnknownPipeline(t *testing.T) {
+	setupGateway(t)
+	up := newScriptedUpstream(t, func(i int, body string) (int, string) {
+		switch i {
+		case 0:
+			return http.StatusOK, `{"choices":[{"message":{"content":"OK"}}]}`
+		default:
+			var obj map[string]any
+			_ = json.Unmarshal([]byte(body), &obj)
+			_, hasPrv := obj["provider"]
+			_, hasPO := obj["providerOptions"]
+			if hasPrv == hasPO { // 混合写法或全无：上游不按任何一种点名
+				return http.StatusOK, `{"choices":[{"message":{"content":"OK"}}]}`
+			}
+			if hasPO {
+				return http.StatusBadRequest, `{"error":"invalid_request_error: No allowed providers available. Available providers are: Alibaba, Baseten."}`
+			}
+			return http.StatusBadRequest, `{"error":{"metadata":{"available_providers":["Gmicloud"]}}}`
+		}
+	})
+	mustPutChannel(t, &Channel{Name: "cp", BaseURL: up.URL, Enabled: true, Models: []string{"m"},
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	chID := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chID+"/probe-upstreams", `{"model":"m"}`, adminToken(t)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("probe status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Known []string `json:"known"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if strings.Join(out.Known, ",") != "alibaba,baseten" {
+		t.Fatalf("known = %v", out.Known)
+	}
+	if up.calls() != 2 { // 正常请求 + planner 收割（命中即止，不再发 direct）
+		t.Fatalf("calls=%d, want 2", up.calls())
+	}
+}
+
+// TestProbeUpstreamsUnknownPipelineDirectFallback planner 收割拿不到清单时，
+// 再用 direct 写法收割一次（OpenRouter 型 error.metadata.available_providers）。
+func TestProbeUpstreamsUnknownPipelineDirectFallback(t *testing.T) {
+	setupGateway(t)
+	up := newScriptedUpstream(t, func(i int, body string) (int, string) {
+		switch i {
+		case 0:
+			return http.StatusOK, `{"choices":[{"message":{"content":"OK"}}]}`
+		case 1: // planner 收割：上游没点名
+			return http.StatusOK, `{"error":{"message":"no allowed providers"}}`
+		default: // direct 收割
+			return http.StatusBadRequest, `{"error":{"metadata":{"available_providers":["Gmicloud"]}}}`
+		}
+	})
+	mustPutChannel(t, &Channel{Name: "cp", BaseURL: up.URL, Enabled: true, Models: []string{"m"},
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	chID := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chID+"/probe-upstreams", `{"model":"m"}`, adminToken(t)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("probe status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Known []string `json:"known"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if strings.Join(out.Known, ",") != "gmicloud" {
+		t.Fatalf("known = %v", out.Known)
+	}
+	if up.calls() != 3 {
+		t.Fatalf("calls=%d, want 3", up.calls())
+	}
+}
+
+// TestProbeUpstreamsUpstreamError 正常小请求被上游明确报错（模型不存在等）时，
+// 探测直接失败并把上游错误带给前端，而不是静默产出空探测产物。
+func TestProbeUpstreamsUpstreamError(t *testing.T) {
+	setupGateway(t)
+	up := newScriptedUpstream(t, func(i int, body string) (int, string) {
+		return http.StatusBadRequest, `{"error":{"message":"model not found","type":"invalid_request_error"}}`
+	})
+	mustPutChannel(t, &Channel{Name: "cp", BaseURL: up.URL, Enabled: true, Models: []string{"m"},
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	chID := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chID+"/probe-upstreams", `{"model":"m"}`, adminToken(t)))
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("probe status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "model not found") {
+		t.Fatalf("error body: %s", rr.Body.String())
 	}
 }
 
 // ---- 探测（direct 管线）----
 
+// openRouterStub 把 OpenRouter 目录指到按路径路由的测试桩，避免探测测试触网。
+func openRouterStub(t *testing.T, routes map[string]func() (int, string)) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fn, ok := routes[r.URL.Path]; ok {
+			st, body := fn()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(st)
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	old := openRouterBaseURL
+	openRouterBaseURL = srv.URL
+	t.Cleanup(func() { openRouterBaseURL = old })
+}
+
 func TestProbeUpstreamsDirectPipeline(t *testing.T) {
 	setupGateway(t)
+	openRouterStub(t, map[string]func() (int, string){
+		"/models/z-ai/glm-5.3/endpoints": func() (int, string) {
+			return http.StatusOK, `{"data":{"endpoints":[{"tag":"novita/z-ai/glm-5.3"},{"tag":"deepinfra/x"}]}}`
+		},
+	})
 	up := newScriptedUpstream(t, func(i int, body string) (int, string) {
 		if strings.Contains(body, "__probe__") {
 			return http.StatusBadRequest, `{"error":{"metadata":{"available_providers":["Alibaba","Baseten"]}}}`
@@ -362,23 +511,50 @@ func TestProbeUpstreamsDirectPipeline(t *testing.T) {
 		t.Fatalf("probe status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	var out struct {
-		Pipeline     string `json:"pipeline"`
-		LastProvider string `json:"last_provider"`
+		Pipeline     string   `json:"pipeline"`
+		LastProvider string   `json:"last_provider"`
 		Known        []string `json:"known"`
 	}
 	_ = json.Unmarshal(rr.Body.Bytes(), &out)
 	if out.Pipeline != pipelineDirect || out.LastProvider != "alibaba" {
 		t.Fatalf("pipeline=%q last=%q", out.Pipeline, out.LastProvider)
 	}
-	if strings.Join(out.Known, ",") != "alibaba,baseten" {
+	// 收割 + OpenRouter 目录（direct 管线的补充来源）
+	if strings.Join(out.Known, ",") != "alibaba,baseten,novita,deepinfra" {
 		t.Fatalf("known = %v", out.Known)
 	}
-	// direct 管线的收割请求应带顶层 provider.only
+	// direct 管线的收割请求应带顶层 provider.only，且不带 planner 写法
 	var probeBody map[string]any
 	_ = json.Unmarshal([]byte(up.body(1)), &probeBody)
 	prv := probeBody["provider"].(map[string]any)
 	if fmt.Sprint(prv["only"]) != "[__probe__]" {
 		t.Fatalf("harvest provider.only = %v", prv["only"])
+	}
+	if _, ok := probeBody["providerOptions"]; ok {
+		t.Fatalf("direct 收割不应带 providerOptions: %s", up.body(1))
+	}
+}
+
+// TestOpenRouterProviderSlugs 网关 slug 与 OpenRouter id 连字符不同时按去符号
+// 形态模糊匹配解析，再取该模型的渠道清单（tag org 段优先，退化 provider_name）。
+func TestOpenRouterProviderSlugs(t *testing.T) {
+	openRouterStub(t, map[string]func() (int, string){
+		"/models": func() (int, string) {
+			return http.StatusOK, `{"data":[{"id":"openai/gpt-4o"},{"id":"z-ai/glm-5.3"}]}`
+		},
+		"/models/z-ai/glm-5.3/endpoints": func() (int, string) {
+			return http.StatusOK, `{"data":{"endpoints":[{"tag":"alibaba/glm-5.3","provider_name":"Alibaba"},{"provider_name":"Novita AI"}]}}`
+		},
+	})
+	cand := &candidate{ch: &Channel{Name: "cp"}}
+	got := openRouterProviderSlugs(context.Background(), cand, "zai/glm-5.3")
+	if strings.Join(got, ",") != "alibaba,novita-ai" {
+		t.Fatalf("openRouterProviderSlugs = %v", got)
+	}
+	// 直取命中时不访问 /models
+	got = openRouterProviderSlugs(context.Background(), cand, "z-ai/glm-5.3")
+	if strings.Join(got, ",") != "alibaba,novita-ai" {
+		t.Fatalf("direct hit = %v", got)
 	}
 }
 
@@ -509,6 +685,24 @@ func TestParseGatewayRoutingEnvelope(t *testing.T) {
 	if r.pipeline != pipelinePlanner || r.finalProvider != "alibaba" || len(r.fallbacks) != 2 {
 		t.Fatalf("planner: %+v", r)
 	}
+	// 真实 Cline Pass 线上形态：路由块挂在响应顶层（message 里没有）
+	r = parseGatewayRouting([]byte(`{"provider_metadata":{"gateway":{"routing":{"finalProvider":"alibaba","canonicalSlug":"z-ai/glm","fallbacksAvailable":["Baseten"],"planningReasoning":"alibaba won tier 0 over baseten and Novita"}}},"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}`))
+	if r.pipeline != pipelinePlanner || r.finalProvider != "alibaba" || r.canonicalSlug != "z-ai/glm" {
+		t.Fatalf("planner top-level: %+v", r)
+	}
+	if strings.Join(r.tier0, ",") != "alibaba,baseten,novita" {
+		t.Fatalf("tier0 = %v", r.tier0)
+	}
+	// choice 级变体
+	r = parseGatewayRouting([]byte(`{"choices":[{"provider_metadata":{"gateway":{"routing":{"finalProvider":"baseten"}}},"message":{"content":"x"}}]}`))
+	if r.pipeline != pipelinePlanner || r.finalProvider != "baseten" {
+		t.Fatalf("planner choice-level: %+v", r)
+	}
+	// 信封内顶层路由
+	r = parseGatewayRouting([]byte(`{"data":{"provider_metadata":{"gateway":{"routing":{"finalProvider":"alibaba"}}},"choices":[{"message":{"content":"OK"}}]}}`))
+	if r.pipeline != pipelinePlanner || r.finalProvider != "alibaba" {
+		t.Fatalf("planner envelope: %+v", r)
+	}
 	r = parseGatewayRouting([]byte(`not json`))
 	if r.pipeline != "" {
 		t.Fatalf("garbage: %+v", r)
@@ -520,9 +714,25 @@ func TestExtractAvailableProviders(t *testing.T) {
 	if strings.Join(got, ",") != "alibaba,baseten,gl" {
 		t.Fatalf("planner extract: %v", got)
 	}
+	// 句子截进 JSON 碎片时只保留干净 slug（对标 smoke 用例）
+	got = extractAvailableProviders([]byte(`Available providers are: alibaba, ","type":"invalid_request_error".`), pipelinePlanner)
+	if strings.Join(got, ",") != "alibaba" {
+		t.Fatalf("planner garbage filter: %v", got)
+	}
 	got = extractAvailableProviders([]byte(`{"error":{"metadata":{"available_providers":["Alibaba Cloud","Baseten"]}}}`), pipelineDirect)
 	if strings.Join(got, ",") != "alibaba-cloud,baseten" {
 		t.Fatalf("direct extract: %v", got)
+	}
+}
+
+// TestMergeUniqueCap 合并结果上限 25（防异常上游灌入超长清单）。
+func TestMergeUniqueCap(t *testing.T) {
+	big := make([]string, 30)
+	for i := range big {
+		big[i] = fmt.Sprintf("p%d", i)
+	}
+	if got := mergeUnique(big, []string{"extra"}); len(got) != 25 {
+		t.Fatalf("cap = %d", len(got))
 	}
 }
 

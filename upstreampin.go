@@ -11,16 +11,22 @@
 //     失败由路由引擎故障转移到下一个内部渠道/key）；preferred 单候选注入
 //     完整 order 优先序，由上游按序自选。
 //
-// 探测：先发正常小请求从响应的 provider_metadata.gateway.routing 读管线类型
-// 与实际服务的渠道；再把 only 钉到不可能的渠道（__probe__）——上游在花费
-// token 前报错并点名全部可用渠道，从中收割渠道清单。探测产物持久化在渠道
-// 的 ModelPins 里供 WebUI 勾选，可随时重建。
+// 探测（对标 dsh-cline-pass 的 probe/harvest）：先发正常小请求从响应的
+// provider_metadata.gateway.routing 读管线类型与实际服务的渠道——真实网关把
+// 路由块挂在响应顶层（message/choice 级是一并兼容的变体）；再把 only 钉到
+// 不可能的渠道（__probe__）——上游在花费 token 前报错并点名全部可用渠道，
+// 从中收割渠道清单（每个收割请求只带当前管线那一种写法，管线未知时按
+// planner → direct 各发一次干净请求）；direct 管线另从 OpenRouter 公开目录
+// 补充该模型的全部渠道。探测产物持久化在渠道的 ModelPins 里供 WebUI 勾选，
+// 可随时重建。
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -220,53 +226,65 @@ type pinRouting struct {
 	canonicalSlug string
 	finalProvider string
 	fallbacks     []string
+	tier0         []string // 规划器 tier-0 考虑过的渠道（planningReasoning）
 }
 
-// gatewayEnvelope OpenAI 形态的响应（可能包 {data:...} 信封）。
+// gatewayRoutingBody provider_metadata.gateway.routing 的路由块（planner 管线）。
+type gatewayRoutingBody struct {
+	FinalProvider      string   `json:"finalProvider"`
+	CanonicalSlug      string   `json:"canonicalSlug"`
+	FallbacksAvailable []string `json:"fallbacksAvailable"`
+	PlanningReasoning  string   `json:"planningReasoning"`
+}
+
+// gatewayRoutingMeta provider_metadata 的 gateway 路由容器。
+type gatewayRoutingMeta struct {
+	Gateway struct {
+		Routing gatewayRoutingBody `json:"routing"`
+	} `json:"gateway"`
+}
+
+// gatewayEnvelope OpenAI 形态的响应（可能包 {data:...} 信封）。真实 Cline Pass
+// 网关把 planner 路由块挂在响应顶层 provider_metadata；message/choice 级是
+// 部分网关的变体，一并兼容（对标 parseRouting 的 message ?? payload 两级查找）。
 type gatewayEnvelope struct {
-	Data    json.RawMessage           `json:"data"`
-	Choices []gatewayEnvelopeChoice   `json:"choices"`
-	Provider string                    `json:"provider"`
-	Model    string                    `json:"model"`
+	Data             json.RawMessage         `json:"data"`
+	Choices          []gatewayEnvelopeChoice `json:"choices"`
+	Provider         string                  `json:"provider"`
+	Model            string                  `json:"model"`
+	ProviderMetadata *gatewayRoutingMeta     `json:"provider_metadata"`
 }
 
 type gatewayEnvelopeChoice struct {
 	Message struct {
-		ProviderMetadata struct {
-			Gateway struct {
-				Routing struct {
-					FinalProvider      string   `json:"finalProvider"`
-					CanonicalSlug      string   `json:"canonicalSlug"`
-					FallbacksAvailable []string `json:"fallbacksAvailable"`
-				} `json:"routing"`
-			} `json:"gateway"`
-		} `json:"provider_metadata"`
+		ProviderMetadata *gatewayRoutingMeta `json:"provider_metadata"`
 	} `json:"message"`
+	ProviderMetadata *gatewayRoutingMeta `json:"provider_metadata"`
 }
 
 // parseGatewayRouting 从 chat/completions 响应体解析上游路由信息（对标
 // dsh-cline-pass 的 parseRouting）：planner 管线的路由挂在
-// choices[0].message.provider_metadata.gateway.routing；direct 管线用顶层
-// provider 字符串。{data:{choices:...}} 信封自动展开。
+// provider_metadata.gateway.routing——依次读 choices[0].message、choices[0]、
+// 响应顶层；direct 管线用顶层 provider 字符串。{data:{choices:...}} 信封自动展开。
 func parseGatewayRouting(body []byte) pinRouting {
 	var env gatewayEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
 		return pinRouting{}
 	}
-	provider, model, choices := env.Provider, env.Model, env.Choices
+	provider, model, choices, meta := env.Provider, env.Model, env.Choices, env.ProviderMetadata
 	if len(env.Data) > 0 {
 		// {data:{...choices...}} 信封：展开后重新解析
 		var inner gatewayEnvelope
 		if json.Unmarshal(env.Data, &inner) == nil && len(inner.Choices) > 0 {
-			provider, model, choices = inner.Provider, inner.Model, inner.Choices
+			provider, model, choices, meta = inner.Provider, inner.Model, inner.Choices, inner.ProviderMetadata
 		}
 	}
 	var r pinRouting
-	if len(choices) > 0 {
-		rt := choices[0].Message.ProviderMetadata.Gateway.Routing
+	if rt := routingOf(choices, meta); rt != nil {
 		r.finalProvider = strings.TrimSpace(rt.FinalProvider)
 		r.canonicalSlug = strings.TrimSpace(rt.CanonicalSlug)
 		r.fallbacks = toSlugs(rt.FallbacksAvailable)
+		r.tier0 = parseTier0(rt.PlanningReasoning)
 	}
 	switch {
 	case r.finalProvider != "":
@@ -284,11 +302,45 @@ func parseGatewayRouting(body []byte) pinRouting {
 	return r
 }
 
+// routingOf 依次从 choices[0].message / choices[0] / 响应顶层取路由块。
+func routingOf(choices []gatewayEnvelopeChoice, top *gatewayRoutingMeta) *gatewayRoutingBody {
+	if len(choices) > 0 {
+		if m := choices[0].Message.ProviderMetadata; m != nil {
+			return &m.Gateway.Routing
+		}
+		if c := choices[0].ProviderMetadata; c != nil {
+			return &c.Gateway.Routing
+		}
+	}
+	if top != nil {
+		return &top.Gateway.Routing
+	}
+	return nil
+}
+
+// tier0Re 规划器推理句里的 tier-0 竞争渠道（对标 parseTier0）。
+var tier0Re = regexp.MustCompile(`([\w-]+) won tier 0 over ([^."]+)`)
+
+// parseTier0 从 planningReasoning 提取规划器 tier-0 考虑过的渠道：
+// "alibaba won tier 0 over baseten and novita" → [alibaba baseten novita]。
+// 被 tier-0 考虑过的渠道都是确认存在的内部渠道，可并入 Known。
+func parseTier0(plan string) []string {
+	m := tier0Re.FindStringSubmatch(plan)
+	if m == nil {
+		return nil
+	}
+	return toSlugs(append([]string{m[1]}, providerListSplitRe.Split(m[2], -1)...))
+}
+
 // availableProvidersRe planner 报错文本中的可用渠道清单。
 var availableProvidersRe = regexp.MustCompile(`Available providers are:\s*([^.]+)`)
 
 // providerListSplitRe 清单分隔：逗号或 " and "（部分网关用 and 连接末两项）。
 var providerListSplitRe = regexp.MustCompile(`\s*,\s*|\s+and\s+`)
+
+// plannerSlugRe planner 清单 token 的干净 slug 形态（对标 dsh-cline-pass 的
+// ^[a-z0-9][a-z0-9-]*$ 过滤）。
+var plannerSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 // probeChannelModel 探测渠道上某模型的内部渠道：识别管线、收割可用渠道
 // 清单、记录实际服务的渠道。返回更新后的固定配置（含探测产物，固定配置
@@ -302,10 +354,15 @@ func probeChannelModel(ch *Channel, k *UpKey, model string) (*ModelUpstreamPin, 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TestTimeout)
 	defer cancel()
 
-	// 1) 正常小请求：读 routing（管线 / 实际服务的渠道 / 备选列表）
-	ans, err := sendProbeChat(ctx, &cand, probeRequestBody(model, "Reply with the word OK"))
+	// 1) 正常小请求：读 routing（管线 / 实际服务的渠道 / 备选列表 / tier-0）
+	ans, err := sendProbeChat(ctx, &cand, probeRequestBody(model, "Reply with the word OK", probeAskTokens))
 	if err != nil {
 		return nil, err
+	}
+	if msg, failed := probeErrorMessage(ans); failed {
+		// 上游明确报错（模型不存在/限流/鉴权失败）：探测到此为止，把上游的
+		// 话报给人看，而不是静默产出一份空探测产物
+		return nil, fmt.Errorf("upstream: %s", truncate(msg, 300))
 	}
 	routing := parseGatewayRouting(ans)
 
@@ -316,23 +373,77 @@ func probeChannelModel(ch *Channel, k *UpKey, model string) (*ModelUpstreamPin, 
 		harvested = nil
 	}
 
+	// 3) direct 管线的补充来源：OpenRouter 公开目录里该模型的全部渠道
+	var endpoints []string
+	if routing.pipeline != pipelinePlanner && routing.canonicalSlug != "" {
+		endpoints = openRouterProviderSlugs(ctx, &cand, routing.canonicalSlug)
+	}
+
+	// 合并顺序即置信顺序（对标 probe 的 mergeUpstreams 顺序）；tier-0 与
+	// 上次探测产物追加在后
+	var known []string
+	switch routing.pipeline {
+	case pipelineDirect:
+		known = mergeUnique(routing.fallbacks, harvested, endpoints)
+	default:
+		known = mergeUnique(harvested, routing.fallbacks, endpoints)
+	}
 	pin.Pipeline = routing.pipeline
 	pin.LastProvider = routing.finalProvider
 	pin.CanonicalSlug = routing.canonicalSlug
-	pin.Known = mergeUnique(harvested, routing.fallbacks, pin.Known)
+	pin.Known = mergeUnique(known, routing.tier0, pin.Known)
 	pin.ProbedAt = time.Now().Unix()
 	pin.normalize()
 	return pin, nil
 }
 
-// harvestKnownProviders 把 only 钉到 __probe__ 触发上游「渠道不存在」报错，
-// 从报错里提取可用渠道全集。收割失败（上游不点名、网络错误）返回 nil。
-func harvestKnownProviders(ctx context.Context, cand *candidate, model, pipeline string) ([]string, error) {
-	ans, err := sendProbeChat(ctx, cand, injectUpstreamPin(probeRequestBody(model, "hi"), pipeline, "__probe__", nil, "", nil))
-	if err != nil {
-		return nil, err
+// probeErrorMessage 判定响应体是否为上游错误（有 error 且无 choices），
+// 是则返回可读文本。对标 probe() 的失败分支：模型不存在/限流/鉴权失败时
+// 探测直接失败，而不是带着空结果"成功"返回。
+func probeErrorMessage(body []byte) (string, bool) {
+	var payload struct {
+		Error   json.RawMessage   `json:"error"`
+		Choices []json.RawMessage `json:"choices"`
 	}
-	return extractAvailableProviders(ans, pipeline), nil
+	if json.Unmarshal(body, &payload) != nil || len(payload.Choices) > 0 || len(payload.Error) == 0 {
+		return "", false
+	}
+	if msg := upstreamErrorText(payload.Error); msg != "" {
+		return msg, true
+	}
+	return "", false
+}
+
+// harvestKnownProviders 把 only 钉到 __probe__ 触发上游「渠道不存在」报错，
+// 从报错里提取可用渠道全集。每个收割请求只带一种管线写法——管线已知发
+// 一次；管线未知按 planner → direct 各发一次干净请求（对标 harvest() 的
+// 单写法形态；两种写法混进同一请求会改变上游的路由判定/报错形态，反而
+// 收不到清单）。全部请求都失败才返回错误；只是没点到清单则返回 nil。
+func harvestKnownProviders(ctx context.Context, cand *candidate, model, pipeline string) ([]string, error) {
+	pipelines := []string{pipeline}
+	if pipeline == "" {
+		pipelines = []string{pipelinePlanner, pipelineDirect}
+	}
+	var merged []string
+	var firstErr error
+	for _, p := range pipelines {
+		body := injectUpstreamPin(probeRequestBody(model, "hi", probeHarvestTokens), p, "__probe__", nil, "", nil)
+		ans, err := sendProbeChat(ctx, cand, body)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		merged = mergeUnique(merged, extractAvailableProviders(ans, p))
+		if len(merged) > 0 {
+			return merged, nil
+		}
+	}
+	if len(merged) > 0 {
+		return merged, nil
+	}
+	return nil, firstErr
 }
 
 // extractAvailableProviders 从（错误）响应体提取可用内部渠道列表：
@@ -342,7 +453,7 @@ func extractAvailableProviders(body []byte, pipeline string) []string {
 	text := string(body)
 	if pipeline == pipelinePlanner || pipeline == "" {
 		if m := availableProvidersRe.FindStringSubmatch(text); m != nil {
-			if slugs := toSlugs(providerListSplitRe.Split(m[1], -1)); len(slugs) > 0 {
+			if slugs := toPlannerSlugs(providerListSplitRe.Split(m[1], -1)); len(slugs) > 0 {
 				return slugs
 			}
 		}
@@ -364,16 +475,44 @@ func extractAvailableProviders(body []byte, pipeline string) []string {
 	return nil
 }
 
+// toPlannerSlugs 报错句子里的渠道 token → slug：slugify 后只保留纯
+// [a-z0-9-] 形态。句子是从（JSON）报错体里截出来的，截取范围会混入
+// `","type":"invalid_request_error"` 之类碎片，不过滤会变成脏渠道名。
+func toPlannerSlugs(tokens []string) []string {
+	out := make([]string, 0, len(tokens))
+	seen := map[string]bool{}
+	for _, tok := range tokens {
+		s := slugifyProvider(tok)
+		if s == "" || seen[s] || !plannerSlugRe.MatchString(s) {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
 // ---- 探测/验证的请求辅助（与 WebUI 测试链路同形态）----
 
-// probeRequestBody 最小对话请求体。
-func probeRequestBody(model, msg string) []byte {
-	b, _ := json.Marshal(map[string]any{
+// 探测/收割请求的 max_tokens（对标 probe=256 / harvest=16）：不带 max_tokens
+// 时推理模型可能把无上限的生成烧在探测请求上。
+const (
+	probeAskTokens     = 256
+	probeHarvestTokens = 16
+)
+
+// probeRequestBody 最小对话请求体（maxTokens>0 时带上）。
+func probeRequestBody(model, msg string, maxTokens int) []byte {
+	b := map[string]any{
 		"model":    model,
 		"messages": []map[string]string{{"role": "user", "content": msg}},
 		"stream":   false,
-	})
-	return b
+	}
+	if maxTokens > 0 {
+		b["max_tokens"] = maxTokens
+	}
+	out, _ := json.Marshal(b)
+	return out
 }
 
 // sendProbeChat 用指定候选发一条非流式请求（渠道头、key、代理与真实转发
@@ -427,7 +566,8 @@ func slugifyProvider(v string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// mergeUnique 多列表合并去重保序（先到先得，不排序——列表顺序即置信顺序）。
+// mergeUnique 多列表合并去重保序（先到先得，不排序——列表顺序即置信顺序），
+// 上限 25（对标 mergeUpstreams，防异常上游灌入超长清单）。
 func mergeUnique(lists ...[]string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -438,7 +578,167 @@ func mergeUnique(lists ...[]string) []string {
 			}
 			seen[v] = true
 			out = append(out, v)
+			if len(out) >= maxKnownUpstreams {
+				return out
+			}
 		}
 	}
 	return out
+}
+
+// ---- direct 管线的 OpenRouter 目录补充来源（对标 openRouterEndpoints）----
+
+// maxKnownUpstreams 单模型 Known 清单上限。
+const maxKnownUpstreams = 25
+
+// openRouterBaseURL OpenRouter 公开 API（var 仅为测试可替换；公开接口无需鉴权）。
+var openRouterBaseURL = "https://openrouter.ai/api/v1"
+
+// openRouterFetchBudget OpenRouter 目录请求的独立预算（受探测总超时约束）。
+const openRouterFetchBudget = 30 * time.Second
+
+// openRouterProviderSlugs 拉取 OpenRouter 上该模型的全部渠道 slug。网关的
+// canonicalSlug 与 OpenRouter id 可能连字符不同（zai/… vs z-ai/…），先直取，
+// 失败再按去符号形态模糊匹配解析一次。任何失败都静默跳过——这只是
+// direct 管线渠道清单的补充来源，不影响探测结论。
+func openRouterProviderSlugs(ctx context.Context, cand *candidate, canonicalSlug string) []string {
+	ctx, cancel := context.WithTimeout(ctx, openRouterFetchBudget)
+	defer cancel()
+	if slugs := fetchOpenRouterEndpoints(ctx, cand, canonicalSlug); len(slugs) > 0 {
+		return slugs
+	}
+	real := resolveOpenRouterSlug(ctx, cand, canonicalSlug)
+	if real == "" || real == canonicalSlug {
+		return nil
+	}
+	return fetchOpenRouterEndpoints(ctx, cand, real)
+}
+
+// openRouterSlugPath 拼路径用的 slug 清洗：OpenRouter id 含 org/ 段，斜杠要
+// 保留；其余字符只留 id 安全字符，杜绝 `?`/`#`/`..` 之类的路径注入。
+func openRouterSlugPath(slug string) string {
+	if strings.Contains(slug, "..") {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range slug {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '.', r == '_', r == '/':
+			b.WriteRune(r)
+		}
+	}
+	return strings.Trim(b.String(), "/")
+}
+
+// fetchOpenRouterEndpoints GET /models/{slug}/endpoints，聚合渠道 slug
+// （endpoint tag 的 org 段优先，退化用 provider_name）。
+func fetchOpenRouterEndpoints(ctx context.Context, cand *candidate, slug string) []string {
+	slug = openRouterSlugPath(slug)
+	if slug == "" {
+		return nil
+	}
+	route, err := resolveProxy(cand)
+	if err != nil {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		openRouterBaseURL+"/models/"+slug+"/endpoints", nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := newUpstreamClient(route).Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil
+	}
+	var detail struct {
+		Data struct {
+			Endpoints []struct {
+				Tag          string `json:"tag"`
+				ProviderName string `json:"provider_name"`
+			} `json:"endpoints"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(data, &detail) != nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, e := range detail.Data.Endpoints {
+		s := slugifyProvider(strings.SplitN(e.Tag, "/", 2)[0])
+		if s == "" {
+			s = slugifyProvider(e.ProviderName)
+		}
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// resolveOpenRouterSlug 在 OpenRouter 模型目录里按去符号形态模糊匹配 slug。
+func resolveOpenRouterSlug(ctx context.Context, cand *candidate, slug string) string {
+	route, err := resolveProxy(cand)
+	if err != nil {
+		return ""
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, openRouterBaseURL+"/models", nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := newUpstreamClient(route).Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return ""
+	}
+	var catalog struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(data, &catalog) != nil {
+		return ""
+	}
+	normalize := func(v string) string {
+		return strings.Map(func(r rune) rune {
+			if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+				return r
+			}
+			if r >= 'A' && r <= 'Z' {
+				return r + ('a' - 'A')
+			}
+			return -1
+		}, v)
+	}
+	want := normalize(slug)
+	for _, m := range catalog.Data {
+		if m.ID == slug {
+			return m.ID
+		}
+	}
+	for _, m := range catalog.Data {
+		if normalize(m.ID) == want && want != "" {
+			return m.ID
+		}
+	}
+	return ""
 }

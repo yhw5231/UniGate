@@ -23,6 +23,7 @@ type Config struct {
 	GWPath          string // gateway.json 路径
 	AccountsPath    string
 	TokenSecretPath string
+	CooldownPath    string // cooldowns.json 路径（429 冷却持久化）
 
 	// 登录验证（WebUI / Admin API）
 	LoginRequired bool
@@ -104,6 +105,7 @@ func loadConfig() Config {
 	gwPath := getenv("GATEWAY_CONFIG_PATH", filepath.Join(dataDir, "gateway.json"))
 	accountsPath := getenv("ACCOUNTS_PATH", filepath.Join(dataDir, "accounts.json"))
 	tokenSecretPath := getenv("TOKEN_SECRET_PATH", filepath.Join(dataDir, "token-secret"))
+	cooldownPath := getenv("COOLDOWN_PATH", filepath.Join(dataDir, "cooldowns.json"))
 	usageDBPath := getenv("USAGE_DB_PATH", filepath.Join(dataDir, "usage.db"))
 
 	persisted, _ := loadPersistedAccounts(accountsPath)
@@ -139,6 +141,7 @@ func loadConfig() Config {
 		GWPath:          gwPath,
 		AccountsPath:    accountsPath,
 		TokenSecretPath: tokenSecretPath,
+		CooldownPath:    cooldownPath,
 
 		LoginRequired: loginReq,
 		AdminUser:     adminUser,

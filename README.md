@@ -252,6 +252,7 @@ journalctl -u unigate -f             # 跟踪日志
 | `token-secret` | 登录 token 签名密钥（首次启动自动生成；固定后重启不影响已登录状态） |
 | `usage.db` | 用量统计 + 请求/错误日志 SQLite 数据库（请求/错误日志持久化，重启不丢） |
 | `lease-assignments.json` | 代理池「key→租约」分配表（保证重启后一号一 IP 不变） |
+| `cooldowns.json` | 429 冷却状态（key/model → 重试到期时间；重启、重新部署后自动恢复，不会因重启清零而立刻冲击限流中的上游账号） |
 
 备份即备份该目录；迁移到新机器：停服 → 拷贝整个目录 → 启动，配置自动加载。
 自定义路径可用 `DATA_DIR` 与 `GATEWAY_CONFIG_PATH` 等环境变量（见下文配置表）。
@@ -497,6 +498,7 @@ Admin API（均需管理员 token）：`PUT /admin/api/channels/{id}/model-pin` 
 | `TZ` | 镜像内 `Asia/Shanghai` | 服务进程时区（影响启动/运行日志时间戳）；容器已装 tzdata，改为 `UTC` 等即可。WebUI 显示的时间不受此影响，始终按北京时间渲染 |
 | `GATEWAY_CONFIG_PATH` | `${DATA_DIR}/gateway.json` | 渠道/密钥配置文件（WebUI 管理） |
 | `LEASE_ASSIGN_PATH` | `${DATA_DIR}/lease-assignments.json` | 代理池「key→租约」分配表（跨渠道复用，持久化保证 IP 稳定） |
+| `COOLDOWN_PATH` | `${DATA_DIR}/cooldowns.json` | 429 冷却状态持久化文件（原子写入；启动时恢复未过期冷却） |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `admin` | WebUI 管理员账号；Admin API 仅此账号可用。启动日志只打印用户名，不打印密码 |
 | `LOGIN_FAIL_LOCKOUT` | `5` | 连续登录失败达到该次数后按「用户名」与「来源 IP」分别锁定（指数退避，封顶 1h）。0 = 关闭防爆破 |
 | `LOGIN_FAIL_WINDOW` | `5m` | 登录失败计数窗口，同时是锁定基础时长（超过阈值后每多失败一次翻倍） |

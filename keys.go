@@ -1,6 +1,9 @@
 // 冷却表：按 (上游 keyID, model 部分) 记录故障冷却，路由引擎据此跳过不可用 key。
 // model 部分由渠道级冷却粒度开关决定：默认按 key 跨模型共享（传空串），
 // 渠道显式 "key_model" 时按 (key, model) 独立冷却。
+// 冷却状态持久化到 data/cooldowns.json（SetPersistPath，原子写入），启动时恢复：
+// 上游按日/按时长限流的账号冷却动辄数小时（如 "Try again in 14h"），重启即丢的话
+// 重新部署后网关会立刻把请求打回限流中的账号，反复撞 429。
 // 目前只有上游 429 记冷却：冷却时长优先取上游明确给出的到期时间
 //（Retry-After 头，或响应体里的 "Try again in 14h 23m" 类文本/时间戳），
 // 上游没给明确时间才用 RATE_LIMIT_COOLDOWN；
@@ -8,6 +11,12 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,12 +33,90 @@ type cooldownPair struct {
 type Cooldowns struct {
 	mu    sync.Mutex
 	until map[cooldownPair]time.Time
+	path  string // 冷却持久化文件路径（SetPersistPath 设置；空 = 仅内存，测试默认）
 }
 
 var cool *Cooldowns
 
 func newCooldowns() *Cooldowns {
 	return &Cooldowns{until: map[cooldownPair]time.Time{}}
+}
+
+// persistedCooldowns cooldowns.json 的文件格式：只写未过期条目，启动时恢复。
+type persistedCooldowns struct {
+	SavedAt int64               `json:"saved_at"`
+	Entries []persistedCooldown `json:"entries"`
+}
+
+type persistedCooldown struct {
+	KeyID string `json:"key_id"`
+	Model string `json:"model,omitempty"` // 空 = 按 key 共享粒度
+	Until int64  `json:"until_unix"`      // 冷却到期时间（unix 秒）
+}
+
+// SetPersistPath 设置冷却持久化文件并加载已有条目（进程启动时调用一次；
+// 已过期条目直接丢弃）。测试不调用此函数，冷却仅在内存中。
+func (c *Cooldowns) SetPersistPath(path string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.path = path
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read cooldowns: %w", err)
+	}
+	var data persistedCooldowns
+	if err := json.Unmarshal(body, &data); err != nil {
+		return fmt.Errorf("decode cooldowns: %w", err)
+	}
+	now := time.Now()
+	for _, e := range data.Entries {
+		if e.KeyID == "" || e.Until <= now.Unix() {
+			continue
+		}
+		c.until[cooldownPair{e.KeyID, e.Model}] = time.Unix(e.Until, 0)
+	}
+	return nil
+}
+
+// saveLocked 原子落盘冷却表（调用方持有写锁；未配置路径时跳过）。
+// 只写未过期条目；写失败仅记日志，不影响内存状态。冷却变更（429 记冷却、
+// 穿透成功/Admin 操作解除）都是低频事件，同步写即可，重启前最后一笔不丢。
+func (c *Cooldowns) saveLocked() {
+	if c.path == "" {
+		return
+	}
+	dir := filepath.Dir(c.path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			log.Printf("save cooldowns: %v", err)
+			return
+		}
+	}
+	now := time.Now()
+	data := persistedCooldowns{SavedAt: now.Unix(), Entries: []persistedCooldown{}}
+	for p, until := range c.until {
+		if !now.Before(until) {
+			continue
+		}
+		data.Entries = append(data.Entries, persistedCooldown{KeyID: p.keyID, Model: p.model, Until: until.Unix()})
+	}
+	body, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return
+	}
+	body = append(body, '\n')
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+		log.Printf("save cooldowns: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, c.path); err != nil {
+		_ = os.Remove(tmp)
+		log.Printf("save cooldowns: %v", err)
+	}
 }
 
 // IsCooling 返回 (keyID, model) 是否处于冷却中。
@@ -57,6 +144,7 @@ func (c *Cooldowns) Mark(keyID, model string, dur time.Duration) {
 	defer c.mu.Unlock()
 	c.until[cooldownPair{keyID, model}] = time.Now().Add(dur)
 	if len(c.until) <= cooldownSoftCap {
+		c.saveLocked()
 		return
 	}
 	c.pruneLocked()
@@ -69,6 +157,7 @@ func (c *Cooldowns) Mark(keyID, model string, dur time.Duration) {
 			delete(c.until, k)
 		}
 	}
+	c.saveLocked()
 }
 
 // Clear 解除 (keyID, model) 的冷却。渠道测试成功后调用：
@@ -76,7 +165,12 @@ func (c *Cooldowns) Mark(keyID, model string, dur time.Duration) {
 func (c *Cooldowns) Clear(keyID, model string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.until, cooldownPair{keyID, model})
+	p := cooldownPair{keyID, model}
+	if _, ok := c.until[p]; !ok {
+		return
+	}
+	delete(c.until, p)
+	c.saveLocked()
 }
 
 // ClearKey 解除某 key 的全部冷却（所有模型粒度），返回清除的条数。
@@ -91,6 +185,9 @@ func (c *Cooldowns) ClearKey(keyID string) int {
 			n++
 		}
 	}
+	if n > 0 {
+		c.saveLocked()
+	}
 	return n
 }
 
@@ -104,6 +201,7 @@ func (c *Cooldowns) ClearModel(keyID, model string) bool {
 		return false
 	}
 	delete(c.until, p)
+	c.saveLocked()
 	return true
 }
 
@@ -129,7 +227,11 @@ func (c *Cooldowns) ClearAll() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	n := len(c.until)
+	if n == 0 {
+		return 0
+	}
 	c.until = map[cooldownPair]time.Time{}
+	c.saveLocked()
 	return n
 }
 

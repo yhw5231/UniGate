@@ -45,6 +45,10 @@ func main() {
 	}
 
 	cool = newCooldowns()
+	if err := cool.SetPersistPath(cfg.CooldownPath); err != nil {
+		// 恢复失败不阻断启动：冷却丢了的后果只是重新部署后先撞一轮 429
+		log.Printf("warning: load cooldowns %s: %v", cfg.CooldownPath, err)
+	}
 	streaks = newStreaks()
 	policy.Store(defaultPolicy())   // 环境变量默认
 	applySettings(store.Settings()) // WebUI 设置覆盖（gateway.json）

@@ -1505,3 +1505,76 @@ func TestCooldownsClearModelAndMap(t *testing.T) {
 		t.Fatal("ClearAll must empty the table")
 	}
 }
+
+// TestCooldownsPersistRoundTrip 冷却状态跨进程重启恢复：Mark/Clear 落盘
+// cooldowns.json，新实例加载后冷却状态一致；过期条目加载时丢弃，损坏文件报错。
+func TestCooldownsPersistRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cooldowns.json")
+
+	c1 := newCooldowns()
+	if err := c1.SetPersistPath(path); err != nil {
+		t.Fatalf("SetPersistPath() error = %v", err)
+	}
+	c1.Mark("k1", "", time.Hour)
+	c1.Mark("k2", "gpt-x", 2*time.Hour)
+	wantUntil, ok := c1.CoolingKey("k2", "gpt-x")
+	if !ok {
+		t.Fatal("k2/gpt-x should be cooling after Mark")
+	}
+
+	// 模拟重启：新实例从文件恢复
+	c2 := newCooldowns()
+	if err := c2.SetPersistPath(path); err != nil {
+		t.Fatalf("SetPersistPath() reload error = %v", err)
+	}
+	if !c2.IsCooling("k1", "") {
+		t.Fatal("cooled key not restored from disk")
+	}
+	gotUntil, ok := c2.CoolingKey("k2", "gpt-x")
+	if !ok {
+		t.Fatal("cooled (key, model) not restored from disk")
+	}
+	if gotUntil.Unix() != wantUntil.Unix() {
+		t.Fatalf("restored until = %v, want %v", gotUntil, wantUntil)
+	}
+
+	// 清除落盘：重启后不再冷却，未清除的条目保留
+	if n := c2.ClearKey("k1"); n != 1 {
+		t.Fatalf("ClearKey() = %d, want 1", n)
+	}
+	c3 := newCooldowns()
+	if err := c3.SetPersistPath(path); err != nil {
+		t.Fatalf("SetPersistPath() reload after clear error = %v", err)
+	}
+	if c3.IsCooling("k1", "") {
+		t.Fatal("cleared key still cooling after reload")
+	}
+	if _, ok := c3.CoolingKey("k2", "gpt-x"); !ok {
+		t.Fatal("surviving entry lost after clear+reload")
+	}
+
+	// 文件里的过期条目加载时丢弃
+	expired := `{"saved_at":1,"entries":[{"key_id":"k9","until_unix":1}]}`
+	if err := os.WriteFile(path, []byte(expired), 0o600); err != nil {
+		t.Fatalf("write expired fixture: %v", err)
+	}
+	c4 := newCooldowns()
+	if err := c4.SetPersistPath(path); err != nil {
+		t.Fatalf("SetPersistPath() expired error = %v", err)
+	}
+	if c4.IsCooling("k9", "") {
+		t.Fatal("expired entry was restored")
+	}
+
+	// 损坏文件报错（main 里仅告警，不阻断启动），内存状态保持为空
+	if err := os.WriteFile(path, []byte("{bad"), 0o600); err != nil {
+		t.Fatalf("write corrupt fixture: %v", err)
+	}
+	c5 := newCooldowns()
+	if err := c5.SetPersistPath(path); err == nil {
+		t.Fatal("SetPersistPath() on corrupt file should fail")
+	}
+	if len(c5.CoolingList()) != 0 {
+		t.Fatal("corrupt file must not inject entries")
+	}
+}

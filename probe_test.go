@@ -5,8 +5,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -213,6 +216,94 @@ func TestProbeExecuteSendsAddition(t *testing.T) {
 	if last, ok := activity.lastCall("k1", ""); !ok || time.Since(last) > time.Minute {
 		t.Fatal("probe should refresh key activity")
 	}
+}
+
+// TestProbeRecordUsageTokens 探测响应的 usage 要写进请求日志的 Tokens 列：
+// chat 响应读 usage.prompt_tokens/completion_tokens，responses 渠道的响应体
+// （Responses 对象）读 input/output_tokens；上游未回 usage 时记 0（不是解析
+// 失败留下的假数据，日志照旧可读）。
+func TestProbeRecordUsageTokens(t *testing.T) {
+	cases := []struct {
+		name       string
+		endpoint   string
+		resp       func(sum int) string
+		wantPrompt int64
+		wantOut    int64
+	}{
+		{
+			name:     "chat",
+			endpoint: endpointChat,
+			resp: func(sum int) string {
+				return fmt.Sprintf(`{"choices":[{"message":{"content":"%d"}}],"usage":{"prompt_tokens":31,"completion_tokens":9}}`, sum)
+			},
+			wantPrompt: 31, wantOut: 9,
+		},
+		{
+			name:     "responses",
+			endpoint: endpointResponses,
+			resp: func(sum int) string {
+				return fmt.Sprintf(`{"id":"r1","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"%d"}]}],"usage":{"input_tokens":17,"output_tokens":4,"total_tokens":21}}`, sum)
+			},
+			wantPrompt: 17, wantOut: 4,
+		},
+		{
+			name:     "no usage",
+			endpoint: endpointChat,
+			resp: func(sum int) string {
+				return fmt.Sprintf(`{"choices":[{"message":{"content":"%d"}}]}`, sum)
+			},
+			wantPrompt: 0, wantOut: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupProbeTest(t)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				a, b, c := probeQuestionFromBody(t, raw)
+				_, _ = w.Write([]byte(tc.resp(a + b + c)))
+			}))
+			defer up.Close()
+
+			ch := testProbeChannel(true)
+			ch.BaseURL = up.URL
+			ch.EndpointType = tc.endpoint
+			if err := store.PutChannel(ch); err != nil {
+				t.Fatal(err)
+			}
+			probes.execute(probeTask{Kind: probeKindIdle, Ch: ch, Key: ch.Keys[0], Model: "m1"})
+
+			recs := reqLog.Snapshot()
+			if len(recs) == 0 {
+				t.Fatal("probe request not logged")
+			}
+			if recs[0].PromptTokens != tc.wantPrompt || recs[0].CompletionTokens != tc.wantOut {
+				t.Fatalf("recorded tokens = %d/%d, want %d/%d (rec %+v)",
+					recs[0].PromptTokens, recs[0].CompletionTokens, tc.wantPrompt, tc.wantOut, recs[0])
+			}
+		})
+	}
+}
+
+// probeQuestionRe 从请求体（chat 的 messages 或 responses 的 input 都适用）
+// 里取加法题的操作数。
+var probeQuestionRe = regexp.MustCompile(`What is (\d+) \+ (\d+) \+ (\d+)\?`)
+
+func probeQuestionFromBody(t *testing.T, raw []byte) (int, int, int) {
+	t.Helper()
+	m := probeQuestionRe.FindStringSubmatch(string(raw))
+	if m == nil {
+		t.Fatalf("no probe question in request body: %s", truncate(string(raw), 200))
+	}
+	var a, b, c int
+	for i, dst := range []*int{&a, &b, &c} {
+		n, err := strconv.Atoi(m[i+1])
+		if err != nil {
+			t.Fatalf("parse operand %q: %v", m[i+1], err)
+		}
+		*dst = n
+	}
+	return a, b, c
 }
 
 // parseProbeQuestion 从探测问题文本解析三个操作数（测试辅助）。

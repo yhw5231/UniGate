@@ -1356,11 +1356,19 @@ function fmtTimeFull(t) { return toBeijing(t).replace("T", " ").replace(/\.\d+Z$
 // fmtTimeShort 北京时间 YYYY-MM-DD HH:MM:SS（表格列内）。
 function fmtTimeShort(t) { return toBeijing(t).replace("T", " ").slice(0, 19); }
 
+// userLabel 日志「下游」列展示：探测请求的 User 是内部哨兵 "probe"（后端存
+// 枚举值，便于按固定值查询），展示为中文「探测」；真实下游用户名原样显示。
+function userLabel(u) {
+  return u === "probe" ? "探测" : (u || "");
+}
+
 // logSearchText 把一条记录的全部字段拍平成搜索文本（当前页全字段不区分大小写过滤）。
+// 下游列同时收原始值与展示值，搜 "probe" 与「探测」都能命中。
 function logSearchText(r) {
   return [
     r.time, r.method, r.path, r.status, r.duration_ms, r.channel, r.key,
-    r.model, r.prompt_tokens, r.completion_tokens, r.user, r.client_ip, r.error, r.id,
+    r.model, r.prompt_tokens, r.completion_tokens, r.user, userLabel(r.user),
+    r.client_ip, r.error, r.id,
   ].filter((v) => v != null && v !== "").join(" ").toLowerCase();
 }
 
@@ -1396,7 +1404,7 @@ function renderLogRows(tbodySel, st, emptyTip) {
       <td class="muted" title="${esc(r.key || "")}">${esc(r.key || "")}</td>
       <td title="${esc(r.model || "")}">${esc(r.model || "")}</td>
       <td class="muted nowrap">${r.prompt_tokens || 0} / ${r.completion_tokens || 0}</td>
-      <td title="${esc(r.user || "")}">${esc(r.user || "")}</td>
+      <td title="${esc(userLabel(r.user))}">${esc(userLabel(r.user))}</td>
       <td class="nowrap" title="${esc(r.client_ip || "")}">${esc(r.client_ip || "")}</td>
       ${errCell}
     </tr>
@@ -1429,7 +1437,7 @@ function logDetailRow(id, r) {
       ${f("key", r.key)}
       ${f("模型", r.model)}
       ${f("Tokens 入/出", (r.prompt_tokens || 0) + " / " + (r.completion_tokens || 0))}
-      ${f("下游", r.user)}
+      ${f("下游", userLabel(r.user))}
       ${f("出口", r.client_ip)}
     </div>
     ${r.error ? `<div class="e">${esc(r.error)}</div>` : ""}

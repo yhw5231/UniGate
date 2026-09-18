@@ -148,6 +148,22 @@ func TestUsageDBWindowFilter(t *testing.T) {
 	}
 }
 
+// TestUsageDBWindowIncludesSameInstantWrite 右界为「查询时刻」且按闭区间过滤：
+// Windows 等平台 time.Now() 只有毫秒精度，同一毫秒内先写入的事件时间戳可能
+// 恰好等于查询窗口的 end——开区间（time < end）会把它判在窗外，表现为「刚发生
+// 的请求立刻查不到」。用毫秒取整的时刻构造该边界，记录必须在窗口内。
+func TestUsageDBWindowIncludesSameInstantWrite(t *testing.T) {
+	dir := t.TempDir()
+	db := newUsageDB(filepath.Join(dir, "usage.db"), 30, 1000)
+	defer db.Close()
+
+	now := time.UnixMilli(time.Now().UnixMilli())
+	db.Append(UsageEvent{Time: now, User: "u", Model: "m1", Key: "k@c", PromptTokens: 5, Status: 200})
+	if res := db.Query(UsageFilter{Start: now.Add(-time.Hour), End: now}); res.Requests != 1 || res.PromptTokens != 5 {
+		t.Fatalf("same-instant write must be inside the window, got %+v", res)
+	}
+}
+
 func TestUsageDBDimensionFilter(t *testing.T) {
 	dir := t.TempDir()
 	db := newUsageDB(filepath.Join(dir, "usage.db"), 30, 1000)

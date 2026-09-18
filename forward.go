@@ -90,6 +90,21 @@ func parseUsageJSON(raw []byte) (int64, int64) {
 	return obj.Usage.PromptTokens, obj.Usage.CompletionTokens
 }
 
+// parseUsageFromBody 解析一次完整上游响应体的 token 用量：chat 响应读
+// usage.prompt_tokens/completion_tokens，Responses 对象（input/output_tokens）
+// 先按网关转发时的同款转换再读。供不经过 statsMiddleware 的内部请求（自动探测、
+// 渠道测试）补齐日志的 Tokens 列——这些请求自己写记录，拿不到中间件记账。
+// 上游没回 usage 时返回 0/0。
+func parseUsageFromBody(raw []byte) (int64, int64) {
+	if p, c := parseUsageJSON(raw); p > 0 || c > 0 {
+		return p, c
+	}
+	if out, ok := responsesToChatCompletion(raw); ok {
+		return parseUsageJSON(out)
+	}
+	return 0, 0
+}
+
 // parseUsageFromFrame 从 SSE 帧中解析 usage（OpenAI 流式在末尾 chunk 带 usage）。
 func parseUsageFromFrame(frame []byte) (int64, int64, bool) {
 	for _, line := range strings.Split(string(frame), "\n") {

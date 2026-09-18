@@ -18,9 +18,10 @@
 //     账号仍然可用；停用与冷却中的账号不探测；间隔 0 = 关闭空闲探测。
 //
 // 探测本身就是一次真实调用：无论结果如何都会刷新该 key（及对应模型）的空闲
-// 计时（因此持续空闲的账号每个间隔探测一次）。结果写入请求日志（User 列为
-// "probe"，可在日志页按用户过滤查看），不计入用量统计；答案异常（上游 2xx
-// 但回复里找不到正确的加法结果）同样记入错误日志供人工核查。
+// 计时（因此持续空闲的账号每个间隔探测一次）。结果写入请求日志（User 列存
+// "probe"，日志页显示为「探测」，可按该列搜索/过滤查看），带真实 token 用量
+// 但不计入用量统计；答案异常（上游 2xx 但回复里找不到正确的加法结果）同样
+// 记入错误日志供人工核查。
 package main
 
 import (
@@ -39,7 +40,7 @@ import (
 )
 
 const (
-	probeUser      = "probe" // 请求日志中探测请求的 User 标识
+	probeUser      = "probe" // 请求日志中探测请求的 User 标识（日志页显示为「探测」）
 	probeScanEvery = 30 * time.Second
 	probeKindIdle  = "idle"
 	probeKindRecov = "recover"
@@ -714,19 +715,22 @@ func recordProbeRequest(t probeTask, res probeHTTPResult, errMsg string) {
 	if reqLog == nil {
 		return
 	}
+	promptTok, completionTok := parseUsageFromBody([]byte(res.body))
 	rec := RequestRecord{
-		ID:         strconv.FormatInt(time.Now().UnixNano(), 36),
-		Time:       res.start,
-		Duration:   time.Since(res.start),
-		DurationMs: time.Since(res.start).Milliseconds(),
-		Method:     http.MethodPost,
-		Path:       res.target,
-		Status:     res.status,
-		BytesOut:   int64(len(res.body)),
-		User:       probeUser,
-		Channel:    t.Ch.Name,
-		Model:      t.Model,
-		Key:        t.Key.Name + "@" + t.Ch.Name,
+		ID:               strconv.FormatInt(time.Now().UnixNano(), 36),
+		Time:             res.start,
+		Duration:         time.Since(res.start),
+		DurationMs:       time.Since(res.start).Milliseconds(),
+		Method:           http.MethodPost,
+		Path:             res.target,
+		Status:           res.status,
+		BytesOut:         int64(len(res.body)),
+		PromptTokens:     promptTok,
+		CompletionTokens: completionTok,
+		User:             probeUser,
+		Channel:          t.Ch.Name,
+		Model:            t.Model,
+		Key:              t.Key.Name + "@" + t.Ch.Name,
 	}
 	if errMsg != "" {
 		rec.ErrMsg = truncate(errMsg, errMsgMax)

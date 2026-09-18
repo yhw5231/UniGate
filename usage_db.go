@@ -511,7 +511,8 @@ type UsageResult struct {
 	ByKey            []UsageBreakdown `json:"by_key,omitempty"`
 }
 
-// resolveWindow 把窗口字符串解析成 [start,end)。
+// resolveWindow 把窗口字符串解析成 [start,end]（end 为查询时刻，过滤时按闭区间
+// 「time <= end」处理——见 buildWhere：同毫秒内写入的事件必须能查到）。
 func resolveWindow(win string, now time.Time) (time.Time, time.Time) {
 	switch win {
 	case "today":
@@ -545,8 +546,12 @@ func buildWhere(f UsageFilter) (string, []any) {
 		conds = append(conds, "time >= ?")
 		args = append(args, start.UnixNano())
 	}
+	// 右界闭区间（<=）：end 是「查询时刻」（resolveWindow 传 time.Now()），
+	// 而 time.Now() 在 Windows 等平台只有毫秒级精度——同一毫秒内先写入的
+	// 事件时间戳会等于 end，开区间（<）会把它判在窗外、刚发生的请求立刻
+	// 「查不到」。语义上也是闭区间更直观：至今为止的用量包含此刻。
 	if !end.IsZero() {
-		conds = append(conds, "time < ?")
+		conds = append(conds, "time <= ?")
 		args = append(args, end.UnixNano())
 	}
 	if f.User != "" {

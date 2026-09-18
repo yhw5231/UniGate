@@ -829,6 +829,9 @@ type testResult struct {
 	// proxyFailed 失败发生在代理解析/探测阶段（池基础设施问题，非"已连上
 	// 出口后的网络错误"）——换 IP 无济于事，测试链路不重试。
 	proxyFailed bool
+	// 上游响应的 token 用量（仅用于请求日志的 Tokens 列，不回给 WebUI）
+	promptTokens     int64
+	completionTokens int64
 }
 
 // runTestOnce 用指定渠道 key 发一条最小测试请求（与客户端直连形态一致：
@@ -894,28 +897,32 @@ func testOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user strin
 	res.Status = resp.StatusCode
 	res.OK = resp.StatusCode >= 200 && resp.StatusCode < 300
 	res.Snippet = truncate(string(data), 512)
+	res.promptTokens, res.completionTokens = parseUsageFromBody(data)
 	return res
 }
 
 // recordTestRequest 把一次渠道测试请求写入请求记录（与网关请求共用请求日志；
-// 代理解析失败时无上游请求，以 status=0 记录并带错误信息）。不计入用量统计。
+// 代理解析失败时无上游请求，以 status=0 记录并带错误信息）。Tokens 列取上游
+// 响应里的真实用量。不计入用量统计。
 func recordTestRequest(start time.Time, target, user, channel, key, model string, res testResult, bytesOut int64) {
 	if reqLog == nil {
 		return
 	}
 	rec := RequestRecord{
-		ID:         strconv.FormatInt(time.Now().UnixNano(), 36),
-		Time:       start,
-		Duration:   time.Since(start),
-		DurationMs: time.Since(start).Milliseconds(),
-		Method:     http.MethodPost,
-		Path:       target,
-		Status:     res.Status,
-		BytesOut:   bytesOut,
-		User:       user,
-		Channel:    channel,
-		Model:      model,
-		Key:        key + "@" + channel,
+		ID:               strconv.FormatInt(time.Now().UnixNano(), 36),
+		Time:             start,
+		Duration:         time.Since(start),
+		DurationMs:       time.Since(start).Milliseconds(),
+		Method:           http.MethodPost,
+		Path:             target,
+		Status:           res.Status,
+		BytesOut:         bytesOut,
+		PromptTokens:     res.promptTokens,
+		CompletionTokens: res.completionTokens,
+		User:             user,
+		Channel:          channel,
+		Model:            model,
+		Key:              key + "@" + channel,
 	}
 	if res.Error != "" {
 		rec.ErrMsg = truncate(res.Error, errMsgMax)

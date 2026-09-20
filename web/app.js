@@ -65,7 +65,7 @@ function logout() {
   TOKEN = "";
   if (logsTimer) clearInterval(logsTimer);
   if (errorsTimer) clearInterval(errorsTimer);
-  if (routeTimer) clearInterval(routeTimer);
+  Object.values(autoTimers).forEach((t) => t && clearInterval(t));
   showLogin();
 }
 
@@ -84,6 +84,7 @@ $("#loginForm").addEventListener("submit", async (e) => {
     $("#whoami").textContent = data.user || "";
     showApp();
     await loadState();
+    syncAutoTimers();
   } catch (err) {
     $("#loginErr").textContent = err.message;
     $("#loginErr").classList.remove("hidden");
@@ -97,6 +98,7 @@ $$(".tab").forEach((btn) => btn.addEventListener("click", () => {
   btn.classList.add("active");
   $$(".tabpane").forEach((p) => p.classList.add("hidden"));
   $("#tab-" + btn.dataset.tab).classList.remove("hidden");
+  if (btn.dataset.tab === "channels") refreshChannels();
   if (btn.dataset.tab === "logs") refreshLogs();
   if (btn.dataset.tab === "errors") refreshErrors();
   if (btn.dataset.tab === "pin") renderPinPage();
@@ -105,6 +107,7 @@ $$(".tab").forEach((btn) => btn.addEventListener("click", () => {
   if (btn.dataset.tab === "usage") refreshUsage();
   if (btn.dataset.tab === "leases") { renderPools(); refreshLeases(); }
   if (btn.dataset.tab === "settings") fillSettingsForm();
+  syncAutoTimers();
 }));
 
 // ---- 状态加载 ----
@@ -166,14 +169,15 @@ $("#settingsSaveBtn").addEventListener("click", async () => {
 
 // ---- 路由页：按模型展示候选 key 与实时状态（可用/冷却中/停用），支持
 // 逐 (key, 模型) 精确解除冷却、一键清空全部冷却、切换全局默认账号调度 ----
-let routeTimer = null;
 let routeState = null;
 
-async function refreshRoute() {
+// refreshRoute 拉取路由视图并重绘。quiet=true（轮询）时失败静默，
+// 避免后台定时器每 5s 弹一次错误条。
+async function refreshRoute(quiet) {
   try {
     routeState = await api("GET", "/admin/api/route");
     renderRoute();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { if (!quiet) toast(e.message, true); }
 }
 
 function renderRoute() {
@@ -243,10 +247,7 @@ function routeModelHTML(g, showOff) {
 $("#routeRefreshBtn").addEventListener("click", refreshRoute);
 $("#routeModelFilter").addEventListener("input", renderRoute);
 $("#routeShowOff").addEventListener("change", renderRoute);
-$("#routeAuto").addEventListener("change", (e) => {
-  if (routeTimer) clearInterval(routeTimer);
-  if (e.target.checked) routeTimer = setInterval(refreshRoute, 5000);
-});
+$("#routeAuto").addEventListener("change", syncAutoTimers);
 
 // 一键清空全部冷却（所有 key、所有模型粒度）
 $("#routeClearAllBtn").addEventListener("click", async () => {
@@ -275,6 +276,37 @@ $("#routeDefaultSchedule").addEventListener("change", async (e) => {
     await loadState(); // 同步设置页显示
   } catch (e2) { toast(e2.message, true); }
 });
+
+// ---- 渠道/路由自动刷新 ----
+// 冷却进入/解除由后端在请求间隙变化（429 冷却、探测恢复等）：两个页面按固定
+// 间隔轻量重拉后端视图、只重绘当前页（不整页刷新）。定时器只对当前激活页维持，
+// 切走即停（切回时由 tab 处理立即重拉一次）；手动刷新按钮随时取一次。
+// 轮询失败静默，避免后台每 5s 弹错误条。
+const AUTO_MS = 5000;
+const autoTimers = { channels: null, route: null };
+
+function activeTabName() {
+  const a = $(".tab.active");
+  return a ? a.dataset.tab : "";
+}
+
+function syncAutoTimers() {
+  const cur = activeTabName();
+  for (const t of ["channels", "route"]) {
+    if (autoTimers[t]) { clearInterval(autoTimers[t]); autoTimers[t] = null; }
+    if (t === cur && $(`#${t}Auto`) && $(`#${t}Auto`).checked) {
+      autoTimers[t] = setInterval(() => (t === "route" ? refreshRoute(true) : refreshChannels(true)), AUTO_MS);
+    }
+  }
+}
+
+// refreshChannels 拉取最新状态并重绘渠道列表（含各 key 冷却明细与剩余时间）。
+async function refreshChannels(quiet) {
+  try {
+    STATE = await api("GET", "/admin/api/state");
+    renderChannels();
+  } catch (e) { if (!quiet) toast(e.message, true); }
+}
 
 // ---- 渠道列表 ----
 // 渠道过滤：按关键字（名称/分组/BaseURL/模型）与分组下拉筛选
@@ -399,6 +431,11 @@ function renderChannels() {
 }
 $("#channelSearch").addEventListener("input", renderChannels);
 $("#channelGroupFilter").addEventListener("change", renderChannels);
+$("#channelsRefreshBtn").addEventListener("click", async () => {
+  try { await refreshChannels(); toast("已刷新"); }
+  catch (e) { toast(e.message, true); }
+});
+$("#channelsAuto").addEventListener("change", syncAutoTimers);
 
 // ---- 渠道固定（独立设置页，upstreampin）----
 // ---- 渠道固定（独立设置页）----
@@ -1859,6 +1896,7 @@ $("#poolSaveBtn").addEventListener("click", async () => {
   try {
     showApp();
     await loadState();
+    syncAutoTimers();
   } catch {
     logout();
   }

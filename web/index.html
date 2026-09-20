@@ -49,6 +49,8 @@
         <div class="spacer"></div>
         <input id="channelSearch" placeholder="搜索名称 / 分组 / BaseURL / 模型…" style="max-width:280px">
         <select id="channelGroupFilter" style="max-width:160px"><option value="">全部分组</option></select>
+        <label class="inline"><input type="checkbox" id="channelsAuto" checked> 自动刷新</label>
+        <button id="channelsRefreshBtn" class="btn">刷新</button>
         <button id="addChannelBtn" class="btn primary">+ 新建渠道</button>
       </div>
       <div id="channelList" class="channel-list"></div>
@@ -83,7 +85,7 @@
         </label>
         <input id="routeModelFilter" placeholder="按模型过滤…" style="max-width:240px">
         <label class="inline"><input type="checkbox" id="routeShowOff" checked> 显示停用</label>
-        <label class="inline"><input type="checkbox" id="routeAuto"> 自动刷新</label>
+        <label class="inline"><input type="checkbox" id="routeAuto" checked> 自动刷新</label>
         <span class="spacer"></span>
         <button id="routeRefreshBtn" class="btn">刷新</button>
         <button id="routeClearAllBtn" class="btn danger" title="清空全部冷却（所有 key、所有模型粒度），立即恢复路由">清空全部冷却</button>

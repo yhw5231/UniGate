@@ -584,8 +584,9 @@ func TestAdminClearCooling(t *testing.T) {
 	}
 }
 
-// TestAdminTestModelEndpoint：渠道级测试端点——逐 (key, 模型) 故障转移、
-// first_only、指定模型、responses 渠道请求体转换。
+// TestAdminTestModelEndpoint：渠道级测试端点——默认只测第一个 key、scope=all
+// 逐个完整测试、scope=pick 指定 key、旧字段 first_only 兼容、responses 渠道
+// 请求体转换。
 func TestAdminTestModelEndpoint(t *testing.T) {
 	setupGateway(t)
 	tok := adminToken(t)
@@ -600,7 +601,7 @@ func TestAdminTestModelEndpoint(t *testing.T) {
 		}})
 	chid := store.Snapshot().Channels[0].ID
 
-	// 全部启用 key：m1 在 k1 失败后应由 k2 成功
+	// 默认（scope 为空）：只测第一个启用的 key → 每模型 1 条，均在 k1 失败
 	rr := httptest.NewRecorder()
 	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model",
 		`{}`, tok))
@@ -615,29 +616,97 @@ func TestAdminTestModelEndpoint(t *testing.T) {
 		} `json:"results"`
 	}
 	_ = json.Unmarshal(rr.Body.Bytes(), &out)
-	// 每个模型 2 条（k1 失败 + k2 成功），共 4 条；最终每模型都成功
-	if len(out.Results) != 4 {
-		t.Fatalf("expected 4 results (2 models × failover), got %d: %+v", len(out.Results), out.Results)
+	if len(out.Results) != 2 {
+		t.Fatalf("default scope should test only the first key (2 results), got %d: %+v", len(out.Results), out.Results)
 	}
-	for i, m := range []string{"m1", "m1", "m2", "m2"} {
-		if out.Results[i].Model != m {
-			t.Fatalf("result[%d].model=%q want %q", i, out.Results[i].Model, m)
+	for i, res := range out.Results {
+		if res.OK || res.Key != "k1" || res.Model != "m"+strconv.Itoa(i+1) {
+			t.Fatalf("default scope result[%d] should be k1 failure on m%d: %+v", i, i+1, res)
 		}
 	}
-	if out.Results[0].OK || out.Results[0].Key != "k1" {
-		t.Fatalf("result[0] should be k1 failure: %+v", out.Results[0])
-	}
-	if !out.Results[1].OK || out.Results[1].Key != "k2" {
-		t.Fatalf("result[1] should be k2 success: %+v", out.Results[1])
-	}
-	if !out.Results[3].OK {
-		t.Fatalf("result[3] should succeed: %+v", out.Results[3])
-	}
-	if fail.count() != 2 || okSrv.count() != 2 {
-		t.Fatalf("upstream calls: fail=%d ok=%d, want 2/2", fail.count(), okSrv.count())
+	if fail.count() != 2 || okSrv.count() != 0 {
+		t.Fatalf("default scope upstream calls: fail=%d ok=%d, want 2/0", fail.count(), okSrv.count())
 	}
 
-	// first_only：只用 k1（必失败）
+	// scope=all：全部启用的 key 逐个完整测试 → 每模型 k1 失败 + k2 成功共 4 条
+	rrA := httptest.NewRecorder()
+	rootHandler(rrA, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model",
+		`{"scope":"all"}`, tok))
+	var outA struct {
+		Results []struct {
+			OK    bool   `json:"ok"`
+			Key   string `json:"key"`
+			Model string `json:"model"`
+		} `json:"results"`
+	}
+	_ = json.Unmarshal(rrA.Body.Bytes(), &outA)
+	if len(outA.Results) != 4 {
+		t.Fatalf("scope=all should test every key (4 results), got %d: %+v", len(outA.Results), outA.Results)
+	}
+	for i, m := range []string{"m1", "m1", "m2", "m2"} {
+		if outA.Results[i].Model != m {
+			t.Fatalf("result[%d].model=%q want %q", i, outA.Results[i].Model, m)
+		}
+	}
+	if outA.Results[0].OK || outA.Results[0].Key != "k1" {
+		t.Fatalf("result[0] should be k1 failure: %+v", outA.Results[0])
+	}
+	if !outA.Results[1].OK || outA.Results[1].Key != "k2" {
+		t.Fatalf("result[1] should be k2 success: %+v", outA.Results[1])
+	}
+	if !outA.Results[3].OK {
+		t.Fatalf("result[3] should succeed: %+v", outA.Results[3])
+	}
+	if fail.count() != 4 || okSrv.count() != 2 {
+		t.Fatalf("scope=all upstream calls: fail=%d ok=%d, want 4/2", fail.count(), okSrv.count())
+	}
+
+	// scope=pick：只测指定 key（k2 成功）
+	k1id, k2id := "", ""
+	for i, k := range store.Snapshot().Channels[0].Keys {
+		if i == 0 {
+			k1id = k.ID
+		} else {
+			k2id = k.ID
+		}
+	}
+	rrP := httptest.NewRecorder()
+	rootHandler(rrP, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model",
+		`{"scope":"pick","key_id":"`+k2id+`","models":"m1"}`, tok))
+	var outP struct {
+		Results []struct {
+			OK  bool   `json:"ok"`
+			Key string `json:"key"`
+		} `json:"results"`
+	}
+	_ = json.Unmarshal(rrP.Body.Bytes(), &outP)
+	if len(outP.Results) != 1 || !outP.Results[0].OK || outP.Results[0].Key != "k2" {
+		t.Fatalf("scope=pick should test only k2 and pass: %+v", outP.Results)
+	}
+	// scope=pick 指定停用的 key：等同未匹配，400
+	{
+		ch := store.Snapshot().Channels[0]
+		ch.Keys[0].Enabled = false
+		if err := store.PutChannel(ch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rrD := httptest.NewRecorder()
+	rootHandler(rrD, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model",
+		`{"scope":"pick","key_id":"`+k1id+`"}`, tok))
+	if rrD.Code != http.StatusBadRequest {
+		t.Fatalf("pick disabled key: status=%d want 400", rrD.Code)
+	}
+	// 恢复 k1 启用，供后续 first_only 用例使用
+	{
+		ch := store.Snapshot().Channels[0]
+		ch.Keys[0].Enabled = true
+		if err := store.PutChannel(ch); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 旧字段 first_only：只用 k1（必失败）
 	rr2 := httptest.NewRecorder()
 	rootHandler(rr2, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model",
 		`{"first_only":true}`, tok))
@@ -650,7 +719,7 @@ func TestAdminTestModelEndpoint(t *testing.T) {
 	if len(out2.Results) != 2 || out2.Results[0].OK {
 		t.Fatalf("first_only should only use k1 and fail: %+v", out2.Results)
 	}
-	if okSrv.count() != 2 {
+	if okSrv.count() != 3 {
 		t.Fatalf("first_only must not touch k2: ok=%d", okSrv.count())
 	}
 }
@@ -1216,5 +1285,96 @@ func TestAdminSettingsDefaultSchedule(t *testing.T) {
 	}
 	if got := store.Snapshot().Channels[0].Schedule; got != scheduleRoundRobin {
 		t.Fatalf("channel schedule = %q", got)
+	}
+}
+
+// TestAdminPutChannelTriggersNewModelProbe 通过管理 API 保存渠道应触发「新增
+// 模型探测」：新建渠道（key 粒度）对每个 key 用第一个模型尽早发题；再次保存
+// 新增模型只探新模型；无变化的保存不再探测。验证钩子 → 队列 → 上游请求全链路。
+func TestAdminPutChannelTriggersNewModelProbe(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	var mu sync.Mutex
+	var got []string // 收到的 probe 模型
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		got = append(got, body.Model)
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer up.Close()
+
+	save := func(body string) string {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		rootHandler(rr, adminReq(http.MethodPut, "/admin/api/channels", body, tok))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("put channel status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		var ch Channel
+		_ = json.Unmarshal(rr.Body.Bytes(), &ch)
+		return ch.ID
+	}
+	waitProbes := func(delta int, wantModel string) {
+		t.Helper()
+		mu.Lock()
+		base := len(got)
+		mu.Unlock()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			mu.Lock()
+			n := len(got)
+			mu.Unlock()
+			if n >= base+delta {
+				break
+			}
+			if time.Now().After(deadline) {
+				mu.Lock()
+				all := append([]string{}, got...)
+				mu.Unlock()
+				t.Fatalf("expected %d new probes for %q, got %v", delta, wantModel, all)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		mu.Lock()
+		fresh := append([]string{}, got[base:]...)
+		mu.Unlock()
+		for _, m := range fresh {
+			if m != wantModel {
+				t.Fatalf("probe model = %q, want %q", m, wantModel)
+			}
+		}
+	}
+
+	// 新建渠道（key 冷却粒度）：首探模型 m1，两个启用 key 各一题
+	id := save(`{"name":"c","base_url":"` + up.URL + `","enabled":true,"auto_probe":true,
+		"models":["m1","m2"],
+		"keys":[{"name":"k1","api_key":"sk-1","enabled":true},{"name":"k2","api_key":"sk-2","enabled":true}]}`)
+	waitProbes(2, "m1")
+
+	// 后续保存携带首保返回的 key ID（WebUI 行为：保存后回填 key ID；不携带
+	// ID 会生成新 ID，key 会被当作新增而重复触发探测）
+	st := store.Snapshot().Channels[0]
+	keysJSON := `"keys":[{"id":"` + st.Keys[0].ID + `","name":"k1","api_key":"sk-1","enabled":true},` +
+		`{"id":"` + st.Keys[1].ID + `","name":"k2","api_key":"sk-2","enabled":true}]`
+
+	// 再次保存新增 m3：只探新模型（每 key 一题），m1/m2 不重探
+	save(`{"id":"` + id + `","name":"c","base_url":"` + up.URL + `","enabled":true,"auto_probe":true,
+		"models":["m1","m2","m3"],` + keysJSON + `}`)
+	waitProbes(2, "m3")
+
+	// 无变化的保存：不再探测
+	save(`{"id":"` + id + `","name":"c","base_url":"` + up.URL + `","enabled":true,"auto_probe":true,
+		"models":["m1","m2","m3"],` + keysJSON + `}`)
+	time.Sleep(150 * time.Millisecond)
+	mu.Lock()
+	n := len(got)
+	mu.Unlock()
+	if n != 4 {
+		t.Fatalf("unchanged save should probe nothing, got %d requests", n)
 	}
 }

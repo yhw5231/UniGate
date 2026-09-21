@@ -107,9 +107,11 @@
           <label>渠道 <select id="testChannel"></select></label>
           <label>测试范围
             <select id="testScope">
-              <option value="all" selected>全部启用的 key</option>
-              <option value="first">仅第一个启用的 key</option>
+              <option value="first" selected>仅第一个启用的 key（默认）</option>
+              <option value="all">全部启用的 key（逐个完整测试）</option>
+              <option value="pick">指定 key</option>
             </select>
+            <select id="testKey" class="hidden" style="margin-top:6px"></select>
           </label>
         </div>
         <div class="grid2">
@@ -117,7 +119,7 @@
           <div>
             <label>已启用模型（点击加入测试清单）</label>
             <div id="testModelChips" class="chips"></div>
-            <p class="muted" style="font-size:12px;margin:6px 0 0">按渠道内 key 顺序发送真实对话请求（与网关故障转移一致）：某模型在某个 key 上成功即通过，失败则自动尝试下一个 key。</p>
+            <p class="muted" style="font-size:12px;margin:6px 0 0">对所选范围逐个 key 发送真实对话请求：「仅第一个 key」只测第一个启用的 key；「全部 key」对全部启用的 key 逐个完整测试（不因某个 key 通过而跳过其余）；「指定 key」只测所选 key。每个 (key, 模型) 独立一行展示结果。</p>
           </div>
         </div>
         <div class="row" style="margin:4px 0 0">

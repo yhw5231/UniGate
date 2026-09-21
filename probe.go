@@ -5,7 +5,7 @@
 //   - 按 (key, model) 冷却：冷却恢复探测用「冷却恢复的那个模型」，空闲探测
 //     逐模型检查、探测「连续未使用的模型」。
 //
-// 三种触发时机：
+// 四种触发时机：
 //   - 启动探测：进程启动（重启/重新部署）后一次性核对账号状态——跳过「上游
 //     明确给出到期时间、仍在冷却中」与「最近窗口内成功调用过」的账号，其余
 //     账号各发一题（并发上限 PROBE_CONCURRENCY）。内存计时线在启动时先从
@@ -15,7 +15,10 @@
 //     重置），按上游明确给出的到期时间重新记冷却，避免路由反复撞限流；
 //   - 空闲探测：正常状态（渠道与 key 均启用且不在冷却）的账号连续
 //     PROBE_IDLE_SEC（WebUI 设置页可改，默认 2h）没有任何调用时发一题，确认
-//     账号仍然可用；停用与冷却中的账号不探测；间隔 0 = 关闭空闲探测。
+//     账号仍然可用；停用与冷却中的账号不探测；间隔 0 = 关闭空闲探测；
+//   - 新增模型探测：渠道模型列表新增模型后尽早对新模型各发一题（一次性，
+//     节流见 NotifyModelsAdded）：部分上游的配额重置窗口从首次调用起算，
+//     探测把计时起点提前，同时验证新模型在该渠道的 key 上真实可用。
 //
 // 探测本身就是一次真实调用：无论结果如何都会刷新该 key（及对应模型）的空闲
 // 计时（因此持续空闲的账号每个间隔探测一次）。结果写入请求日志（User 列存
@@ -45,6 +48,7 @@ const (
 	probeKindIdle  = "idle"
 	probeKindRecov = "recover"
 	probeKindBoot  = "startup" // 启动探测（重启/重新部署后一次性核对账号状态）
+	probeKindNew   = "modelnew" // 新增模型探测：渠道模型列表加入新模型后的尽早核对
 
 	// probeBootRecentWindow 启动探测判断「最近用过」的窗口：窗口内成功调用过的
 	// 账号不核对（刚验证过，不必再花一次额度）。固定 2h，不跟随空闲探测间隔
@@ -179,15 +183,27 @@ type probeScheduler struct {
 	interval  time.Duration
 	sem       chan struct{} // 在途探测请求数上限（nil = 不限制）
 	startOnce sync.Once
+	// newProbed 已派发过「新增模型探测」的 (key, 模型)：渠道保存反复触发时
+	// 同一组合只探一次，避免重复浪费额度（键：keyID+"\x00"+model）。
+	newProbed map[string]bool
+	// queue/wake/queueOnce：渠道保存派生的即时探测任务队列。任务由常驻
+	// worker 在后台消费（入队即唤醒、首次入队才启动），请求并发受 sem 上限
+	// 约束——一次保存新增成批模型/key 时不会瞬间打满上游额度。
+	queue     []probeTask
+	wake      chan struct{}
+	queueOnce sync.Once
 }
 
 var probes = newProbeScheduler()
 
 func newProbeScheduler() *probeScheduler {
 	return &probeScheduler{
-		cooling:  map[cooldownPair]bool{},
-		inFlight: map[string]bool{},
-		interval: probeScanEvery,
+		cooling:   map[cooldownPair]bool{},
+		inFlight:  map[string]bool{},
+		newProbed: map[string]bool{},
+		queue:     nil,
+		wake:      make(chan struct{}, 1),
+		interval:  probeScanEvery,
 	}
 }
 
@@ -219,11 +235,12 @@ func (s *probeScheduler) releaseProbe() {
 	}
 }
 
-// Start 启动后台扫描循环（幂等）。扫描本身在 ticker 协程内同步做（只做状态
-// 对比与任务收集，开销极小），探测任务按 key 分批派发到独立 goroutine——
-// 同一 key 的多模型探测在批内串行，不同 key 并行。
+// Start 启动后台扫描循环与即时探测队列 worker（幂等）。扫描本身在 ticker
+// 协程内同步做（只做状态对比与任务收集，开销极小），探测任务按 key 分批派发
+// 到独立 goroutine——同一 key 的多模型探测在批内串行，不同 key 并行。
 func (s *probeScheduler) Start() {
 	s.startOnce.Do(func() {
+		s.queueOnce.Do(func() { go s.taskWorker() })
 		go func() {
 			t := time.NewTicker(s.interval)
 			defer t.Stop()
@@ -234,6 +251,41 @@ func (s *probeScheduler) Start() {
 			}
 		}()
 	})
+}
+
+// ---- 渠道保存触发的即时探测队列 ----
+
+// enqueue 把渠道保存派生的探测任务加入后台队列并唤醒 worker（幂等启动；
+// 未调用 Start 也能工作）。worker 按 key 分批执行，每批内部串行、跨 key
+// 并行，请求级并发由 sem 上限约束。
+func (s *probeScheduler) enqueue(tasks []probeTask) {
+	if len(tasks) == 0 {
+		return
+	}
+	s.queueOnce.Do(func() { go s.taskWorker() })
+	s.mu.Lock()
+	s.queue = append(s.queue, tasks...)
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default: // 已有待处理信号，不必重复唤醒
+	}
+}
+
+// taskWorker 常驻消费即时探测队列（阻塞在 wake 上）。
+func (s *probeScheduler) taskWorker() {
+	for range s.wake {
+		s.mu.Lock()
+		tasks := s.queue
+		s.queue = nil
+		s.mu.Unlock()
+		if len(tasks) == 0 {
+			continue
+		}
+		for _, batch := range groupTasksByKey(tasks) {
+			go s.runBatch(batch)
+		}
+	}
 }
 
 // scanOnce 扫描一轮：更新冷却跟踪、收集命中探测条件的任务，按 key 分组返回
@@ -329,6 +381,12 @@ func (s *probeScheduler) scanOnce() [][]probeTask {
 	}
 
 	// 按 key 分组（保持收集顺序），同 key 串行、跨 key 并行
+	return groupTasksByKey(tasks)
+}
+
+// groupTasksByKey 按 key 分组（保持收集顺序）：同 key 的任务在批内串行执行、
+// 整批共用一个在途占位，不同 key 并行。
+func groupTasksByKey(tasks []probeTask) [][]probeTask {
 	order := make([]string, 0, 4)
 	batches := map[string][]probeTask{}
 	for _, t := range tasks {
@@ -391,6 +449,142 @@ func probeModelFor(ch *Channel) string {
 		return ch.Models[0]
 	}
 	return "gpt-4o-mini"
+}
+
+// modelDiff 纯差集：new 中旧列表不存在的模型（保序去重）。用于已存在渠道的
+// 模型新增检测——旧列表为空（渠道未声明模型、对全部模型放行）不算任何新增。
+func modelDiff(oldModels, newModels []string) []string {
+	oldSet := make(map[string]bool, len(oldModels))
+	for _, m := range oldModels {
+		oldSet[m] = true
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range newModels {
+		if m == "" || oldSet[m] || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	return out
+}
+
+// newModelProbeList 计算一组「全新增」模型里需要尽快探测的清单（按冷却粒度
+// 裁剪）：key 粒度只探第一个模型——配额重置计时按账号算，每个 key 探一个模型
+// 即可把计时提前，成批模型不逐探避免打满额度；key_model 粒度全部模型逐个验证
+// （每个模型独立冷却，都要核对）。用于新渠道首次配置与新增 key 的验证模型集。
+func newModelProbeList(models []string, keyModel bool) []string {
+	models = normalizeModelList(models)
+	if !keyModel && len(models) > 0 {
+		return models[:1]
+	}
+	return models
+}
+
+// channelTasks 计算渠道保存后需要尽早探测的 (key, 模型) 任务（ChannelUpdated
+// 内部使用；测试直接用它验证探测范围与节流）。探测范围：
+//   - 新增模型：对渠道全部启用 key 各探一次（新渠道/首次配置时按冷却粒度裁剪）；
+//   - 新增 key：按冷却粒度决定模型集（key 粒度只探第一个模型，key_model 粒度
+//     全部模型）。
+// 节流约束：每个 (key, 模型) 进程内只派发一次（newProbed 记忆）；停用的 key
+// 跳过；上游明确给出到期时间的冷却中跳过（等自然到期，不白撞）；探测模型
+// 本身在冷却中的跳过（到期后的冷却恢复探测会接手验证）；该模型最近
+// （probeBootRecentWindow 窗口内）调用过的跳过（刚验证过）。
+func (s *probeScheduler) channelTasks(old, ch *Channel) []probeTask {
+	if ch == nil {
+		return nil
+	}
+	keyModel := ch.CooldownScope == cooldownScopeKeyModel
+	// 无模型声明的渠道对全部模型放行（route 语义）：以 gpt-4o-mini 兜底探测，
+	// 与 probeModelFor / 渠道测试的兜底一致。
+	modelBase := ch.Models
+	if len(modelBase) == 0 {
+		modelBase = []string{"gpt-4o-mini"}
+	}
+	var oldModels []string
+	oldKeys := map[string]bool{}
+	if old != nil {
+		oldModels = old.Models
+		for _, k := range old.Keys {
+			oldKeys[k.ID] = true
+		}
+	}
+	// 新增模型：新渠道（old=nil）按冷却粒度裁剪首探集；已存在渠道严格差集
+	//（未声明模型的渠道 diff 为空，不把 gpt-4o-mini 兜底误当新增）
+	var newModels []string
+	if old == nil {
+		newModels = newModelProbeList(modelBase, keyModel)
+	} else {
+		newModels = modelDiff(oldModels, ch.Models)
+	}
+	// 新增 key 要验证的模型集：与「新渠道首探」同一裁剪规则
+	keyModels := newModelProbeList(modelBase, keyModel)
+	var newKeys []*UpKey
+	for _, k := range ch.Keys {
+		if k.Enabled && !oldKeys[k.ID] {
+			newKeys = append(newKeys, k)
+		}
+	}
+	if len(newModels) == 0 && len(newKeys) == 0 {
+		return nil
+	}
+
+	var tasks []probeTask
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keep := func(k *UpKey, m string) bool {
+		if _, ok := cool.ExplicitCooling(k.ID); ok {
+			return false
+		}
+		if cool.IsCooling(k.ID, ch.cooldownModelFor(m)) {
+			return false
+		}
+		if t, ok := activity.lastCall(k.ID, m); ok && time.Since(t) < probeBootRecentWindow {
+			return false
+		}
+		return true
+	}
+	addPair := func(k *UpKey, m string) {
+		p := k.ID + "\x00" + m
+		if s.newProbed[p] {
+			return
+		}
+		s.newProbed[p] = true
+		tasks = append(tasks, probeTask{Kind: probeKindNew, Ch: ch, Key: k, Model: m})
+	}
+	for _, m := range newModels {
+		for _, k := range ch.Keys {
+			if k.Enabled && keep(k, m) {
+				addPair(k, m)
+			}
+		}
+	}
+	for _, k := range newKeys {
+		for _, m := range keyModels {
+			if keep(k, m) {
+				addPair(k, m)
+			}
+		}
+	}
+	return tasks
+}
+
+// ChannelUpdated 渠道保存/模型替换后触发「尽早探测」：把需要验证的 (key, 模型)
+// 任务入队，由后台 worker 按并发上限执行（不阻塞请求）。目的：部分上游的配额
+// 重置窗口从首次调用起算，尽早探测把计时起点提前，同时验证新模型/新 key 真实
+// 可用。old 为保存前的渠道（nil = 新建）。渠道停用/未开自动探测时整体跳过。
+func (s *probeScheduler) ChannelUpdated(old, ch *Channel) {
+	if ch == nil || !ch.Enabled || !ch.AutoProbe {
+		return
+	}
+	tasks := s.channelTasks(old, ch)
+	if len(tasks) == 0 {
+		return
+	}
+	log.Printf("probe: 新增模型探测：渠道 %q 共 %d 个 (key,模型) 入队（并发上限 %d）",
+		ch.Name, len(tasks), s.concurrency())
+	s.enqueue(tasks)
 }
 
 // randomProbeOperands 加法题的三个随机 5 位数（10000–99999）。
@@ -600,6 +794,8 @@ func (s *probeScheduler) probeOne(t probeTask) {
 		kind = "冷却恢复探测"
 	case probeKindBoot:
 		kind = "启动探测"
+	case probeKindNew:
+		kind = "新增模型探测"
 	}
 	label := t.Key.Name + "@" + t.Ch.Name
 

@@ -1572,6 +1572,23 @@ function testChannelSel() {
     `<option value="${esc(c.id)}">${esc(c.name)}${c.enabled ? "" : "（已停用）"}（key ${c.keys ? c.keys.length : 0}）</option>`
   ).join("") || '<option value="">（无渠道）</option>';
   if (chans.some((c) => c.id === cur)) sel.value = cur;
+  testKeySel(sel);
+}
+
+// testScope 为「指定 key」时展示 key 下拉；默认只测第一个 key。
+function syncTestScope() {
+  $("#testKey").classList.toggle("hidden", $("#testScope").value !== "pick");
+}
+
+// testKeySel 按当前选中渠道填充「指定 key」下拉（只列启用的 key）。
+function testKeySel(chSel) {
+  const ch = ((STATE && STATE.channels) || []).find((c) => c.id === chSel.value);
+  const keys = (ch && ch.keys) || [];
+  const cur = $("#testKey").value;
+  $("#testKey").innerHTML = keys.filter((k) => k.enabled).map((k) =>
+    `<option value="${esc(k.id)}">${esc(k.name || "(未命名)")}</option>`
+  ).join("") || '<option value="">（无启用的 key）</option>';
+  if (keys.some((k) => k.id === cur && k.enabled)) $("#testKey").value = cur;
 }
 
 // testModelChips 渲染「已启用模型」chips：已在测试清单中的高亮（✓）并可点击移除，
@@ -1603,10 +1620,12 @@ $("#testModels").addEventListener("input", testModelChips);
 
 function refreshTestTab() {
   testChannelSel();
+  syncTestScope();
   testModelChips();
 }
 
-$("#testChannel").addEventListener("change", testModelChips);
+$("#testChannel").addEventListener("change", () => { testKeySel($("#testChannel")); testModelChips(); });
+$("#testScope").addEventListener("change", syncTestScope);
 $("#testRefreshBtn").addEventListener("click", async () => {
   try { await loadState(); refreshTestTab(); toast("已刷新"); }
   catch (e) { toast(e.message, true); }
@@ -1666,6 +1685,9 @@ $("#testRunBtn").addEventListener("click", async () => {
     models = models.slice(0, 3);
     toast(`已按「仅测前 3 个模型」截取：${models.join("、")}`);
   }
+  const scope = $("#testScope").value;
+  const keyId = scope === "pick" ? $("#testKey").value : "";
+  if (scope === "pick" && !keyId) { toast("请先选择要测试的 key", true); return; }
 
   testRunning = true;
   testAbort = false;
@@ -1683,7 +1705,8 @@ $("#testRunBtn").addEventListener("click", async () => {
     try {
       const r = await api("POST", `/admin/api/channels/${encodeURIComponent(ch.id)}/test-model`, {
         models: m,
-        first_only: $("#testScope").value === "first",
+        scope,
+        key_id: keyId,
       });
       const results = r.results || [];
       if (!results.length) {
@@ -1698,8 +1721,9 @@ $("#testRunBtn").addEventListener("click", async () => {
         const row = testRow({ ...res, model: res.model || m, latency_ms: res.latency_ms ?? null });
         $("#testTable tbody").appendChild(row);
       }
-      const last = results[results.length - 1];
-      if (last.ok) pass++; else fail++;
+      // 模型级结论：任一 key 通过即算该模型可用（全部模式部分 key 失败不影响计数）
+      const okN = results.filter((x) => x.ok).length;
+      if (okN > 0) pass++; else fail++;
     } catch (e) {
       placeholder.remove();
       testRowAndCount({ model: m, ok: false, error: e.message, latency_ms: null });

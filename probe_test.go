@@ -538,3 +538,274 @@ func TestProbeIdleIntervalConfigurable(t *testing.T) {
 		t.Fatalf("recovery probe must still fire when idle probing is off, got %+v", tasks)
 	}
 }
+
+// TestNewModelProbeList 首探模型集裁剪：key 粒度只取第一个模型（避免成批模型
+// 瞬间打满额度），key_model 粒度全部模型逐个验证。
+func TestNewModelProbeList(t *testing.T) {
+	if got := newModelProbeList([]string{"m1", "m2", "m3"}, false); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("key scope should probe only first model, got %v", got)
+	}
+	if got := newModelProbeList([]string{"m2", "m1", "m2"}, true); len(got) != 2 || got[0] != "m2" || got[1] != "m1" {
+		t.Fatalf("key_model scope should probe all models, got %v", got)
+	}
+	if got := newModelProbeList([]string{"", " m1 "}, false); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("should normalize and drop empties, got %v", got)
+	}
+	if got := newModelProbeList(nil, true); len(got) != 0 {
+		t.Fatalf("no models should probe nothing, got %v", got)
+	}
+}
+
+// TestModelDiff 已存在渠道的模型差集：保序去重；旧列表为空（未声明模型）不算
+// 任何新增（gpt-4o-mini 兜底不被误当新增）。
+func TestModelDiff(t *testing.T) {
+	if got := modelDiff([]string{"m1", "m2"}, []string{"m2", "m1", "m3", "m4", "m3"}); len(got) != 2 || got[0] != "m3" || got[1] != "m4" {
+		t.Fatalf("addition should keep order and dedupe, got %v", got)
+	}
+	if got := modelDiff([]string{"m1", "m2"}, []string{"m2", "m1"}); len(got) != 0 {
+		t.Fatalf("no additions expected, got %v", got)
+	}
+	if got := modelDiff(nil, []string{"gpt-4o-mini"}); len(got) != 1 {
+		t.Fatalf("fallback model would look new when old list empty, got %v", got)
+	}
+}
+
+// TestChannelTasksScope 探测范围按冷却粒度与变更内容裁剪：
+//   - 新渠道（old=nil）：key 粒度只探第一个模型（每个 key 各一题）；key_model
+//     粒度全部模型逐个探（全部 key × 全部模型）。
+//   - 新增 key：key 粒度只探第一个模型；key_model 粒度全部模型逐个探。
+//   - 新增模型：对全部启用 key 各探一次。
+//   - 无模型声明渠道：gpt-4o-mini 兜底。
+//   - 重复保存（无变化）不产生任务。
+func TestChannelTasksScope(t *testing.T) {
+	setupProbeTest(t)
+	keyIDs := []string{"k1", "k2"}
+	makeCh := func(scope string, models []string) *Channel {
+		ch := testProbeChannel(true)
+		ch.CooldownScope = scope
+		ch.Models = models
+		ch.Keys = []*UpKey{}
+		for _, id := range keyIDs {
+			ch.Keys = append(ch.Keys, &UpKey{ID: id, Name: id, APIKey: "sk-" + id, Enabled: true})
+		}
+		return ch
+	}
+	// 每个独立用例用全新实例，避免 newProbed 跨用例串扰；需要验证「不重复」
+	// 的用例自己持有一个实例连调两次。
+	fresh := func() *probeScheduler { return newProbeScheduler() }
+	pairs := func(tasks []probeTask) map[string]bool { // "key:model" → true
+		out := map[string]bool{}
+		for _, tk := range tasks {
+			if tk.Kind != probeKindNew {
+				t.Fatalf("task kind = %s, want new-model probe", tk.Kind)
+			}
+			out[tk.Key.ID+":"+tk.Model] = true
+		}
+		return out
+	}
+
+	// 新渠道 key 粒度：只探第一个模型 × 每个 key
+	p := pairs(fresh().channelTasks(nil, makeCh("", []string{"m1", "m2"})))
+	if len(p) != 2 || !p["k1:m1"] || !p["k2:m1"] {
+		t.Fatalf("new key-scope channel should probe first model on each key, got %v", p)
+	}
+
+	// 新渠道 key_model 粒度：全部模型 × 全部 key
+	p = pairs(fresh().channelTasks(nil, makeCh("key_model", []string{"m1", "m2"})))
+	if len(p) != 4 || !p["k1:m1"] || !p["k1:m2"] || !p["k2:m1"] || !p["k2:m2"] {
+		t.Fatalf("new key_model channel should probe every model on every key, got %v", p)
+	}
+
+	// 已保存渠道（key 粒度）新增模型 m3：只在两个 key 上探 m3，不重探 m1/m2
+	p = pairs(fresh().channelTasks(makeCh("", []string{"m1", "m2"}), makeCh("", []string{"m1", "m2", "m3"})))
+	if len(p) != 2 || !p["k1:m3"] || !p["k2:m3"] {
+		t.Fatalf("add model should probe it on each key only, got %v", p)
+	}
+
+	// 已保存渠道（key_model 粒度）新增 key k3：全部模型在 k3 上逐个探
+	old4 := makeCh("key_model", []string{"m1", "m2"})
+	ch4 := makeCh("key_model", []string{"m1", "m2"})
+	ch4.Keys = append(ch4.Keys, &UpKey{ID: "k3", Name: "k3", APIKey: "sk-k3", Enabled: true})
+	p = pairs(fresh().channelTasks(old4, ch4))
+	if len(p) != 2 || !p["k3:m1"] || !p["k3:m2"] {
+		t.Fatalf("new key on key_model channel should probe all models, got %v", p)
+	}
+
+	// 已保存渠道（key 粒度）新增 key k3：只探第一个模型
+	old5 := makeCh("", []string{"m1", "m2"})
+	ch5 := makeCh("", []string{"m1", "m2"})
+	ch5.Keys = append(ch5.Keys, &UpKey{ID: "k3", Name: "k3", APIKey: "sk-k3", Enabled: true})
+	p = pairs(fresh().channelTasks(old5, ch5))
+	if len(p) != 1 || !p["k3:m1"] {
+		t.Fatalf("new key on key-scope channel should probe first model only, got %v", p)
+	}
+
+	// 无模型声明渠道新增 key：gpt-4o-mini 兜底探测 new key
+	old6 := makeCh("", nil)
+	ch6 := makeCh("", nil)
+	ch6.Keys = append(ch6.Keys, &UpKey{ID: "k3", Name: "k3", APIKey: "sk-k3", Enabled: true})
+	p = pairs(fresh().channelTasks(old6, ch6))
+	if len(p) != 1 || !p["k3:gpt-4o-mini"] {
+		t.Fatalf("no-model channel new key should probe gpt-4o-mini, got %v", p)
+	}
+
+	// 同一实例连调两次：重复保存（前后一致）无任务；已派发过的新增不重复
+	ps := fresh()
+	if got := ps.channelTasks(makeCh("", []string{"m1"}), makeCh("", []string{"m1", "m2"})); len(got) != 2 {
+		t.Fatalf("expected 2 tasks on first add, got %+v", got)
+	}
+	if got := ps.channelTasks(makeCh("", []string{"m1"}), makeCh("", []string{"m1", "m2"})); len(got) != 0 {
+		t.Fatalf("already-sent new model should not repeat, got %+v", got)
+	}
+	if got := ps.channelTasks(makeCh("", []string{"m1", "m2"}), makeCh("", []string{"m1", "m2"})); len(got) != 0 {
+		t.Fatalf("unchanged save should produce no tasks, got %+v", got)
+	}
+}
+
+// TestNewModelTasksThrottle 新增模型探测的节流：每个 (key, 模型) 只派发一次、
+// 停用 key 跳过、冷却与最近调用过的跳过。
+func TestNewModelTasksThrottle(t *testing.T) {
+	setupProbeTest(t)
+	old := testProbeChannel(true)
+	old.Models = []string{"m1"}
+	old.Keys = []*UpKey{
+		{ID: "k1", Name: "a", APIKey: "sk-1", Enabled: true},
+		{ID: "k2", Name: "b", APIKey: "sk-2", Enabled: true},
+		{ID: "k3", Name: "c", APIKey: "sk-3", Enabled: false},
+	}
+	ch := testProbeChannel(true)
+	ch.Models = []string{"m1", "m2"}
+	ch.Keys = []*UpKey{
+		{ID: "k1", Name: "a", APIKey: "sk-1", Enabled: true},
+		{ID: "k2", Name: "b", APIKey: "sk-2", Enabled: true},
+		{ID: "k3", Name: "c", APIKey: "sk-3", Enabled: false},
+	}
+
+	// 正常：两个启用 key 各一题（k3 停用跳过）
+	tasks := probes.channelTasks(old, ch)
+	if len(tasks) != 2 {
+		t.Fatalf("want 2 tasks for two enabled keys, got %+v", tasks)
+	}
+	for _, tk := range tasks {
+		if tk.Kind != probeKindNew || tk.Model != "m2" {
+			t.Fatalf("task should be new-model probe on m2: %+v", tk)
+		}
+	}
+	// 已派发过一次（newProbed 记忆）：再次通知不重复
+	ch3 := testProbeChannel(true)
+	ch3.Models = []string{"m1", "m2"}
+	ch3.Keys = ch.Keys
+	if got := probes.channelTasks(old, ch3); len(got) != 0 {
+		t.Fatalf("already-sent pair should not repeat, got %+v", got)
+	}
+
+	// 冷却中的 (key, 模型) 跳过：k1 冷却（key 粒度），只 k2 探 m3
+	old2 := testProbeChannel(true)
+	old2.Models = []string{"m1", "m2"}
+	old2.Keys = ch.Keys
+	ch4 := testProbeChannel(true)
+	ch4.Models = []string{"m1", "m2", "m3"}
+	ch4.Keys = ch.Keys
+	cool.Mark("k1", ch4.cooldownModelFor("m3"), time.Hour)
+	tasks = probes.channelTasks(old2, ch4)
+	if len(tasks) != 1 || tasks[0].Key.ID != "k2" {
+		t.Fatalf("cooling key should be skipped, got %+v", tasks)
+	}
+	cool.ClearKey("k1")
+
+	// 上游明确冷却的 key 整 key 跳过
+	old3 := testProbeChannel(true)
+	old3.Models = []string{"m1", "m2"}
+	old3.Keys = ch.Keys
+	ch5 := testProbeChannel(true)
+	ch5.Models = []string{"m1", "m2", "m4"}
+	ch5.Keys = ch.Keys
+	cool.MarkExplicit("k1", "", time.Hour)
+	tasks = probes.channelTasks(old3, ch5)
+	if len(tasks) != 1 || tasks[0].Key.ID != "k2" {
+		t.Fatalf("explicit-cooling key should be skipped, got %+v", tasks)
+	}
+	cool.ClearKey("k1")
+
+	// 最近调用过该模型的 key 跳过（刚验证过）
+	old4 := testProbeChannel(true)
+	old4.Models = []string{"m1", "m2"}
+	old4.Keys = ch.Keys
+	ch6 := testProbeChannel(true)
+	ch6.Models = []string{"m1", "m2", "m5"}
+	ch6.Keys = ch.Keys
+	activity.noteAt("k2", "m5", time.Now())
+	tasks = probes.channelTasks(old4, ch6)
+	if len(tasks) != 1 || tasks[0].Key.ID != "k1" {
+		t.Fatalf("recently-used key should be skipped, got %+v", tasks)
+	}
+}
+
+// TestNewModelProbeDispatched 端到端：ChannelUpdated 把新增模型探测任务入队，
+// 后台 worker 真实发出探测（并发受限），且重复通知不重复探测。
+func TestNewModelProbeDispatched(t *testing.T) {
+	setupProbeTest(t)
+	var mu sync.Mutex
+	var got []string // 收到的 probe 模型
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		got = append(got, body.Model)
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer up.Close()
+
+	old := testProbeChannel(true)
+	old.BaseURL = up.URL
+	old.Models = []string{"m1"}
+	old.Keys = []*UpKey{
+		{ID: "k1", Name: "a", APIKey: "sk-1", Enabled: true},
+		{ID: "k2", Name: "b", APIKey: "sk-2", Enabled: true},
+	}
+	mustPutChannel(t, old)
+
+	ch := testProbeChannel(true)
+	ch.BaseURL = up.URL
+	ch.Models = []string{"m1", "m2"}
+	ch.Keys = old.Keys
+
+	probes.ChannelUpdated(old, ch)
+	waitCount := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			mu.Lock()
+			n := len(got)
+			mu.Unlock()
+			if n >= want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("ChannelUpdated did not probe the new model (want %d, got %+v)", want, got)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitCount(2)
+	mu.Lock()
+	for _, m := range got {
+		if m != "m2" {
+			t.Fatalf("probe model = %q, want m2", m)
+		}
+	}
+	mu.Unlock()
+
+	// 重复通知（无新模型/新 key）：不再发请求（一次性节流）
+	probes.ChannelUpdated(ch, ch)
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	n := len(got)
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("re-notify should probe nothing, got %d requests", n)
+	}
+}

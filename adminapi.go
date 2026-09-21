@@ -485,11 +485,15 @@ func handleAdminPutChannel(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid channel json: "+err.Error(), "bad_request")
 		return
 	}
+	old := findChannel(ch.ID) // nil = 新建渠道
 	if err := store.PutChannel(&ch); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
 		return
 	}
 	reconcileLeases()
+	// 新增模型/新增 key 尽早探测：部分上游的配额重置计时从首次调用起算，探测
+	// 把它提前；范围与节流见 ChannelUpdated（按冷却粒度、入队限并发）
+	probes.ChannelUpdated(old, &ch)
 	writeJSON(w, http.StatusOK, ch)
 }
 
@@ -787,6 +791,7 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 兼容旧行为：全量替换写回渠道
+	oldModels := ch.Models
 	ch.Models = normalizeModelList(fetched)
 	if err := store.PutChannel(ch); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "save channel: "+err.Error(), "internal")
@@ -794,6 +799,10 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("admin replaced models for channel %q via key %q: %d models (%d free)",
 		ch.Name, usedKey, len(fetched), len(free))
+	// 新增模型尽早探测（替换只动模型列表，key 集合不变；同一套范围/节流/队列）
+	oldCh := *ch
+	oldCh.Models = oldModels
+	probes.ChannelUpdated(&oldCh, ch)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"channel_id":  ch.ID,
 		"models":      ch.Models,
@@ -803,10 +812,16 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// testTarget 指定渠道级测试的范围。
+// testTarget 指定渠道级测试的范围。scope:
+//   - first（默认）：只测第一个启用的 key；
+//   - all：全部启用的 key 逐个完整测试（不因某个 key 通过而跳过其余）；
+//   - pick：只测 key_id 指定的 key。
+// 旧字段 first_only=true 兼容为 first。Models 每行/逗号分隔；空=用渠道已启用
+// 模型（无则 "gpt-4o-mini"）。
 type testTarget struct {
-	KeyID     string `json:"key_id"`     // 非空=只测该 key
-	FirstOnly bool   `json:"first_only"` // 只用第一个启用的 key（不看后续）
+	KeyID     string `json:"key_id"`     // scope=pick 时指定被测 key
+	Scope     string `json:"scope"`      // first（默认）/ all / pick
+	FirstOnly bool   `json:"first_only"` // 旧版兼容：true 等价 scope=first
 	Models    string `json:"models"`     // 每行/逗号分隔；空=用渠道已启用模型（无则 "gpt-4o-mini"）
 }
 
@@ -1014,9 +1029,11 @@ func handleAdminTestKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, runTestOnce(ctx, ch, k, model, msg, adminUserFrom(r.Context())))
 }
 
-// handleAdminTestModel 渠道级测试：对指定模型集合，在渠道内按顺序挑选可用 key
-// 发起真实对话请求（复用网关的故障转移语义），返回逐 (key, 模型) 结果供 WebUI 展示。
-// key_id 非空时只测该 key。所有失败都以 ok=false 的结果返回，不用 HTTP 错误码。
+// handleAdminTestModel 渠道级测试：对指定模型集合，按 scope 挑选 key 发起真实
+// 对话请求（复用网关请求链路与自动换 IP 重试），返回逐 (key, 模型) 结果供
+// WebUI 展示。scope=first（默认）只测第一个启用的 key；scope=all 对全部启用
+// 的 key 逐个完整测试（不做故障转移截断）；scope=pick 只测 key_id 指定的 key。
+// 所有失败都以 ok=false 的结果返回，不用 HTTP 错误码。
 func handleAdminTestModel(w http.ResponseWriter, r *http.Request) {
 	var body testTarget
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1035,17 +1052,34 @@ func handleAdminTestModel(w http.ResponseWriter, r *http.Request) {
 			models = []string{"gpt-4o-mini"}
 		}
 	}
-	// 候选 key：按配置顺序（key_id 非空时仅该 key；first_only 时取第一个启用的）
+	// key 选择：scope=all 取全部启用的 key；scope=pick 只取指定 key（未给
+	// key_id 时退化为 first）；默认（空 / first / 旧字段 first_only）只取
+	// 第一个启用的 key。
+	scope := body.Scope
+	if scope != "all" && scope != "pick" {
+		scope = "first"
+	}
+	if scope == "pick" && body.KeyID == "" {
+		scope = "first"
+	}
 	keys := make([]*UpKey, 0, len(ch.Keys))
 	for _, k := range ch.Keys {
 		if !k.Enabled {
 			continue
 		}
-		if body.KeyID == "" || k.ID == body.KeyID {
+		switch scope {
+		case "all":
+			keys = append(keys, k)
+		case "pick":
+			if k.ID == body.KeyID {
+				keys = append(keys, k)
+			}
+			continue // pick：继续扫描全表匹配（ID 唯一，正常只会命中一个）
+		default: // first
 			keys = append(keys, k)
 		}
-		if body.FirstOnly {
-			break
+		if scope == "first" {
+			break // first 模式只取第一个启用的 key
 		}
 	}
 	if len(keys) == 0 {
@@ -1060,8 +1094,8 @@ func handleAdminTestModel(w http.ResponseWriter, r *http.Request) {
 			res := runTestOnce(ctx, ch, k, m, "ping", adminUserFrom(r.Context()))
 			cancel()
 			results = append(results, res)
-			if res.OK {
-				break // 该模型已通过，无需继续其余 key
+			if scope != "all" && res.OK {
+				break // 非全量模式：该模型已通过，无需继续其余 key
 			}
 		}
 	}

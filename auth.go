@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,11 +21,17 @@ type tokenClaims struct {
 	Exp  int64  `json:"exp"` // unix 秒
 }
 
+// accountsMu 保护 AdminUser/AdminPass（ExtraUsers 只读不写）：
+// 登录/鉴权并发读，设置页「账号」子页修改时并发写，避免数据竞争。
+var accountsMu sync.RWMutex
+
 // verifyLogin 校验用户名密码：先查 EXTRA_USERS 追加用户，再查管理员（默认 admin/admin）。
 func verifyLogin(username, password string) bool {
 	if username == "" || password == "" {
 		return false
 	}
+	accountsMu.RLock()
+	defer accountsMu.RUnlock()
 	if pw, ok := cfg.ExtraUsers[username]; ok {
 		return subtleEqual(pw, password)
 	}
@@ -150,6 +157,86 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		"user":       body.Username,
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleAdminPutAccount 修改管理员登录账号（设置页「账号」子页）：
+// body {current_password 必填, username 可选, password 可选}，至少提供一项。
+// 必须验证当前密码（防「已登录的共享终端」被他人改掉账号）；改后立即生效并
+// 原子写入 accounts.json（重启后保留）。若 ADMIN_USERNAME/ADMIN_PASSWORD
+// 环境变量存在，重启后会被环境变量覆盖，响应带 warning 提示。
+func handleAdminPutAccount(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CurrentPassword string `json:"current_password"`
+		Username        string `json:"username"`
+		Password        string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
+		return
+	}
+	accountsMu.Lock()
+	defer accountsMu.Unlock()
+	if body.Username == "" && body.Password == "" {
+		writeJSONError(w, http.StatusBadRequest, "username 与 password 至少提供一项", "bad_request")
+		return
+	}
+	if !subtleEqual(cfg.AdminPass, body.CurrentPassword) {
+		writeJSONError(w, http.StatusUnauthorized, "当前密码不正确", "unauthorized")
+		return
+	}
+	oldUser := cfg.AdminUser
+	newUser, newPass := cfg.AdminUser, cfg.AdminPass
+	if u := strings.TrimSpace(body.Username); u != "" {
+		if u == cfg.AdminUser {
+			writeJSONError(w, http.StatusBadRequest, "新用户名与当前相同", "bad_request")
+			return
+		}
+		// 冒号是 EXTRA_USERS 环境变量的键值分隔符，用户名含冒号将无法用该格式配置
+		if len(u) > 64 || strings.ContainsAny(u, ":\r\n") {
+			writeJSONError(w, http.StatusBadRequest, "用户名须不超过 64 字符，且不能包含冒号或换行", "bad_request")
+			return
+		}
+		if _, clash := cfg.ExtraUsers[u]; clash {
+			writeJSONError(w, http.StatusBadRequest, "用户名与已有用户冲突", "bad_request")
+			return
+		}
+		newUser = u
+	}
+	if p := body.Password; p != "" {
+		if len(p) < 6 || len(p) > 128 {
+			writeJSONError(w, http.StatusBadRequest, "新密码长度须为 6–128 字符", "bad_request")
+			return
+		}
+		newPass = p
+	}
+	cfg.AdminUser, cfg.AdminPass = newUser, newPass
+
+	// 持久化：管理员凭据 + 当前生效的追加用户（含环境变量带来的，容器重建后不丢）
+	saved, _ := loadPersistedAccounts(cfg.AccountsPath)
+	saved.AdminUsername, saved.AdminPassword = newUser, newPass
+	if len(cfg.ExtraUsers) > 0 {
+		saved.ExtraUsers = cfg.ExtraUsers
+	}
+	if err := savePersistedAccounts(cfg.AccountsPath, saved); err != nil {
+		log.Printf("admin account change: persist failed: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "保存账号失败（改动已生效，但重启后可能还原）："+err.Error(), "internal_error")
+		return
+	}
+	log.Printf("admin account changed: user %q -> %q, password_changed=%v",
+		oldUser, newUser, body.Password != "")
+
+	// 环境变量优先级高于 accounts.json：重启后会把本次修改覆盖回去，明确提示
+	var warns []string
+	if _, ok := os.LookupEnv("ADMIN_USERNAME"); ok && body.Username != "" {
+		warns = append(warns, "ADMIN_USERNAME 环境变量已设置，重启后用户名恢复为环境变量值")
+	}
+	if _, ok := os.LookupEnv("ADMIN_PASSWORD"); ok && body.Password != "" {
+		warns = append(warns, "ADMIN_PASSWORD 环境变量已设置，重启后密码恢复为环境变量值")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"username": newUser,
+		"warning":  strings.Join(warns, "；"),
+	})
 }
 
 // requireAuth 中间件：校验请求身份。LOGIN_REQUIRED=false 时放行。

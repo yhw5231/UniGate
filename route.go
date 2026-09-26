@@ -30,11 +30,18 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// chEntry 参与构建候选的渠道 + 配置序（同优先级内稳定排序依据）。
+type chEntry struct {
+	ch  *Channel
+	idx int
+}
 
 // candidate 一个可路由的 (渠道, key) 组合。
 type candidate struct {
@@ -88,9 +95,19 @@ func endsWithChatCompletions(s string) bool {
 	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }
 
+// failoverSameChannel 该渠道的失败转移模式：默认（"" / same_channel）在一个
+// key 失败后继续尝试同渠道的下一个 key；force_channel 则跳过本渠道剩余 key，
+// 直接进入下一渠道（「强制切换渠道」）。
+func (ch *Channel) failoverSameChannel() bool {
+	return ch.FailoverMode != "force_channel"
+}
+
 // buildCandidates 按优先级构建候选列表（深拷贝自 store）。
-// 调度模式（渠道 schedule，未配置跟随全局默认）：
-//   - failover（默认）：按渠道顺序 + key 顺序，靠前的 key 用满才轮到后面；
+// 渠道顺序：先按渠道优先级（priority，默认 0，越小越靠前）排序，同一优先级内
+// 若存在设置了权重（weight>0）的渠道，按权重比例做平滑加权轮询决定每请求的
+// 渠道先后；否则保持配置顺序。渠道内 key 顺序由调度模式决定
+//（渠道 schedule，未配置跟随全局默认）：
+//   - failover（默认）：按 key 顺序，靠前的 key 用满才轮到后面；
 //   - round_robin：每个渠道把 key 列表从递增游标处旋转一轮（保序），
 //     请求在账号间轮流分配，均摊用量。游标按渠道 ID 记忆（内存态，重启归零）。
 //
@@ -100,14 +117,23 @@ func endsWithChatCompletions(s string) bool {
 func buildCandidates(model string, rawBody []byte) []candidate {
 	snap := store.View() // 只读视图：零拷贝（每请求热路径，不做全量配置深拷贝）
 	def := currentPolicy().DefaultSchedule
+	var avail []chEntry
+	for i, ch := range snap.Channels {
+		if !ch.Enabled || !ch.allowsModel(model) {
+			continue
+		}
+		avail = append(avail, chEntry{ch: ch, idx: i})
+	}
+	if len(avail) == 0 {
+		return nil
+	}
+	// 先按优先级升序稳定排序（同优先级保持配置顺序），再按权重重排
+	sort.SliceStable(avail, func(a, b int) bool { return avail[a].ch.Priority < avail[b].ch.Priority })
+	ordered := orderByPriorityWeight(avail)
+
 	var out []candidate
-	for _, ch := range snap.Channels {
-		if !ch.Enabled {
-			continue
-		}
-		if !ch.allowsModel(model) {
-			continue
-		}
+	for _, e := range ordered {
+		ch := e.ch
 		keys := ch.Keys
 		if ch.effectiveSchedule(def) == scheduleRoundRobin {
 			keys = rotateKeysRR(ch.ID, keys)
@@ -127,6 +153,93 @@ func buildCandidates(model string, rawBody []byte) []candidate {
 		}
 	}
 	return out
+}
+
+// wrrState 平滑加权轮询状态（渠道 ID → 当前权值；内存态，重启归零）。
+var wrrState struct {
+	sync.Mutex
+	cur map[string]int
+}
+
+// orderByPriorityWeight 按 (优先级, 权重) 确定渠道顺序：优先级分组已由调用方
+// 排序完成，这里对每个同优先级组内存在权重（>0）渠道的组做平滑加权轮询重排，
+// 其余组保持原顺序（纯故障转移）。
+func orderByPriorityWeight(entries []chEntry) []chEntry {
+	out := make([]chEntry, 0, len(entries))
+	for i := 0; i < len(entries); {
+		j := i
+		for j < len(entries) && entries[j].ch.Priority == entries[i].ch.Priority {
+			j++
+		}
+		group := entries[i:j]
+		hasWeight := false
+		for _, e := range group {
+			if e.ch.Weight > 0 {
+				hasWeight = true
+				break
+			}
+		}
+		if hasWeight {
+			group = smoothWRREntries(group) // 同优先级组内按权重轮流优先
+		}
+		out = append(out, group...)
+		i = j
+	}
+	return out
+}
+
+// smoothWRREntries 对渠道组做一轮平滑加权轮询（Nginx 算法）：每请求把各渠道
+// 的当前权值 += 权重，取当前权值最大的渠道放到本轮候选首位，选中者 -= 总权重。
+// 长期看各渠道被选为先手的比例 = 权重比（weight=0 的渠道不获得额外分配）；
+// 首位之后的渠道保持原顺序（故障转移沿该顺序继续）。
+func smoothWRREntries(entries []chEntry) []chEntry {
+	if len(entries) <= 1 {
+		return entries
+	}
+	total := 0
+	for _, e := range entries {
+		total += e.ch.Weight
+	}
+	if total <= 0 {
+		return entries
+	}
+	wrrState.Lock()
+	defer wrrState.Unlock()
+	if wrrState.cur == nil {
+		wrrState.cur = map[string]int{}
+	}
+	best := 0
+	for i := range entries {
+		id := entries[i].ch.ID
+		cur := wrrState.cur[id] + entries[i].ch.Weight
+		wrrState.cur[id] = cur
+		if cur > wrrState.cur[entries[best].ch.ID] {
+			best = i
+		}
+	}
+	wrrState.cur[entries[best].ch.ID] -= total
+	out := make([]chEntry, 0, len(entries))
+	out = append(out, entries[best])
+	for i := range entries {
+		if i != best {
+			out = append(out, entries[i])
+		}
+	}
+	return out
+}
+
+// nextCandidateIndex 失败后的候选推进：same_channel（默认）只前进一个候选
+//（同渠道内继续尝试下一个 key）；force_channel 跳过本渠道剩余全部候选，直接
+// 进入下一渠道的候选段（「强制切换渠道」）。
+func nextCandidateIndex(cands []candidate, i int) int {
+	if cands[i].ch.failoverSameChannel() {
+		return i + 1
+	}
+	j := i + 1
+	for j < len(cands) && cands[j].ch.ID == cands[i].ch.ID {
+		j++
+	}
+	return j
 }
 
 // rrCursors 轮询游标：渠道 ID → 该渠道 key 列表的下一起点（内存态）。
@@ -320,7 +433,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 			lastErr = "resolve proxy: " + err.Error()
 			recordTrace(&cand, "proxy_error", lastErr)
 			log.Printf("route: key %s proxy resolve failed: %v", cand.k.Name, err)
-			i++
+			i = nextCandidateIndex(cands, i)
 			continue
 		}
 
@@ -349,7 +462,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 				recordTrace(&cand, "egress_retry", "")
 				continue // 不推进 i：同一候选换出口后原地重试
 			}
-			i++
+			i = nextCandidateIndex(cands, i)
 			continue
 		}
 
@@ -383,7 +496,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 			recordTrace(&cand, "rejected_429", lastErr)
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
-			i++
+			i = nextCandidateIndex(cands, i)
 			continue
 		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 			// 鉴权失败只换 key，不冷却、不换出口
@@ -391,7 +504,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 			recordTrace(&cand, "rejected_auth", lastErr)
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
-			i++
+			i = nextCandidateIndex(cands, i)
 			continue
 		case resp.StatusCode >= 500:
 			// 上游 5xx 只换 key，不冷却；但按 key 记连续次数（成功请求清零），
@@ -408,7 +521,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 				streaks.Reset(cand.k.ID)
 				rotateExit(&cand, fmt.Sprintf("%d consecutive 5xx", n))
 			}
-			i++
+			i = nextCandidateIndex(cands, i)
 			continue
 		}
 
@@ -429,7 +542,7 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 				lastErr = "upstream " + rejectReason(resp)
 				recordTrace(&cand, "rejected_after_commit", lastErr)
 				resp.Body.Close()
-				i++
+				i = nextCandidateIndex(cands, i)
 				continue
 			}
 			// 上游 4xx/5xx 业务错误原样透传，但把响应体片段记入请求日志：

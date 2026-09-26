@@ -19,7 +19,8 @@ import (
 
 // ---- 请求记录 ----
 
-// RequestRecord 一条大模型请求记录。
+// RequestRecord 一条大模型请求记录。错误记录（status>=400）额外携带请求内容与
+// 返回内容（截断），展开详情可直接看到「发出去什么、上游/网关回了什么」。
 type RequestRecord struct {
 	ID               string        `json:"id"`
 	Time             time.Time     `json:"time"`
@@ -37,6 +38,8 @@ type RequestRecord struct {
 	PromptTokens     int64         `json:"prompt_tokens,omitempty"`
 	CompletionTokens int64         `json:"completion_tokens,omitempty"`
 	ErrMsg           string        `json:"error,omitempty"`
+	RequestBody      string        `json:"request_body,omitempty"`  // 错误记录：下游请求内容（截断）
+	ResponseBody     string        `json:"response_body,omitempty"` // 错误记录：回给下游的返回内容（截断）
 }
 
 // RequestLog 请求日志：固定容量，保留最新 capacity 条。挂上 SQLite 表名后
@@ -53,6 +56,21 @@ type RequestLog struct {
 	// 避免与 Add/Query 的自有锁嵌套）。
 	table     string
 	dbAppends int // 距上次裁剪的写入计数（由 mu 保护）
+
+	// retentionDays 按天保留上限（0 = 关闭天数裁剪，只按条数）：错误日志由
+	// WebUI 设置/环境变量 ERR_LOG_RETENTION_DAYS 控制，写入时随条数裁剪一起
+	// 删除保留期外的记录。
+	retentionDays int
+}
+
+// setRetentionDays 更新按天保留上限（WebUI 设置保存时调用；请求日志不使用）。
+func (l *RequestLog) setRetentionDays(days int) {
+	if days < 0 {
+		days = 0
+	}
+	l.mu.Lock()
+	l.retentionDays = days
+	l.mu.Unlock()
 }
 
 func newRequestLog(capacity int) *RequestLog {
@@ -70,9 +88,13 @@ func (l *RequestLog) attachTable(table string) {
 	l.table = table
 	keep := l.cap
 	hasDB := usageDB != nil
+	days := l.retentionDays
 	l.mu.Unlock()
 	if hasDB && keep > 0 {
 		usageDB.logPrune(table, keep)
+	}
+	if hasDB && days > 0 {
+		usageDB.logPruneByDays(table, days)
 	}
 }
 
@@ -105,6 +127,7 @@ func (l *RequestLog) Add(rec RequestRecord) {
 	l.dbAppends++
 	prune := l.dbAppends%logPruneEvery == 0
 	keep := l.cap
+	days := l.retentionDays
 	l.mu.Unlock()
 	if err := usageDB.LogAppend(table, rec, 0); err != nil {
 		l.addMem(rec)
@@ -112,6 +135,9 @@ func (l *RequestLog) Add(rec RequestRecord) {
 	}
 	if prune {
 		usageDB.logPrune(table, keep)
+		if days > 0 {
+			usageDB.logPruneByDays(table, days)
+		}
 	}
 }
 
@@ -213,6 +239,7 @@ const errMsgMax = 8192
 func initStats() {
 	reqLog = newRequestLog(cfg.ReqLogSize)
 	errLog = newRequestLog(cfg.ErrLogSize)
+	errLog.setRetentionDays(currentPolicy().ErrLogRetentionDays)
 	if usageDB != nil {
 		reqLog.attachTable(logTableRequest)
 		errLog.attachTable(logTableError)
@@ -249,6 +276,7 @@ type reqStats struct {
 	promptTokens     int64
 	completionTokens int64
 	errMsg           string // 网关转发失败的诊断信息（覆盖通用的 HTTP 状态文本）
+	requestBody      []byte // 下游请求内容（仅错误记录保存，截断）
 }
 
 func reqStatsFrom(ctx context.Context) *reqStats {
@@ -264,7 +292,14 @@ func setReqErrMsg(r *http.Request, msg string) {
 	}
 }
 
-// ---- responseRecorder：捕获状态码与输出字节数 ----
+// ---- responseRecorder：捕获状态码、输出字节数与错误响应内容 ----
+
+// errReqBodyMax / errRespBodyMax 错误记录保存的请求/返回内容上限（截断保存，
+// 防止把几十 MB 的 SSE 流或超大请求体塞进日志库）。
+const (
+	errReqBodyMax  = 4096
+	errRespBodyMax = 8192
+)
 
 type responseRecorder struct {
 	http.ResponseWriter
@@ -272,6 +307,7 @@ type responseRecorder struct {
 	bytes       int64
 	wroteHeader bool
 	rs          *reqStats // 供上游响应写入 token 用量
+	respBuf     []byte    // 状态 >=400 时累积回给下游的响应内容（截断）
 }
 
 func (r *responseRecorder) WriteHeader(code int) {
@@ -285,6 +321,14 @@ func (r *responseRecorder) WriteHeader(code int) {
 func (r *responseRecorder) Write(b []byte) (int, error) {
 	if !r.wroteHeader {
 		r.WriteHeader(http.StatusOK)
+	}
+	// 错误响应累积内容（仅 status>=400 时；截断上限防止放大内存）
+	if r.status >= 400 && len(r.respBuf) < errRespBodyMax {
+		room := errRespBodyMax - len(r.respBuf)
+		if len(b) > room {
+			b = b[:room]
+		}
+		r.respBuf = append(r.respBuf, b...)
 	}
 	// 每次写出武装下游写超时：客户端保持连接但停止读取时，写（含底层
 	// bufio 刷出）会在超时后报错而不再永久阻塞（客户端停读兜底）
@@ -424,6 +468,9 @@ func statsServe(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 		} else {
 			rec.ErrMsg = http.StatusText(status)
 		}
+		// 错误记录附带请求内容与返回内容（展开详情可对照排查）
+		rec.RequestBody = truncate(string(rs.requestBody), errReqBodyMax)
+		rec.ResponseBody = truncate(string(rw.respBuf), errRespBodyMax)
 	}
 	// key 列是「名称@渠道」的用户标签而非凭证，完整显示不脱敏
 	recordRequest(rec)
@@ -450,6 +497,8 @@ func statsServe(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 
 // isAdmin 判断登录用户是否为管理员。
 func isAdmin(user string) bool {
+	accountsMu.RLock()
+	defer accountsMu.RUnlock()
 	return cfg.LoginRequired && user != "" && user == cfg.AdminUser
 }
 

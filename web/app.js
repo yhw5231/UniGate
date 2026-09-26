@@ -106,8 +106,16 @@ $$(".tab").forEach((btn) => btn.addEventListener("click", () => {
   if (btn.dataset.tab === "test") refreshTestTab();
   if (btn.dataset.tab === "usage") refreshUsage();
   if (btn.dataset.tab === "leases") { renderPools(); refreshLeases(); }
-  if (btn.dataset.tab === "settings") fillSettingsForm();
+  if (btn.dataset.tab === "settings") { fillSettingsForm(); fillAccountForm(); }
   syncAutoTimers();
+}));
+
+// ---- 设置页子页签：路由策略 / 账号 ----
+$$(".subtab").forEach((btn) => btn.addEventListener("click", () => {
+  $$(".subtab").forEach((b) => b.classList.remove("active"));
+  btn.classList.add("active");
+  $$(".subpane").forEach((p) => p.classList.add("hidden"));
+  $("#sub-" + btn.dataset.subpane).classList.remove("hidden");
 }));
 
 // ---- 状态加载 ----
@@ -117,6 +125,7 @@ async function loadState() {
   renderGWKeys();
   renderPools();
   fillSettingsForm();
+  fillAccountForm();
   if (!$("#tab-leases").classList.contains("hidden")) refreshLeases();
 }
 
@@ -132,6 +141,7 @@ function fillSettingsForm() {
   $("#setProbeIdleSec").value = s.probe_idle_sec ?? "";
   $("#setProbeStartup").value = s.probe_startup === undefined ? "" : (s.probe_startup ? "1" : "0");
   $("#setDefaultSchedule").value = s.default_schedule || "";
+  $("#setErrLogRetentionDays").value = s.err_log_retention_days ?? "";
   // RoutePolicy 无 json tag：生效值按 Go 字段名下发，Duration 序列化为纳秒
   const ns = (v) => Math.round((v || 0) / 1e9);
   const tries = (p.MaxRouteTries || 0) === 0 ? "全部" : p.MaxRouteTries;
@@ -167,9 +177,65 @@ $("#settingsSaveBtn").addEventListener("click", async () => {
   } catch (e) { toast(e.message, true); }
 });
 
+// 设置页「日志与错误」子页：错误日志按天保留（PUT 为全量替换，合并当前
+// 已显式设置的其余项，避免覆盖路由策略表单里已保存的值）。
+$("#logSettingsSaveBtn").addEventListener("click", async () => {
+  const body = { ...(STATE && STATE.settings ? { ...STATE.settings } : {}) };
+  const days = $("#setErrLogRetentionDays").value.trim();
+  if (days === "") {
+    body.err_log_retention_days = null; // 留空 = 恢复环境变量默认
+  } else {
+    const n = parseInt(days, 10);
+    if (!Number.isFinite(n) || n < 0) { toast("错误日志保留天数必须是不小于 0 的整数", true); return; }
+    body.err_log_retention_days = n;
+  }
+  try {
+    await api("PUT", "/admin/api/settings", body);
+    toast("日志设置已保存并生效");
+    await loadState();
+  } catch (e) { toast(e.message, true); }
+});
+
+// ---- 设置页「账号」子页：修改管理员用户名/密码 ----
+// 走 PUT /admin/api/account：须带当前密码验证；改后立即生效并持久化，
+// 重启后仍保留（除非对应环境变量显式覆盖，后端会带 warning 提示）。
+function fillAccountForm() {
+  const who = ($("#whoami").textContent || "").trim();
+  $("#accountCurUser").textContent = who || "—";
+}
+
+$("#acctSaveUserBtn").addEventListener("click", async () => {
+  const cur = $("#acctCurPassForUser").value;
+  const name = $("#acctNewUser").value.trim();
+  if (!cur) return toast("请输入当前密码", true);
+  if (!name) return toast("请输入新用户名", true);
+  try {
+    const r = await api("PUT", "/admin/api/account", { current_password: cur, username: name });
+    toast((r.warning ? r.warning + "；" : "") + "用户名已修改，请用新用户名重新登录");
+    $("#loginUser").value = r.username; // 登录页预填新用户名
+    logout(); // 旧 token 已不属于管理员，立即回到登录页
+  } catch (e) { toast(e.message, true); }
+});
+
+$("#acctSavePassBtn").addEventListener("click", async () => {
+  const cur = $("#acctCurPass").value;
+  const p1 = $("#acctNewPass").value;
+  const p2 = $("#acctNewPass2").value;
+  if (!cur) return toast("请输入当前密码", true);
+  if (!p1) return toast("请输入新密码", true);
+  if (p1 !== p2) return toast("两次输入的新密码不一致", true);
+  try {
+    const r = await api("PUT", "/admin/api/account", { current_password: cur, password: p1 });
+    toast((r.warning ? r.warning + "；" : "") + "密码已修改并生效");
+    $("#acctCurPass").value = $("#acctNewPass").value = $("#acctNewPass2").value = "";
+  } catch (e) { toast(e.message, true); }
+});
+
 // ---- 路由页：按模型展示候选 key 与实时状态（可用/冷却中/停用），支持
 // 逐 (key, 模型) 精确解除冷却、一键清空全部冷却、切换全局默认账号调度 ----
 let routeState = null;
+// routeOpen 记录「已展开」的模型分组（Set）；未在集合内的分组默认收起。
+let routeOpen = new Set();
 
 // refreshRoute 拉取路由视图并重绘。quiet=true（轮询）时失败静默，
 // 避免后台定时器每 5s 弹一次错误条。
@@ -206,12 +272,21 @@ function renderRoute() {
       await loadState(); // 同步渠道页的冷却明细
     } catch (e) { toast(e.message, true); }
   }));
+  // 点击模型头（按钮除外）切换候选明细展开/收起
+  el.querySelectorAll(".route-model-head[data-act=toggle]").forEach((h) => h.addEventListener("click", (e) => {
+    if (e.target.closest("button")) return;
+    const m = h.closest(".route-model").dataset.model;
+    if (routeOpen.has(m)) routeOpen.delete(m); else routeOpen.add(m);
+    renderRoute();
+  }));
 }
 
 // routeModelHTML 单个模型分组的候选行。候选顺序 = 网关实际转发顺序
 //（渠道配置序 + key 配置序），可直接当作「下一个请求会用谁」的预览。
+// 分组头点击展开/收起候选明细（默认收起，只头部展示可用/冷却概况）。
 function routeModelHTML(g, showOff) {
   const keys = (g.keys || []).filter((k) => showOff || k.status !== "disabled");
+  const open = routeOpen.has(g.model);
   const rows = keys.map((k) => {
     let badge, extra = "";
     if (k.status === "ok") {
@@ -232,15 +307,16 @@ function routeModelHTML(g, showOff) {
     </div>`;
   }).join("");
   const zero = g.available === 0 ? '<span class="badge off" title="该模型当前没有可路由的 key，请求会失败（全部冷却时网关会穿透最早到期的候选试探）">无可用 key</span>' : "";
-  return `<div class="route-model">
-    <div class="route-model-head">
+  return `<div class="route-model ${open ? "open" : ""}" data-model="${esc(g.model)}">
+    <div class="route-model-head" data-act="toggle" title="点击展开/收起该模型的候选明细">
+      <span class="chev">${open ? "▾" : "▸"}</span>
       <span class="rk-model" title="${esc(g.model)}">${esc(g.model || "（未声明模型列表 · 对全部模型放行）")}</span>
       ${zero}
       <span class="badge on">可用 ${g.available}</span>
       ${g.cooling ? `<span class="badge warn">冷却 ${g.cooling}</span>` : ""}
       <span class="muted">候选 ${g.total}</span>
     </div>
-    ${rows ? `<div class="route-keys">${rows}</div>` : '<div class="key-line muted">该模型没有候选渠道/key（渠道未启用或模型未声明）</div>'}
+    ${open ? `<div class="route-keys">${rows ? rows : '<div class="key-line muted">该模型没有候选渠道/key（渠道未启用或模型未声明）</div>'}</div>` : ""}
   </div>`;
 }
 
@@ -333,6 +409,17 @@ function refreshGroupOptions() {
   $("#groupSuggestions").innerHTML = groups.map((g) => `<option value="${esc(g)}">`).join("");
 }
 
+// ---- 渠道列表 ----
+// channelOpen 记录「已展开」的渠道卡片（Set）；未在集合内的卡片默认收起，
+// 点击卡片头展开/收起。刷新重绘时保持展开状态。
+let channelOpen = new Set();
+
+function toggleChannelCard(id) {
+  if (channelOpen.has(id)) channelOpen.delete(id); else channelOpen.add(id);
+  const card = document.querySelector(`.channel-card[data-id="${CSS.escape(id)}"]`);
+  if (card) card.classList.toggle("open", channelOpen.has(id));
+}
+
 function renderChannels() {
   refreshGroupOptions();
   const wrap = $("#channelList");
@@ -369,8 +456,10 @@ function renderChannels() {
       const p = ch.model_pins[m];
       return p && ((p.upstreams || []).length || (p.exclude || []).length || p.sort);
     }).length;
-    return `<div class="channel-card" data-id="${esc(ch.id)}">
-      <div class="head">
+    const open = channelOpen.has(ch.id);
+    return `<div class="channel-card ${open ? "open" : ""}" data-id="${esc(ch.id)}">
+      <div class="head" data-act="toggle" title="点击展开/收起渠道详情">
+        <span class="chev">${open ? "▾" : "▸"}</span>
         <span class="badge ${ch.enabled ? "on" : "off"}">${ch.enabled ? "启用" : "停用"}</span>
         <span class="name">${esc(ch.name)}</span>
         ${ch.group ? `<span class="badge group">${esc(ch.group)}</span>` : ""}
@@ -379,6 +468,9 @@ function renderChannels() {
         ${ch.rewrite_reasoning ? '<span class="badge info">reasoning改写</span>' : ""}
         ${ch.cooldown_scope === "key_model" ? '<span class="badge info">按(Key,模型)冷却</span>' : ""}
         ${ch.schedule === "round_robin" ? '<span class="badge info" title="每次请求从下一个 key 开始轮流分配">顺序轮询</span>' : ""}
+        ${ch.priority ? `<span class="badge info" title="渠道优先级：数值越小越先被路由">优先级 ${esc(ch.priority)}</span>` : ""}
+        ${ch.weight ? `<span class="badge info" title="渠道权重：同优先级内按权重比例轮流优先">权重 ${esc(ch.weight)}</span>` : ""}
+        ${ch.failover_mode === "force_channel" ? '<span class="badge info" title="渠道内任一 key 失败立即切到下一个渠道">强制切渠道</span>' : ""}
         ${ch.auto_probe ? '<span class="badge info" title="启动时、key 冷却恢复/连续无调用达空闲探测间隔（默认 2 小时）时自动发加法题验证账号状态">自动探测</span>' : ""}
         ${ch.proxy && ch.proxy.kind ? '<span class="badge info">渠道代理</span>' : ""}
         ${pinnedModels ? `<span class="badge info" title="该渠道有模型的内部渠道被固定（请求注入 provider.only/order，不再随机路由）">已固定 ${pinnedModels} 个模型</span>` : ""}
@@ -388,10 +480,18 @@ function renderChannels() {
         <button class="btn small" data-act="edit">编辑</button>
         <button class="btn small danger" data-act="del">删除</button>
       </div>
+      <div class="card-body">
       ${modelLine}
       ${keyLines || '<div class="key-line muted">无 key</div>'}
+      </div>
     </div>`;
   }).join("");
+
+  // 点击卡片头（按钮除外）切换展开/收起
+  wrap.querySelectorAll(".head[data-act=toggle]").forEach((h) => h.addEventListener("click", (e) => {
+    if (e.target.closest("button")) return;
+    toggleChannelCard(h.closest(".channel-card").dataset.id);
+  }));
 
   wrap.querySelectorAll('[data-act="edit"]').forEach((b) => b.addEventListener("click", () => {
     const id = b.closest(".channel-card").dataset.id;
@@ -820,6 +920,9 @@ function openChannelEditor(ch) {
   $("#chRewrite").checked = !!ch.rewrite_reasoning;
   $("#chCooldownScope").value = ch.cooldown_scope === "key_model" ? "key_model" : "key";
   $("#chSchedule").value = ch.schedule || "";
+  $("#chPriority").value = ch.priority || 0;
+  $("#chWeight").value = ch.weight || 0;
+  $("#chFailoverMode").value = ch.failover_mode === "force_channel" ? "force_channel" : "";
   $("#chAutoProbe").checked = !!ch.auto_probe;
   renderChannelProxy(ch.proxy || null);
   renderHeaderRows(ch.headers || {});
@@ -1300,6 +1403,9 @@ function collectChannelForm() {
     rewrite_reasoning: $("#chRewrite").checked,
     cooldown_scope: $("#chCooldownScope").value,
     schedule: $("#chSchedule").value,
+    priority: parseInt($("#chPriority").value, 10) || 0,
+    weight: parseInt($("#chWeight").value, 10) || 0,
+    failover_mode: $("#chFailoverMode").value,
     auto_probe: $("#chAutoProbe").checked,
     proxy: chProxy,
     model_pins: Object.keys(modelPins).length ? modelPins : undefined,
@@ -1478,6 +1584,8 @@ function logDetailRow(id, r) {
       ${f("出口", r.client_ip)}
     </div>
     ${r.error ? `<div class="e">${esc(r.error)}</div>` : ""}
+    ${r.request_body ? `<div class="e"><div class="k">请求内容</div>${esc(r.request_body)}</div>` : ""}
+    ${r.response_body ? `<div class="e"><div class="k">返回内容</div>${esc(r.response_body)}</div>` : ""}
   </div></td></tr>`;
 }
 

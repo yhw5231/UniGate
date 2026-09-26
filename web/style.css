@@ -34,6 +34,24 @@ code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
   cursor: pointer; border-radius: 6px; font-size: 14px;
 }
 .tab.active { background: var(--panel2); color: var(--text); }
+/* 页内子页签（设置页：路由策略 / 账号） */
+.subnav { display: flex; gap: 4px; margin-bottom: 14px; }
+.subtab {
+  background: none; border: 1px solid transparent; color: var(--muted);
+  padding: 6px 14px; cursor: pointer; border-radius: 6px; font-size: 14px;
+}
+.subtab:hover { color: var(--text); }
+.subtab.active { background: var(--panel2); border-color: var(--border); color: var(--text); }
+/* 折叠卡片/分组：默认收起，点击头部展开 */
+.channel-card .head { cursor: pointer; }
+.channel-card .card-body { display: none; }
+.channel-card.open .card-body { display: block; }
+.chev { color: var(--muted); font-size: 12px; width: 14px; display: inline-block; }
+.route-model-head { cursor: pointer; }
+.route-model:not(.open) .route-keys { display: none; }
+.log-detail .k {
+  color: var(--muted); font-size: 12px; margin: 6px 0 2px; font-weight: 600;
+}
 .spacer { flex: 1; }
 /* main 占满视口宽度：日志等表格页与渠道/路由等卡片页均自适应视口宽度，
    宽屏下不再留白，key 冷却明细等长内容尽量单行铺开、不被挤换行。 */

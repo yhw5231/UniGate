@@ -150,6 +150,9 @@ type Channel struct {
 	CooldownScope string                       `json:"cooldown_scope,omitempty"` // 冷却粒度："" / "key" 按 key 跨模型共享（默认）；"key_model" 按 (key,model)
 	Schedule      string                       `json:"schedule,omitempty"`       // 账号调度："" 跟随全局默认；"failover" 故障转移；"round_robin" 顺序轮询
 	AutoProbe     bool                         `json:"auto_probe,omitempty"`     // 自动探测：启动时、key 冷却恢复时、正常状态连续无调用达空闲探测间隔（默认 2h）时，自动发加法题验证账号状态（probe.go）
+	Priority      int                          `json:"priority,omitempty"`       // 渠道优先级：数值越小越先被路由（默认 0）；同优先级保持配置顺序
+	Weight        int                          `json:"weight,omitempty"`         // 渠道权重：>0 时同一优先级组内按权重比例轮流分配请求（0 = 不参与加权）
+	FailoverMode  string                       `json:"failover_mode,omitempty"`  // 失败转移："" / "same_channel" 同渠道内逐个 key 失败转移（默认）；"force_channel" key 失败立即切到下一渠道
 	Proxy         *ProxySpec                   `json:"proxy,omitempty"`          // 渠道级代理（如代理池）：未单独配置代理的 key 全部继承，每个 key 独立租约/出口 IP
 	ModelPins     map[string]*ModelUpstreamPin `json:"model_pins,omitempty"`     // 模型 → 上游内部渠道固定（upstreampin.go）
 	Enabled       bool                         `json:"enabled"`
@@ -442,6 +445,7 @@ type GatewaySettings struct {
 	ProbeIdleSec         *int    `json:"probe_idle_sec,omitempty"`          // 自动探测的空闲探测间隔秒数（默认 7200=2h，0 关闭）
 	ProbeStartup         *bool   `json:"probe_startup,omitempty"`           // 启动探测开关（默认 true；重启/部署后核对账号状态）
 	DefaultSchedule      *string `json:"default_schedule,omitempty"`        // 默认账号调度："" 沿用环境变量；"failover" / "round_robin"
+	ErrLogRetentionDays  *int    `json:"err_log_retention_days,omitempty"`  // 错误日志按天保留上限（默认 7，0 = 只按条数）
 }
 
 // normalize 校验设置值（nil 合法 = 未设置）。
@@ -459,6 +463,9 @@ func (s *GatewaySettings) normalize() error {
 		if v != nil && *v < 0 {
 			return fmt.Errorf("%s must be >= 0", name)
 		}
+	}
+	if s.ErrLogRetentionDays != nil && *s.ErrLogRetentionDays < 0 {
+		return errors.New("err_log_retention_days must be >= 0")
 	}
 	if s.DefaultSchedule != nil {
 		v, err := normalizeSchedule(*s.DefaultSchedule)
@@ -732,6 +739,17 @@ func normalizeChannel(ch *Channel) error {
 		return err
 	}
 	ch.Schedule = sched
+	if ch.Priority < 0 {
+		return errors.New("channel priority must be >= 0")
+	}
+	if ch.Weight < 0 {
+		return errors.New("channel weight must be >= 0")
+	}
+	switch ch.FailoverMode {
+	case "", "same_channel", "force_channel":
+	default:
+		return fmt.Errorf("unsupported failover_mode %q (want same_channel / force_channel)", ch.FailoverMode)
+	}
 	if ch.Proxy != nil && ch.Proxy.Kind == "" {
 		ch.Proxy = nil // 空代理规格 = 未设置渠道级代理
 	}

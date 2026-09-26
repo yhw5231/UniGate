@@ -80,11 +80,12 @@ type Config struct {
 	TestTimeout time.Duration // 渠道/key 测试端点的整体超时（默认 45s，低于常见反代 60s）
 
 	// 可观察性
-	ReqLogSize         int // 请求记录环形缓冲容量（全部请求）
-	ErrLogSize         int // 错误记录环形缓冲容量（独立存储，不被成功请求挤出）
-	UsageDBPath        string
-	UsageRetentionDays int
-	UsageMaxRecords    int
+	ReqLogSize          int // 请求记录环形缓冲容量（全部请求）
+	ErrLogSize          int // 错误记录环形缓冲容量（独立存储，不被成功请求挤出）
+	ErrLogRetentionDays int // 错误记录按天保留上限（默认 7，0 = 关闭天数裁剪只按条数）
+	UsageDBPath         string
+	UsageRetentionDays  int
+	UsageMaxRecords     int
 }
 
 // defaultTokenSecret 进程内兜底签名密钥（无 TOKEN_SECRET 且密钥文件不可写时用）。
@@ -187,11 +188,12 @@ func loadConfig() Config {
 
 		TestTimeout: durationEnv("TEST_TIMEOUT", 45*time.Second),
 
-		ReqLogSize:         intEnv("REQ_LOG_SIZE", 1000),
-		ErrLogSize:         intEnv("ERR_LOG_SIZE", 1000),
-		UsageDBPath:        usageDBPath,
-		UsageRetentionDays: intEnv("USAGE_RETENTION_DAYS", 30),
-		UsageMaxRecords:    intEnv("USAGE_MAX_RECORDS", 100000),
+		ReqLogSize:          intEnv("REQ_LOG_SIZE", 1000),
+		ErrLogSize:          intEnv("ERR_LOG_SIZE", 1000),
+		ErrLogRetentionDays: intEnv("ERR_LOG_RETENTION_DAYS", 7),
+		UsageDBPath:         usageDBPath,
+		UsageRetentionDays:  intEnv("USAGE_RETENTION_DAYS", 30),
+		UsageMaxRecords:     intEnv("USAGE_MAX_RECORDS", 100000),
 	}
 }
 
@@ -254,13 +256,14 @@ func durationEnv(key string, def time.Duration) time.Duration {
 // RoutePolicy 运行时路由策略：环境变量提供默认值，WebUI 设置（gateway.json）
 // 显式覆盖。原子持有，保存设置时与在途请求无数据竞争。
 type RoutePolicy struct {
-	RateLimitCooldown time.Duration // 429 冷却（上游未给明确到期时间时）
-	RotateAfter5xx    int           // 连续 5xx 换出口阈值（0 = 关闭）
-	MaxRouteTries     int           // 单请求最多尝试 key 数（0 = 全部）
-	KeepaliveInterval time.Duration // 流式心跳间隔（0 = 关闭）
-	ProbeIdleInterval time.Duration // 自动探测的空闲探测间隔（0 = 关闭空闲探测）
-	ProbeStartup      bool          // 启动探测（重启/重新部署后核对账号状态）
-	DefaultSchedule   string        // 默认账号调度：failover / round_robin（渠道未显式配置时使用）
+	RateLimitCooldown   time.Duration // 429 冷却（上游未给明确到期时间时）
+	RotateAfter5xx      int           // 连续 5xx 换出口阈值（0 = 关闭）
+	MaxRouteTries       int           // 单请求最多尝试 key 数（0 = 全部）
+	KeepaliveInterval   time.Duration // 流式心跳间隔（0 = 关闭）
+	ProbeIdleInterval   time.Duration // 自动探测的空闲探测间隔（0 = 关闭空闲探测）
+	ProbeStartup        bool          // 启动探测（重启/重新部署后核对账号状态）
+	DefaultSchedule     string        // 默认账号调度：failover / round_robin（渠道未显式配置时使用）
+	ErrLogRetentionDays int           // 错误日志按天保留上限（0 = 只按条数）
 }
 
 var policy atomic.Pointer[RoutePolicy]
@@ -268,13 +271,14 @@ var policy atomic.Pointer[RoutePolicy]
 // defaultPolicy 环境变量默认策略。
 func defaultPolicy() *RoutePolicy {
 	return &RoutePolicy{
-		RateLimitCooldown: cfg.RateLimitCooldown,
-		RotateAfter5xx:    cfg.RotateAfter5xx,
-		MaxRouteTries:     cfg.MaxRouteTries,
-		KeepaliveInterval: cfg.KeepaliveInterval,
-		ProbeIdleInterval: time.Duration(cfg.ProbeIdleSec) * time.Second,
-		ProbeStartup:      cfg.ProbeStartup,
-		DefaultSchedule:   cfg.DefaultSchedule,
+		RateLimitCooldown:   cfg.RateLimitCooldown,
+		RotateAfter5xx:      cfg.RotateAfter5xx,
+		MaxRouteTries:       cfg.MaxRouteTries,
+		KeepaliveInterval:   cfg.KeepaliveInterval,
+		ProbeIdleInterval:   time.Duration(cfg.ProbeIdleSec) * time.Second,
+		ProbeStartup:        cfg.ProbeStartup,
+		DefaultSchedule:     cfg.DefaultSchedule,
+		ErrLogRetentionDays: cfg.ErrLogRetentionDays,
 	}
 }
 
@@ -311,7 +315,19 @@ func applySettings(set GatewaySettings) {
 	if set.DefaultSchedule != nil {
 		p.DefaultSchedule = normalizeScheduleDefault(*set.DefaultSchedule)
 	}
+	if set.ErrLogRetentionDays != nil {
+		if *set.ErrLogRetentionDays < 0 {
+			p.ErrLogRetentionDays = 0
+		} else {
+			p.ErrLogRetentionDays = *set.ErrLogRetentionDays
+		}
+	}
 	policy.Store(p)
+	// 错误日志按天上限跟随生效设置（applySettings 可能在 initStats 之前调用，
+	// initStats/attachTable 时会以当前值为准补一次启动裁剪）
+	if errLog != nil {
+		errLog.setRetentionDays(p.ErrLogRetentionDays)
+	}
 }
 
 // splitCSV 按逗号切分并去空白、去空项。

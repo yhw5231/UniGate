@@ -100,7 +100,9 @@ CREATE TABLE IF NOT EXISTS request_log (
 	key TEXT NOT NULL DEFAULT '',
 	prompt_tokens INTEGER NOT NULL DEFAULT 0,
 	completion_tokens INTEGER NOT NULL DEFAULT 0,
-	error TEXT NOT NULL DEFAULT ''
+	error TEXT NOT NULL DEFAULT '',
+	request_body TEXT NOT NULL DEFAULT '',
+	response_body TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_request_log_time ON request_log(time);
 
@@ -120,7 +122,9 @@ CREATE TABLE IF NOT EXISTS error_log (
 	key TEXT NOT NULL DEFAULT '',
 	prompt_tokens INTEGER NOT NULL DEFAULT 0,
 	completion_tokens INTEGER NOT NULL DEFAULT 0,
-	error TEXT NOT NULL DEFAULT ''
+	error TEXT NOT NULL DEFAULT '',
+	request_body TEXT NOT NULL DEFAULT '',
+	response_body TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_error_log_time ON error_log(time);
 `
@@ -138,6 +142,10 @@ func validLogTable(table string) bool {
 // usageMigrations 老库补列（ALTER TABLE 幂等性由检查保证）。
 var usageMigrations = []string{
 	`ALTER TABLE usage_events ADD COLUMN channel TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE request_log ADD COLUMN request_body TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE request_log ADD COLUMN response_body TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE error_log ADD COLUMN request_body TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE error_log ADD COLUMN response_body TEXT NOT NULL DEFAULT ''`,
 }
 
 func newUsageDB(path string, retentionDays, maxRecords int) *UsageDB {
@@ -663,11 +671,11 @@ func (db *UsageDB) LogAppend(table string, rec RequestRecord, keep int) error {
 		return errUsageDBUnavailable
 	}
 	err := db.execLocked(`INSERT INTO `+table+`
-		(rid, time, duration_ms, method, path, status, bytes_out, client_ip, user, channel, model, key, prompt_tokens, completion_tokens, error)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(rid, time, duration_ms, method, path, status, bytes_out, client_ip, user, channel, model, key, prompt_tokens, completion_tokens, error, request_body, response_body)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		rec.ID, rec.Time.UnixNano(), rec.DurationMs, rec.Method, rec.Path, rec.Status,
 		rec.BytesOut, rec.ClientIP, rec.User, rec.Channel, rec.Model, rec.Key,
-		rec.PromptTokens, rec.CompletionTokens, rec.ErrMsg)
+		rec.PromptTokens, rec.CompletionTokens, rec.ErrMsg, rec.RequestBody, rec.ResponseBody)
 	if err != nil {
 		log.Printf("usage db: append %s: %v", table, err)
 		return err
@@ -703,7 +711,8 @@ func (db *UsageDB) LogQuery(table string, page, pageSize int) ([]RequestRecord, 
 		return []RequestRecord{}, 0
 	}
 	rows, err := h.Query(`SELECT rid, time, duration_ms, method, path, status, bytes_out,
-		client_ip, user, channel, model, key, prompt_tokens, completion_tokens, error
+		client_ip, user, channel, model, key, prompt_tokens, completion_tokens, error,
+		request_body, response_body
 		FROM `+table+` ORDER BY id DESC LIMIT ? OFFSET ?`, pageSize, (page-1)*pageSize)
 	if err != nil {
 		db.retireIfDead(h)
@@ -718,7 +727,7 @@ func (db *UsageDB) LogQuery(table string, page, pageSize int) ([]RequestRecord, 
 		)
 		if err := rows.Scan(&rec.ID, &unix, &rec.DurationMs, &rec.Method, &rec.Path, &rec.Status,
 			&rec.BytesOut, &rec.ClientIP, &rec.User, &rec.Channel, &rec.Model, &rec.Key,
-			&rec.PromptTokens, &rec.CompletionTokens, &rec.ErrMsg); err != nil {
+			&rec.PromptTokens, &rec.CompletionTokens, &rec.ErrMsg, &rec.RequestBody, &rec.ResponseBody); err != nil {
 			continue
 		}
 		rec.Time = time.Unix(0, unix)
@@ -740,6 +749,21 @@ func (db *UsageDB) logPrune(table string, keep int) {
 	}
 	_ = db.execLocked(`DELETE FROM `+table+` WHERE id NOT IN (
 		SELECT id FROM `+table+` ORDER BY id DESC LIMIT ?)`, keep)
+}
+
+// logPruneByDays 把日志表按保留天数裁剪：删除 time 早于 cutoff 的记录
+//（days <= 0 关闭）。错误记录按天清理用（条数上限之外的第二种上限）。
+func (db *UsageDB) logPruneByDays(table string, days int) {
+	if db == nil || !validLogTable(table) || days <= 0 {
+		return
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.ensure() == nil {
+		return
+	}
+	cutoff := time.Now().AddDate(0, 0, -days).UnixNano()
+	_ = db.execLocked(`DELETE FROM `+table+` WHERE time < ?`, cutoff)
 }
 
 // LogClear 清空日志表，返回删除条数。

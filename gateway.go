@@ -49,6 +49,8 @@ func gatewayChat(w http.ResponseWriter, r *http.Request) {
 
 	if rs := reqStatsFrom(r.Context()); rs != nil {
 		rs.model = model
+		// 错误记录需要请求内容：gatewayChat 是唯一完整读到请求体的地方
+		rs.requestBody = rawBody
 	}
 
 	cand := forwardChat(w, r, rawBody, stream, model)

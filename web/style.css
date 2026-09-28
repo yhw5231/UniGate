@@ -64,13 +64,19 @@ main { width: 100%; margin: 0 auto; padding: 20px 24px; }
 /* 表单 */
 label { display: block; margin: 6px 0; }
 label.inline { display: inline-flex; align-items: center; gap: 6px; margin-right: 16px; }
-input[type=text], input:not([type]), input[type=password], textarea, select {
+input[type=text], input:not([type]), input[type=password], input[type=number], textarea, select {
   width: 100%; background: var(--panel2); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px;
   font: inherit; outline: none;
 }
 input:focus, textarea:focus, select:focus { border-color: var(--accent); }
 textarea { resize: vertical; }
+/* 渠道编辑弹窗的选项行：一行放不下时整项折行，不压缩内部控件（避免下拉/输入被挤变形） */
+.opt-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; margin-bottom: 10px; }
+.opt-row label.inline { margin: 0; }
+.opt-row select { width: auto; max-width: 260px; }
+.opt-row input[type=number] { width: 88px; }
+@media (max-width: 800px) { .opt-row { gap: 6px 12px; } }
 
 /* 按钮 */
 .btn {
@@ -136,6 +142,9 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 .channel-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
 .channel-card .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .channel-card .head .name { font-weight: 700; font-size: 15px; }
+/* 卡片头内的「优先级 / 权重」快捷编辑：紧凑内联，随卡片头折行 */
+.ch-num { display: inline-flex; align-items: center; gap: 4px; margin: 0; font-size: 12px; color: var(--muted); }
+.ch-num input { width: 64px; padding: 2px 6px; font-size: 12px; }
 .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
 .badge.on { background: rgba(53,194,110,.15); color: var(--ok); }
 .badge.off { background: rgba(224,82,82,.15); color: var(--err); }

@@ -488,7 +488,7 @@
           <button class="btn small" id="fetchApplyBtn">按勾选重建列表</button>
         </div>
       </div>
-      <div class="row">
+      <div class="opt-row">
         <label class="inline"><input type="checkbox" id="chEnabled"> 启用渠道</label>
         <label class="inline" title="把上游返回的 reasoning 字段复制为 reasoning_content（Cline 渠道需要）"><input type="checkbox" id="chRewrite"> reasoning→reasoning_content 改写</label>
         <label class="inline" title="按 Key：某模型故障即冷停该 key 的所有模型（适合 key 配额共享的上游）；按 (Key, 模型)：某模型故障只冷却该 key 的该模型">冷却粒度
@@ -504,11 +504,13 @@
             <option value="round_robin">顺序轮询</option>
           </select>
         </label>
-        <label class="inline" title="渠道优先级：数值越小越先被路由（默认 0）；同优先级保持配置顺序">优先级
-          <input id="chPriority" type="number" min="0" value="0" style="width:80px">
+      </div>
+      <div class="opt-row">
+        <label class="inline" title="渠道优先级：数值越小越先被路由（默认 0）；同优先级保持配置顺序。也可在渠道页卡片头直接修改">优先级
+          <input id="chPriority" type="number" min="0" step="1" value="0">
         </label>
-        <label class="inline" title="渠道权重：>0 时同一优先级内的渠道按权重比例轮流优先（平滑加权轮询，请求多时按比例均摊）；0 = 不参与加权，按顺序故障转移">权重
-          <input id="chWeight" type="number" min="0" value="0" style="width:80px">
+        <label class="inline" title="渠道权重：>0 时同一优先级内的渠道按权重比例轮流优先（平滑加权轮询，请求多时按比例均摊）；0 = 不参与加权，按顺序故障转移。也可在渠道页卡片头直接修改">权重
+          <input id="chWeight" type="number" min="0" step="1" value="0">
         </label>
         <label class="inline" title="失败转移：同渠道切换 = 渠道内一个 key 失败继续尝试下一个 key，全部失败才切到下一渠道；强制切换渠道 = 渠道内任一 key 失败立即跳到下一渠道（适合每个渠道只想要一个 key 生效的场景）">失败转移
           <select id="chFailoverMode">

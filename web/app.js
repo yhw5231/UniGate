@@ -443,11 +443,20 @@ function syncAutoTimers() {
 }
 
 // refreshChannels 拉取最新状态并重绘渠道列表（含各 key 冷却明细与剩余时间）。
+// 自动刷新（quiet）时若光标停在渠道列表内的输入控件上（卡片头的优先级/权重快捷
+// 编辑等），跳过本次重绘：重绘会替换节点，正在输入的内容与焦点会一起丢失。
 async function refreshChannels(quiet) {
   try {
+    if (quiet && editingInChannelList()) return;
     STATE = await api("GET", "/admin/api/state");
     renderChannels();
   } catch (e) { if (!quiet) toast(e.message, true); }
+}
+
+// editingInChannelList 光标是否停在渠道列表内的可输入控件上。
+function editingInChannelList() {
+  const a = document.activeElement;
+  return !!(a && a.matches("input, textarea, select") && $("#channelList").contains(a));
 }
 
 // ---- 渠道列表 ----
@@ -538,8 +547,12 @@ function renderChannels() {
         ${ch.rewrite_reasoning ? '<span class="badge info">reasoning改写</span>' : ""}
         ${ch.cooldown_scope === "key_model" ? '<span class="badge info">按(Key,模型)冷却</span>' : ""}
         ${ch.schedule === "round_robin" ? '<span class="badge info" title="每次请求从下一个 key 开始轮流分配">顺序轮询</span>' : ""}
-        ${ch.priority ? `<span class="badge info" title="渠道优先级：数值越小越先被路由">优先级 ${esc(ch.priority)}</span>` : ""}
-        ${ch.weight ? `<span class="badge info" title="渠道权重：同优先级内按权重比例轮流优先">权重 ${esc(ch.weight)}</span>` : ""}
+        <label class="ch-num" title="渠道优先级：数值越小越先被路由（默认 0）；同优先级保持配置顺序。改动即保存">优先级
+          <input class="ch-pri" type="number" min="0" step="1" value="${esc(ch.priority || 0)}">
+        </label>
+        <label class="ch-num" title="渠道权重：>0 时同一优先级内的渠道按权重比例轮流优先（平滑加权轮询，请求多时按比例均摊）；0 = 不参与加权，按顺序故障转移。改动即保存">权重
+          <input class="ch-wt" type="number" min="0" step="1" value="${esc(ch.weight || 0)}">
+        </label>
         ${ch.failover_mode === "force_channel" ? '<span class="badge info" title="渠道内任一 key 失败立即切到下一个渠道">强制切渠道</span>' : ""}
         ${ch.auto_probe ? '<span class="badge info" title="启动时、key 冷却恢复/连续无调用达空闲探测间隔（默认 2 小时）时自动发加法题验证账号状态">自动探测</span>' : ""}
         ${ch.proxy && ch.proxy.kind ? '<span class="badge info">渠道代理</span>' : ""}
@@ -559,11 +572,36 @@ function renderChannels() {
     </div>`;
   }).join("");
 
-  // 点击卡片头（按钮除外）切换展开/收起
+  // 点击卡片头（按钮/内嵌编辑控件除外）切换展开/收起
   wrap.querySelectorAll(".head[data-act=toggle]").forEach((h) => h.addEventListener("click", (e) => {
-    if (e.target.closest("button")) return;
+    if (e.target.closest("button, input, select, label")) return;
     toggleChannelCard(h.closest(".channel-card").dataset.id);
   }));
+
+  // 卡片头内联编辑「优先级 / 权重」：改动即保存（PUT 为整体替换，回带整渠道对象），
+  // 输入框内的操作不触发卡片展开/收起
+  wrap.querySelectorAll(".ch-num input").forEach((inp) => {
+    inp.addEventListener("click", (e) => e.stopPropagation());
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") inp.blur(); });
+    inp.addEventListener("change", async () => {
+      const ch = chans.find((c) => c.id === inp.closest(".channel-card").dataset.id);
+      if (!ch) return;
+      const field = inp.classList.contains("ch-pri") ? "priority" : "weight";
+      const label = field === "priority" ? "优先级" : "权重";
+      const val = Math.max(0, parseInt(inp.value, 10) || 0);
+      if (val === (ch[field] || 0)) { inp.value = ch[field] || 0; return; }
+      try {
+        const next = JSON.parse(JSON.stringify(ch));
+        next[field] = val;
+        await api("PUT", "/admin/api/channels", next);
+        toast(`${label}已设为 ${val}`);
+        await loadState();
+      } catch (e) {
+        toast(`${label}保存失败：` + e.message, true);
+        inp.value = ch[field] || 0;
+      }
+    });
+  });
 
   wrap.querySelectorAll('[data-act="edit"]').forEach((b) => b.addEventListener("click", () => {
     const id = b.closest(".channel-card").dataset.id;

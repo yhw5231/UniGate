@@ -3,9 +3,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"time"
@@ -74,6 +77,42 @@ func extractModel(raw []byte) string {
 		return ""
 	}
 	return parsed.Model
+}
+
+// extractModelAny 从请求体解析 model 字段：JSON 请求走 extractModel；
+// multipart/form-data 请求（图片 edits / variations 的 model 是表单字段）
+// 按 boundary 解析表单提取。
+func extractModelAny(raw []byte, contentType string) string {
+	if strings.HasPrefix(contentType, "multipart/") {
+		if _, params, err := mime.ParseMediaType(contentType); err == nil {
+			if boundary := params["boundary"]; boundary != "" {
+				return extractModelMultipart(raw, boundary)
+			}
+		}
+		return ""
+	}
+	return extractModel(raw)
+}
+
+// extractModelMultipart 从 multipart 表单体提取 model 字段值。
+// 只读取名为 model 的字段（值很小），其余字段（图片二进制等大内容）只
+// 跳过不读入内存。找不到或解析失败返回 ""。
+func extractModelMultipart(raw []byte, boundary string) string {
+	rd := multipart.NewReader(bytes.NewReader(raw), boundary)
+	for {
+		part, err := rd.NextPart()
+		if err != nil {
+			return ""
+		}
+		if part.FormName() != "model" {
+			continue
+		}
+		b, err := io.ReadAll(io.LimitReader(part, 1<<10))
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(b))
+	}
 }
 
 // parseUsageJSON 从 OpenAI 响应体解析 usage.prompt_tokens / completion_tokens。

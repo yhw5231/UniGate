@@ -5,6 +5,11 @@
 //
 //	网关端口（PORT）：
 //	POST /v1/chat/completions      下游 OpenAI 兼容转发（需通用 key，GW_KEY_AUTH=false 时免鉴权）
+//	POST /v1/embeddings            文本向量化转发（上游 {BaseURL}/embeddings）
+//	POST /v1/images/generations    图片生成转发（上游 {BaseURL}/images/generations）
+//	POST /v1/images/edits          图片编辑转发（multipart 或 JSON，原样透传）
+//	POST /v1/images/variations     图片变体转发
+//	POST /v1/videos/generations    视频生成转发（上游 {BaseURL}/videos/generations）
 //	GET  /v1/models                聚合各渠道模型列表
 //	管理端口（WEBUI_PORT）：
 //	POST /login                    管理员登录（WebUI / Admin API 用）

@@ -552,7 +552,7 @@ func sendProbeChat(ctx context.Context, cand *candidate, body []byte) ([]byte, e
 		return nil, err
 	}
 	client := newUpstreamClient(route)
-	resp, err := doUpstreamRequest(ctx, client, cand, body, false, nil)
+	resp, err := doUpstreamRequest(ctx, client, cand, cand.chatTarget(), body, "", true, false, nil)
 	if err != nil {
 		return nil, err
 	}

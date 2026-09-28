@@ -900,7 +900,7 @@ func testOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user strin
 	client := newUpstreamClient(route)
 	noteKeyCall(cand.k.ID, model) // 管理员测试也是一次真实调用：刷新 key 空闲计时
 	start := time.Now()
-	resp, err := doUpstreamRequest(ctx, client, &cand, reqBody, false, nil)
+	resp, err := doUpstreamRequest(ctx, client, &cand, target, reqBody, "", true, false, nil)
 	res.LatencyMS = time.Since(start).Milliseconds()
 	if err != nil {
 		res.Error = err.Error()

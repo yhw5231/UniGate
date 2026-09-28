@@ -117,6 +117,24 @@ curl http://localhost:10010/v1/chat/completions \
 `GET /v1/models` 聚合所有启用渠道的模型列表（静态列表 ∪ 已拉取列表 ∪ models 端点
 实时拉取，去重）。
 
+除对话外，网关还支持 OpenAI 兼容的**非对话端点**，路由 / 故障转移 / 冷却 / 用量
+记账与 chat/completions 完全一致（按请求体的 `model` 字段匹配渠道模型列表，
+`{BaseURL}` 为渠道 `BaseURL`，key 单独配置 `BaseURL` 时优先）：
+
+| 网关端点 | 上游路径 |
+| --- | --- |
+| `POST /v1/embeddings` | `{BaseURL}/embeddings` |
+| `POST /v1/images/generations` | `{BaseURL}/images/generations` |
+| `POST /v1/images/edits`（multipart 或 JSON） | `{BaseURL}/images/edits` |
+| `POST /v1/images/variations` | `{BaseURL}/images/variations` |
+| `POST /v1/videos/generations` | `{BaseURL}/videos/generations` |
+
+multipart 请求（图片 edits / variations）连同 Content-Type（含 boundary）原样
+透传上游，`model` 从表单字段提取。embedding 模型（如 `text-embedding-3-small`）、
+图片生成模型（如 `dall-e-3`、`gpt-image-1`、`flux`）、视频生成模型（如 `kling-v1`）
+与对话模型一样声明在渠道的模型列表里即可参与路由；自动探测会跳过明显非对话的
+模型名。
+
 ## 部署说明
 
 ### 方式一：Docker Compose（推荐，本地构建部署）

@@ -442,13 +442,37 @@ func (s *probeScheduler) endProbe(keyID string) {
 
 // ---- 探测执行 ----
 
-// probeModelFor 探测用模型：渠道启用模型列表的第一个；未声明模型列表时用
-// gpt-4o-mini（与渠道测试的兜底一致）。
+// probeModelFor 探测用模型：渠道启用模型列表里第一个「对话」模型；未声明
+// 模型列表（或全部模型都像非对话模型）时用 gpt-4o-mini 兜底（与渠道测试一致）。
+// 渠道同时声明 embedding/图片/视频模型时，跳过明显非对话的模型名——
+// 探测发的是 chat 请求，拿 embedding 模型探测只会稳定得到 400/404 的错误日志。
 func probeModelFor(ch *Channel) string {
-	if len(ch.Models) > 0 {
-		return ch.Models[0]
+	for _, m := range ch.Models {
+		if isChatProbeModel(m) {
+			return m
+		}
 	}
 	return "gpt-4o-mini"
+}
+
+// isChatProbeModel 判断模型名是否明显属于非对话模型（embedding/图片/视频
+// 生成）。前缀/后缀匹配，保守命中——名称相似但不确定的一律按对话模型放行。
+func isChatProbeModel(model string) bool {
+	name := strings.ToLower(strings.TrimSpace(model))
+	for _, prefix := range []string{
+		"text-embedding-", "embedding-",
+		"dall-e", "gpt-image", "flux-", "sdxl", "stable-diffusion",
+		"kling-", "veo-", "sora-", "cogvideo-", "wan-", "runway-", "midjourney",
+		"pika-", "video-0", "video-1",
+	} {
+		if strings.HasPrefix(name, prefix) {
+			return false
+		}
+	}
+	if strings.HasSuffix(name, "-embedding") || strings.Contains(name, "-embedding-") {
+		return false
+	}
+	return true
 }
 
 // modelDiff 纯差集：new 中旧列表不存在的模型（保序去重）。用于已存在渠道的
@@ -891,7 +915,7 @@ func sendProbeRequest(ch *Channel, k *UpKey, model, question string) probeHTTPRe
 		return res
 	}
 	client := newUpstreamClient(route)
-	resp, err := doUpstreamRequest(ctx, client, &cand, reqBody, false, nil)
+	resp, err := doUpstreamRequest(ctx, client, &cand, cand.chatTarget(), reqBody, "", true, false, nil)
 	if err != nil {
 		res.err = err
 		return res

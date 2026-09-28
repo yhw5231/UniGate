@@ -17,6 +17,16 @@ func handleGateway(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPost && matchesPath(r.URL.Path, "/v1/chat/completions", "/chat/completions"):
 		gatewayChat(w, r)
+	case r.Method == http.MethodPost && matchesPath(r.URL.Path, "/v1/embeddings", "/embeddings"):
+		gatewayOther(w, r, "/embeddings")
+	case r.Method == http.MethodPost && matchesPath(r.URL.Path, "/v1/images/generations", "/images/generations"):
+		gatewayOther(w, r, "/images/generations")
+	case r.Method == http.MethodPost && matchesPath(r.URL.Path, "/v1/images/edits", "/images/edits"):
+		gatewayOther(w, r, "/images/edits")
+	case r.Method == http.MethodPost && matchesPath(r.URL.Path, "/v1/images/variations", "/images/variations"):
+		gatewayOther(w, r, "/images/variations")
+	case r.Method == http.MethodPost && matchesPath(r.URL.Path, "/v1/videos/generations", "/videos/generations"):
+		gatewayOther(w, r, "/videos/generations")
 	case r.Method == http.MethodGet && matchesPath(r.URL.Path, "/v1/models", "/models", "/v1/models/", "/models/"):
 		gatewayModels(w, r)
 	default:
@@ -54,6 +64,43 @@ func gatewayChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cand := forwardChat(w, r, rawBody, stream, model)
+	if cand == nil {
+		return
+	}
+	if rs := reqStatsFrom(r.Context()); rs != nil {
+		rs.key = cand.k.Name + "@" + cand.ch.Name
+		rs.channel = cand.ch.Name
+	}
+}
+
+// gatewayOther 处理 embeddings / 图片生成 / 视频生成等非对话端点的转发。
+// 与 chat 共用同一套渠道路由/故障转移/冷却逻辑（按请求体的 model 字段匹配
+// 渠道模型列表），上游端点由渠道 BaseURL（或 key BaseURL）拼接对应后缀得到，
+// 不做 Responses 转换与 reasoning 改写；multipart 请求体（图片 edits /
+// variations）连同 Content-Type（含 boundary）原样透传。
+func gatewayOther(w http.ResponseWriter, r *http.Request, suffix string) {
+	rawBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<20))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "read request body failed: "+err.Error(), "bad_request")
+		return
+	}
+	ct := r.Header.Get("Content-Type")
+	model := extractModelAny(rawBody, ct)
+	// multipart 的 boundary 必须保留：只透传 multipart 类型的原始 Content-Type，
+	// 普通 JSON 请求继续用网关默认的 application/json
+	upstreamCT := ""
+	if strings.HasPrefix(ct, "multipart/") {
+		upstreamCT = ct
+	}
+
+	if rs := reqStatsFrom(r.Context()); rs != nil {
+		rs.model = model
+		// 错误记录需要请求内容：gatewayChat 是唯一完整读到请求体的地方，
+		// 非对话端点在这里同样记下（含 multipart 表单体）
+		rs.requestBody = rawBody
+	}
+
+	cand := forwardOther(w, r, rawBody, upstreamCT, model, suffix)
 	if cand == nil {
 		return
 	}

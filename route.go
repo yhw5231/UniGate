@@ -90,6 +90,24 @@ func trimSlash(s string) string {
 	return s
 }
 
+// targetFor 返回该候选的非对话端点（embeddings/图片/视频等，suffix 如
+// "/embeddings"）：key BaseURL 优先，其次渠道 BaseURL；BaseURL 已以该路径
+// 结尾（配置了完整端点地址）时原样使用，否则拼接。不做 Responses 转换与
+// 版本段推导——非对话接口不与 chatTarget 的端点类型逻辑混用。
+func (c *candidate) targetFor(suffix string) string {
+	base := trimSlash(c.k.BaseURL)
+	if base == "" {
+		base = strings.TrimRight(strings.TrimSpace(c.ch.BaseURL), "/")
+	}
+	if base == "" {
+		return ""
+	}
+	if strings.HasSuffix(base, suffix) {
+		return base
+	}
+	return base + suffix
+}
+
 func endsWithChatCompletions(s string) bool {
 	const suffix = "/chat/completions"
 	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
@@ -340,11 +358,37 @@ func applyCustomHeaders(req *http.Request, headers map[string]string) {
 	}
 }
 
-// forwardChat 执行故障转移转发，把最终响应写给下游 w。
+// forwardMode 转发模式：modeChat 为对话端点（含 responses 适配）、
+// modeOther 为 embeddings/图片/视频等非对话端点（上游路径按后缀拼接、
+// 不做 Responses 转换与 reasoning 改写、无流式）。
+type forwardMode int
+
+const (
+	forwardModeChat forwardMode = iota
+	forwardModeOther
+)
+
+// forwardChat 执行 chat/completions 的故障转移转发（见 forwardRequest）。
+func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream bool, model string) *candidate {
+	return forwardRequest(w, r, rawBody, "", stream, model, forwardModeChat, "")
+}
+
+// forwardOther 执行非对话端点（embeddings/图片/视频）的故障转移转发：
+// contentType 非空（multipart 请求）时连同 boundary 原样透传上游，
+// suffix 为上游路径后缀（如 "/embeddings"）。
+func forwardOther(w http.ResponseWriter, r *http.Request, rawBody []byte, contentType string, model, suffix string) *candidate {
+	return forwardRequest(w, r, rawBody, contentType, false, model, forwardModeOther, suffix)
+}
+
+// forwardRequest 执行故障转移转发，把最终响应写给下游 w。
 // 返回实际服务的候选（用于统计），无可用上游时返回 nil。
 // 每个候选的尝试结果（含跳过原因）都会追加到请求日志的错误信息，便于在
 // WebUI 上直接回答「为什么 502」：哪个 key 因什么失败、冷却了多久。
-func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream bool, model string) *candidate {
+func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, contentType string, stream bool, model string, mode forwardMode, suffix string) *candidate {
+	isChat := mode == forwardModeChat
+	if !isChat {
+		stream = false // 非对话端点（embeddings/图片/视频）无流式
+	}
 	cands := buildCandidates(model, rawBody)
 	if len(cands) == 0 {
 		writeJSONError(w, http.StatusBadGateway, "no enabled upstream key available", "no_upstream")
@@ -440,7 +484,11 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 		client := newUpstreamClient(route)
 		// 记录 key 活动（空闲探测的计时依据）：任何真实发出的上游请求都算调用
 		noteKeyCall(cand.k.ID, model)
-		resp, err := doUpstreamRequest(r.Context(), client, &cand, rawBody, stream, r.Header)
+		target := cand.chatTarget()
+		if !isChat {
+			target = cand.targetFor(suffix)
+		}
+		resp, err := doUpstreamRequest(r.Context(), client, &cand, target, rawBody, contentType, isChat, stream, r.Header)
 		if err != nil {
 			// 下游已断开（超时/取消）导致上游请求被中止：不是上游故障，
 			// 不换 IP，也不必再试其余候选（都会立刻以同样方式失败）
@@ -550,7 +598,12 @@ func forwardChat(w http.ResponseWriter, r *http.Request, rawBody []byte, stream 
 			//「上游为什么 400/404」（无效 key、模型不存在等具体原因）。
 			peekUpstreamError(r, resp)
 		}
-		serveUpstreamResponse(sink, resp, stream, cand.ch.Rewrite, cand.ch.EndpointType)
+		// 非对话端点不做 reasoning 改写与 Responses 转换（原样透传）
+		rewrite, epType := cand.ch.Rewrite, cand.ch.EndpointType
+		if !isChat {
+			rewrite, epType = false, ""
+		}
+		serveUpstreamResponse(sink, resp, stream, rewrite, epType)
 		served = &cand
 		break
 	}
@@ -704,17 +757,24 @@ func peekUpstreamError(r *http.Request, resp *http.Response) {
 // 透传下游的 UA/Accept（无则按流式/非流式给默认值），保证请求与标准
 // OpenAI 客户端直连形态一致。渠道自定义头最后写入：同名覆盖网关默认头
 //（含 Authorization / Content-Type / UA / Accept），无同名新增。
-// 渠道端点类型为 responses 时，先把 chat/completions 请求体转换为 Responses API 格式。
-func doUpstreamRequest(ctx context.Context, client *http.Client, cand *candidate, rawBody []byte, stream bool, srcHeader http.Header) (*http.Response, error) {
+// target 为发往上游的完整 URL；contentType 非空（multipart 请求）时覆盖
+// 默认的 application/json（boundary 必须保留）；translateResponses 为 true
+// 且渠道端点类型为 responses 时，先把 chat/completions 请求体转换为
+// Responses API 格式（仅对话端点）。
+func doUpstreamRequest(ctx context.Context, client *http.Client, cand *candidate, target string, rawBody []byte, contentType string, translateResponses bool, stream bool, srcHeader http.Header) (*http.Response, error) {
 	body := cand.requestBody(rawBody)
-	if cand.ch.EndpointType == endpointResponses {
+	if translateResponses && cand.ch.EndpointType == endpointResponses {
 		body = chatToResponsesRequest(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cand.chatTarget(), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if cand.k.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+cand.k.APIKey)
 	}

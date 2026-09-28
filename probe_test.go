@@ -809,3 +809,27 @@ func TestNewModelProbeDispatched(t *testing.T) {
 		t.Fatalf("re-notify should probe nothing, got %d requests", n)
 	}
 }
+
+// TestProbeModelForSkipsNonChatModels：探测模型选择跳过明显的非对话模型
+//（embedding/图片/视频），全为非对话模型时回退 gpt-4o-mini。
+func TestProbeModelForSkipsNonChatModels(t *testing.T) {
+	cases := []struct {
+		models []string
+		want   string
+	}{
+		{[]string{"gpt-4o", "text-embedding-3-small"}, "gpt-4o"},
+		{[]string{"text-embedding-3-small", "dall-e-3", "gpt-4o"}, "gpt-4o"},
+		{[]string{"text-embedding-3-small", "kling-v1"}, "gpt-4o-mini"},
+		{nil, "gpt-4o-mini"},
+		{[]string{"claude-sonnet-embedding-en"}, "gpt-4o-mini"},
+		{[]string{"gpt-4o"}, "gpt-4o"},
+		{[]string{"flux-1.1-pro"}, "gpt-4o-mini"},
+		{[]string{"qwen2.5-vl-7b"}, "qwen2.5-vl-7b"}, // 视觉对话模型按对话处理
+	}
+	for _, c := range cases {
+		ch := &Channel{Models: c.models}
+		if got := probeModelFor(ch); got != c.want {
+			t.Errorf("probeModelFor(%v) = %q, want %q", c.models, got, c.want)
+		}
+	}
+}

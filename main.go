@@ -19,6 +19,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -124,9 +125,13 @@ func webUIMerged() bool {
 func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	if strings.HasPrefix(path, "/v1/") || path == "/models" || path == "/models/" || path == "/chat/completions" {
-		user, ok := authorizeGW(w, r)
+		gk, user, ok := authorizeGW(w, r)
 		if !ok {
 			return
+		}
+		if gk != nil {
+			// 下游 key 注入上下文：模型白名单校验（GWKey.Models）与 /v1/models 过滤用
+			r = r.WithContext(context.WithValue(r.Context(), gwKeyCtxKey{}, gk))
 		}
 		if rs := reqStatsFrom(r.Context()); rs != nil {
 			rs.user = user

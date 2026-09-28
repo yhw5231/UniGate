@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -136,6 +137,53 @@ type UpKey struct {
 	Proxy   *ProxySpec `json:"proxy,omitempty"`
 }
 
+// ModelMap 渠道级模型名映射：下游模型名 → 该上游实际模型名（可多个）。
+//
+// 一个下游模型名可以对应上游的多个模型（典型如区域/线路变体 cn:deepseek-v4.1-flash、
+// global:deepseek-v4.1-flash）：路由时每个上游模型各成一个候选，转发时把请求体的
+// model 字段分别改写为对应上游名，冷却也按上游模型分别计算（见 route.go）。
+// 映射键（下游名）同时被视为该渠道「声明支持」的模型，无需再写进 Models。
+//
+// JSON 兼容旧配置：值写单个字符串（旧格式）或字符串数组都接受；序列化时单值写
+// 字符串、多值写数组，便于人工阅读 gateway.json。
+type ModelMap map[string][]string
+
+// UnmarshalJSON 接受 {"k":"v"}（旧格式）与 {"k":["v1","v2"]}（多上游）两种写法。
+func (m *ModelMap) UnmarshalJSON(data []byte) error {
+	raw := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	out := make(ModelMap, len(raw))
+	for k, v := range raw {
+		var one string
+		if err := json.Unmarshal(v, &one); err == nil {
+			out[k] = []string{one}
+			continue
+		}
+		var many []string
+		if err := json.Unmarshal(v, &many); err != nil {
+			return fmt.Errorf("model_map %q: 值必须是字符串或字符串数组", k)
+		}
+		out[k] = many
+	}
+	*m = out
+	return nil
+}
+
+// MarshalJSON 单值写字符串（与旧格式一致）、多值写数组。
+func (m ModelMap) MarshalJSON() ([]byte, error) {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		if len(v) == 1 {
+			out[k] = v[0]
+			continue
+		}
+		out[k] = v
+	}
+	return json.Marshal(out)
+}
+
 // Channel 一个上游渠道（OpenAI 兼容供应商）。
 type Channel struct {
 	ID            string                       `json:"id"`
@@ -144,7 +192,8 @@ type Channel struct {
 	BaseURL       string                       `json:"base_url"`                 // 如 https://api.cline.bot/api/v1
 	EndpointType  string                       `json:"endpoint_type,omitempty"`  // 上游对话端点类型："chat"（默认，/chat/completions）；"responses"（OpenAI Responses API /responses）
 	ModelsURL     string                       `json:"models_url,omitempty"`     // 模型列表端点；默认 BaseURL + /models
-	Models        []string                     `json:"models,omitempty"`         // 静态模型列表（用于 /v1/models 聚合与路由过滤）
+	Models        []string                     `json:"models,omitempty"`         // 模型列表（用于 /v1/models 聚合与路由过滤；每项可为精确名、通配 "claude-*" 或正则 "re:^gpt-4.*$"）
+	ModelMap      ModelMap                     `json:"model_map,omitempty"`      // 模型名映射：下游模型名 → 该上游实际模型名（可多个，见 modelname.go）
 	Headers       map[string]string            `json:"headers,omitempty"`        // 渠道级自定义请求头
 	Rewrite       bool                         `json:"rewrite_reasoning"`        // reasoning -> reasoning_content 改写（Cline 等需要）
 	CooldownScope string                       `json:"cooldown_scope,omitempty"` // 冷却粒度："" / "key" 按 key 跨模型共享（默认）；"key_model" 按 (key,model)
@@ -313,20 +362,46 @@ func (c *Channel) modelsURL() string {
 	return base + "/models"
 }
 
-// allowsModel 判断渠道是否声明支持该模型：无模型信息（静态列表与已拉取列表皆空）时放行所有。
+// allowsModel 判断渠道是否声明支持该模型：无模型信息（列表为空）时放行所有。
+// 每项支持精确名、通配（"claude-*" / "gpt-4?"）与正则（"re:^gpt-4.*$"）；精确名按
+// 归一化等价比较（大小写、供应商前缀、":free"/"-free" 类变体后缀），
+// 即上游报 "cline-free/x:free"、下游写 "x" 也能命中同一渠道（见 modelname.go）。
+// 模型映射的键（下游模型名）同样算「声明支持」：配了映射即可用该下游名调用，
+// 不必再把它写进 Models。
 func (c *Channel) allowsModel(model string) bool {
 	if model == "" {
 		return true
 	}
 	if len(c.Models) == 0 {
-		return true // 无声明，不设限
+		return true // 无声明，不设限（映射键不构成白名单）
 	}
 	for _, m := range c.Models {
-		if m == model {
+		if modelMatches(model, m) {
+			return true
+		}
+	}
+	for k := range c.ModelMap {
+		if modelMatches(model, k) {
 			return true
 		}
 	}
 	return false
+}
+
+// modelMapKeys 返回渠道模型映射的键（下游模型名），按键名排序（稳定输出，
+// 供路由视图分组与 /v1/models 暴露用）。
+func (c *Channel) modelMapKeys() []string {
+	if c == nil || len(c.ModelMap) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.ModelMap))
+	for k := range c.ModelMap {
+		if strings.TrimSpace(k) != "" {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // effectiveProxy 返回 key 实际生效的代理配置：key 自身配置优先（含显式直连，
@@ -418,12 +493,26 @@ func (p *ModelUpstreamPin) normalize() bool {
 		p.Pipeline != "" || len(p.Known) > 0 || p.CanonicalSlug != "" || p.LastProvider != ""
 }
 
-// upstreamPinFor 返回该渠道上某模型的固定配置（无则 nil）。
+// upstreamPinFor 返回该渠道上某模型的固定配置（无则 nil）。查找先按原样名，
+// 再按归一化等价名——下游请求写法与固定配置的记录名（渠道声明/探测产物）
+// 可能只差供应商前缀或 ":free" 类后缀，名称处理下视为同一模型。
 func (c *Channel) upstreamPinFor(model string) *ModelUpstreamPin {
 	if c == nil || model == "" {
 		return nil
 	}
-	return c.ModelPins[model]
+	if pin := c.ModelPins[model]; pin != nil {
+		return pin
+	}
+	canon := canonicalModel(model)
+	if canon == "" {
+		return nil
+	}
+	for m, pin := range c.ModelPins {
+		if pin != nil && canonicalModel(m) == canon {
+			return pin
+		}
+	}
+	return nil
 }
 
 // GWKey 下游通用 key（供客户端调用本网关）。
@@ -431,6 +520,7 @@ type GWKey struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
 	Key       string    `json:"key"`
+	Models    []string  `json:"models,omitempty"` // 允许调用的模型（支持通配/正则模式；空 = 不限制）
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -446,6 +536,17 @@ type GatewaySettings struct {
 	ProbeStartup         *bool   `json:"probe_startup,omitempty"`           // 启动探测开关（默认 true；重启/部署后核对账号状态）
 	DefaultSchedule      *string `json:"default_schedule,omitempty"`        // 默认账号调度："" 沿用环境变量；"failover" / "round_robin"
 	ErrLogRetentionDays  *int    `json:"err_log_retention_days,omitempty"`  // 错误日志按天保留上限（默认 7，0 = 只按条数）
+
+	// 熔断（连续失败冷却，对标 go-gateway 的 breaker）：网络/代理错误与 5xx
+	// 连续失败达阈值后按指数退避冷却该 key（成功即清零）。429 有独立冷却逻辑。
+	BreakerEnabled    *bool    `json:"breaker_enabled,omitempty"`           // 开关（默认 true）
+	BreakerThreshold  *int     `json:"breaker_threshold,omitempty"`         // 连续失败阈值（默认 3）
+	BreakerBaseSec    *int     `json:"breaker_base_cooldown_sec,omitempty"` // 基础冷却秒数（默认 30）
+	BreakerMaxSec     *int     `json:"breaker_max_cooldown_sec,omitempty"`  // 最大冷却秒数（默认 900）
+	BreakerMultiplier *float64 `json:"breaker_multiplier,omitempty"`        // 每次触发的冷却倍数（默认 2，>= 1）
+
+	// 模型名称处理：全局别名（下游请求名 → 规范模型名），作用于路由与上游请求体。
+	ModelAliases map[string]string `json:"model_aliases,omitempty"`
 }
 
 // normalize 校验设置值（nil 合法 = 未设置）。
@@ -454,11 +555,14 @@ func (s *GatewaySettings) normalize() error {
 		return nil
 	}
 	for name, v := range map[string]*int{
-		"rate_limit_cooldown_sec": s.RateLimitCooldownSec,
-		"rotate_after_5xx":        s.RotateAfter5xx,
-		"max_route_tries":         s.MaxRouteTries,
-		"keepalive_sec":           s.KeepaliveSec,
-		"probe_idle_sec":          s.ProbeIdleSec,
+		"rate_limit_cooldown_sec":   s.RateLimitCooldownSec,
+		"rotate_after_5xx":          s.RotateAfter5xx,
+		"max_route_tries":           s.MaxRouteTries,
+		"keepalive_sec":             s.KeepaliveSec,
+		"probe_idle_sec":            s.ProbeIdleSec,
+		"breaker_threshold":         s.BreakerThreshold,
+		"breaker_base_cooldown_sec": s.BreakerBaseSec,
+		"breaker_max_cooldown_sec":  s.BreakerMaxSec,
 	} {
 		if v != nil && *v < 0 {
 			return fmt.Errorf("%s must be >= 0", name)
@@ -467,6 +571,9 @@ func (s *GatewaySettings) normalize() error {
 	if s.ErrLogRetentionDays != nil && *s.ErrLogRetentionDays < 0 {
 		return errors.New("err_log_retention_days must be >= 0")
 	}
+	if s.BreakerMultiplier != nil && *s.BreakerMultiplier < 1 {
+		return errors.New("breaker_multiplier must be >= 1")
+	}
 	if s.DefaultSchedule != nil {
 		v, err := normalizeSchedule(*s.DefaultSchedule)
 		if err != nil {
@@ -474,7 +581,39 @@ func (s *GatewaySettings) normalize() error {
 		}
 		s.DefaultSchedule = &v
 	}
+	aliases, err := normalizeModelAliases(s.ModelAliases)
+	if err != nil {
+		return err
+	}
+	s.ModelAliases = aliases
 	return nil
+}
+
+// normalizeModelAliases 清理全局别名：去空白、丢弃空项、键去重（同名键后者覆盖）。
+// 别名指向自身无意义，直接丢弃。规范化（大小写/前缀/后缀）后重复的键拒绝：
+// 两者的归一化等价，保留哪一条不明确。
+func normalizeModelAliases(in map[string]string) (map[string]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(in))
+	seen := map[string]string{} // 归一化键 → 原键
+	for k, v := range in {
+		key, val := strings.TrimSpace(k), strings.TrimSpace(v)
+		if key == "" || val == "" || key == val {
+			continue
+		}
+		canon := canonicalModel(key)
+		if prev, ok := seen[canon]; ok && prev != key {
+			return nil, fmt.Errorf("model_aliases: %q 与 %q 归一化后等价，请只保留一条", prev, key)
+		}
+		seen[canon] = key
+		out[key] = val
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // gatewayConfig gateway.json 的持久化格式。
@@ -768,6 +907,8 @@ func normalizeChannel(ch *Channel) error {
 	if len(ch.ModelPins) == 0 {
 		ch.ModelPins = nil
 	}
+	ch.Models = normalizeModelList(ch.Models)
+	ch.ModelMap = normalizeModelMap(ch.ModelMap)
 	for _, k := range ch.Keys {
 		if err := normalizeUpKey(k); err != nil {
 			return fmt.Errorf("key %q: %w", k.Name, err)
@@ -790,6 +931,55 @@ func normalizeModelList(list []string) []string {
 		}
 		seen[m] = true
 		out = append(out, m)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// normalizeModelMap 清理渠道级模型映射：去空白、丢弃空键、丢弃「映射到自身」的
+// 无意义目标、目标去重保序；归一化后重复的键（不同写法指向同一模型）只保留首个
+// （按键名排序决定保留者）。某键的目标全部无效时删除该键；全空返回 nil。
+func normalizeModelMap(in ModelMap) ModelMap {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(ModelMap, len(in))
+	seen := map[string]string{} // 归一化键 → 原键（稳定：按键名排序决定保留者）
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		canonKey := canonicalModel(key)
+		if prev, ok := seen[canonKey]; ok && prev != key {
+			continue
+		}
+		var targets []string
+		targetSeen := map[string]bool{}
+		for _, raw := range in[k] {
+			v := strings.TrimSpace(raw)
+			if v == "" || canonicalModel(v) == canonKey {
+				continue // 空值 / 映射到自身：不产生改写
+			}
+			c := canonicalModel(v)
+			if targetSeen[c] {
+				continue
+			}
+			targetSeen[c] = true
+			targets = append(targets, v)
+		}
+		if len(targets) == 0 {
+			continue
+		}
+		seen[canonKey] = key
+		out[key] = targets
 	}
 	if len(out) == 0 {
 		return nil
@@ -957,6 +1147,7 @@ func (s *GatewayStore) ProxyPool(id string) (*ProxyPool, bool) {
 func (s *GatewayStore) PutGWKey(k *GWKey) error {
 	k.Name = strings.TrimSpace(k.Name)
 	k.Key = strings.TrimSpace(k.Key)
+	k.Models = normalizeModelList(k.Models)
 	if k.Name == "" {
 		return errors.New("gateway key name required")
 	}

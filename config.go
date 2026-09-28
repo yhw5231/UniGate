@@ -47,8 +47,16 @@ type Config struct {
 
 	// 故障转移与冷却
 	MaxRouteTries     int           // 单请求最多尝试的 key 数（0 = 全部）
-	RateLimitCooldown time.Duration // 429 冷却（上游未给明确到期时间时；其余故障不冷却，只换 key）
+	RateLimitCooldown time.Duration // 429 冷却（上游未给明确到期时间时；429 冷却独立于熔断）
 	RotateAfter5xx    int           // 连续 5xx 超过该次数自动换出口 IP（默认 3，0 = 关闭）
+
+	// 熔断（连续失败冷却）：网络/代理错误与 5xx 连续失败达阈值即按指数退避
+	// 冷却该 key（对标 go-gateway 的 breaker；成功即清零并解除冷却）。
+	BreakerEnabled   bool
+	BreakerThreshold int
+	BreakerBase      time.Duration
+	BreakerMax       time.Duration
+	BreakerMult      float64
 
 	// 账号调度默认模式（渠道未显式配置时使用）：failover / round_robin
 	DefaultSchedule string
@@ -174,6 +182,12 @@ func loadConfig() Config {
 		RotateAfter5xx:    intEnv("ROTATE_AFTER_5XX", 3),
 		DefaultSchedule:   normalizeScheduleDefault(getenv("DEFAULT_SCHEDULE", "")),
 
+		BreakerEnabled:   boolEnv("BREAKER_ENABLED", true),
+		BreakerThreshold: intEnv("BREAKER_THRESHOLD", 3),
+		BreakerBase:      durationEnv("BREAKER_BASE_COOLDOWN", 30*time.Second),
+		BreakerMax:       durationEnv("BREAKER_MAX_COOLDOWN", 15*time.Minute),
+		BreakerMult:      floatEnv("BREAKER_MULTIPLIER", 2),
+
 		UpstreamHeaderTimeout: durationEnv("UPSTREAM_HEADER_TIMEOUT", 10*time.Minute),
 		UpstreamReadIdle:      durationEnv("UPSTREAM_READ_IDLE_TIMEOUT", 10*time.Minute),
 
@@ -253,17 +267,71 @@ func durationEnv(key string, def time.Duration) time.Duration {
 	return d
 }
 
+// boolEnv 读取布尔环境变量（解析失败回退默认值并告警）。
+func boolEnv(key string, def bool) bool {
+	if v, err := parseBoolEnv(key, def); err == nil {
+		return v
+	}
+	log.Printf("warning: invalid %s, using default %v", key, def)
+	return def
+}
+
+// floatEnv 读取浮点环境变量（解析失败回退默认值并告警）。
+func floatEnv(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Printf("warning: invalid %s=%q, using default %v", key, v, def)
+		return def
+	}
+	return f
+}
+
+// BreakerPolicy 熔断策略（连续失败冷却，对标 go-gateway 的 breaker）：
+// 网络/代理错误与 5xx 连续失败达 Threshold 次后冷却该 key，冷却时长按
+// BaseCooldown × Multiplier^(触发次数-1) 指数退避、上限 MaxCooldown；
+// 任意一次成功即清零并解除冷却（无半开态：到期自动恢复路由，下次失败再触发）。
+type BreakerPolicy struct {
+	Enabled      bool
+	Threshold    int
+	BaseCooldown time.Duration
+	MaxCooldown  time.Duration
+	Multiplier   float64
+}
+
+// normalize 修正非法取值（阈值至少 1、基础冷却至少 1s、倍率至少 1 等）。
+func (p BreakerPolicy) normalize() BreakerPolicy {
+	if p.Threshold <= 0 {
+		p.Threshold = 1
+	}
+	if p.BaseCooldown <= 0 {
+		p.BaseCooldown = time.Second
+	}
+	if p.MaxCooldown <= 0 || p.MaxCooldown < p.BaseCooldown {
+		p.MaxCooldown = p.BaseCooldown
+	}
+	if p.Multiplier < 1 {
+		p.Multiplier = 2
+	}
+	return p
+}
+
 // RoutePolicy 运行时路由策略：环境变量提供默认值，WebUI 设置（gateway.json）
 // 显式覆盖。原子持有，保存设置时与在途请求无数据竞争。
 type RoutePolicy struct {
-	RateLimitCooldown   time.Duration // 429 冷却（上游未给明确到期时间时）
-	RotateAfter5xx      int           // 连续 5xx 换出口阈值（0 = 关闭）
-	MaxRouteTries       int           // 单请求最多尝试 key 数（0 = 全部）
-	KeepaliveInterval   time.Duration // 流式心跳间隔（0 = 关闭）
-	ProbeIdleInterval   time.Duration // 自动探测的空闲探测间隔（0 = 关闭空闲探测）
-	ProbeStartup        bool          // 启动探测（重启/重新部署后核对账号状态）
-	DefaultSchedule     string        // 默认账号调度：failover / round_robin（渠道未显式配置时使用）
-	ErrLogRetentionDays int           // 错误日志按天保留上限（0 = 只按条数）
+	RateLimitCooldown   time.Duration     // 429 冷却（上游未给明确到期时间时）
+	RotateAfter5xx      int               // 连续 5xx 换出口阈值（0 = 关闭）
+	MaxRouteTries       int               // 单请求最多尝试 key 数（0 = 全部）
+	KeepaliveInterval   time.Duration     // 流式心跳间隔（0 = 关闭）
+	ProbeIdleInterval   time.Duration     // 自动探测的空闲探测间隔（0 = 关闭空闲探测）
+	ProbeStartup        bool              // 启动探测（重启/重新部署后核对账号状态）
+	DefaultSchedule     string            // 默认账号调度：failover / round_robin（渠道未显式配置时使用）
+	ErrLogRetentionDays int               // 错误日志按天保留上限（0 = 只按条数）
+	Breaker             BreakerPolicy     // 连续失败熔断（网络错误/5xx → 指数退避冷却）
+	ModelAliases        map[string]string // 全局模型别名：下游请求名 → 规范模型名
 }
 
 var policy atomic.Pointer[RoutePolicy]
@@ -279,6 +347,13 @@ func defaultPolicy() *RoutePolicy {
 		ProbeStartup:        cfg.ProbeStartup,
 		DefaultSchedule:     cfg.DefaultSchedule,
 		ErrLogRetentionDays: cfg.ErrLogRetentionDays,
+		Breaker: BreakerPolicy{
+			Enabled:      cfg.BreakerEnabled,
+			Threshold:    cfg.BreakerThreshold,
+			BaseCooldown: cfg.BreakerBase,
+			MaxCooldown:  cfg.BreakerMax,
+			Multiplier:   cfg.BreakerMult,
+		}.normalize(),
 	}
 }
 
@@ -321,6 +396,28 @@ func applySettings(set GatewaySettings) {
 		} else {
 			p.ErrLogRetentionDays = *set.ErrLogRetentionDays
 		}
+	}
+	// 熔断：逐字段覆盖，未设置（nil）跟随环境变量默认
+	if set.BreakerEnabled != nil {
+		p.Breaker.Enabled = *set.BreakerEnabled
+	}
+	if set.BreakerThreshold != nil {
+		p.Breaker.Threshold = *set.BreakerThreshold
+	}
+	if set.BreakerBaseSec != nil {
+		p.Breaker.BaseCooldown = time.Duration(*set.BreakerBaseSec) * time.Second
+	}
+	if set.BreakerMaxSec != nil {
+		p.Breaker.MaxCooldown = time.Duration(*set.BreakerMaxSec) * time.Second
+	}
+	if set.BreakerMultiplier != nil {
+		p.Breaker.Multiplier = *set.BreakerMultiplier
+	}
+	p.Breaker = p.Breaker.normalize()
+	if len(set.ModelAliases) > 0 {
+		p.ModelAliases = cloneJSON(set.ModelAliases)
+	} else {
+		p.ModelAliases = nil
 	}
 	policy.Store(p)
 	// 错误日志按天上限跟随生效设置（applySettings 可能在 initStats 之前调用，

@@ -30,7 +30,7 @@ func TestChannelPriorityOrdersCandidates(t *testing.T) {
 		&Channel{Name: "high", BaseURL: up.srv.URL, Enabled: true, Priority: 1,
 			Keys: []*UpKey{{Name: "khigh", APIKey: "sk-high", Enabled: true}}},
 	)
-	cands := buildCandidates("m1", nil)
+	cands := buildCandidates("m1", "m1", nil)
 	if len(cands) != 2 {
 		t.Fatalf("candidates = %d, want 2", len(cands))
 	}
@@ -52,14 +52,14 @@ func TestChannelWeightDistribution(t *testing.T) {
 	)
 	first := map[string]int{}
 	for i := 0; i < 200; i++ {
-		cands := buildCandidates("m1", nil)
+		cands := buildCandidates("m1", "m1", nil)
 		first[cands[0].k.Name]++
 	}
 	if first["k1"] < 100 || first["k2"] < 30 {
 		t.Fatalf("first-choice distribution = %v, want ~3:1", first)
 	}
 	// 权重全为 0 的渠道组不参与加权：保持配置顺序
-	cands := buildCandidates("m2", nil)
+	cands := buildCandidates("m2", "m2", nil)
 	if cands[0].k.Name != "k1" || cands[1].k.Name != "k2" {
 		t.Fatalf("zero-weight order = [%s %s], want config order", cands[0].k.Name, cands[1].k.Name)
 	}

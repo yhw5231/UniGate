@@ -354,7 +354,7 @@ func probeChannelModel(ch *Channel, k *UpKey, model string) (*ModelUpstreamPin, 
 		//（渠道可能来自只读视图，就地改写会污染已发布配置且无锁保护）
 		pin = cloneJSON(pin)
 	}
-	cand := candidate{ch: ch, k: k}
+	cand := newCandidate(ch, k, model)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TestTimeout)
 	defer cancel()
 

@@ -4,10 +4,13 @@
 // 冷却状态持久化到 data/cooldowns.json（SetPersistPath，原子写入），启动时恢复：
 // 上游按日/按时长限流的账号冷却动辄数小时（如 "Try again in 14h"），重启即丢的话
 // 重新部署后网关会立刻把请求打回限流中的账号，反复撞 429。
-// 目前只有上游 429 记冷却：冷却时长优先取上游明确给出的到期时间
-//（Retry-After 头，或响应体里的 "Try again in 14h 23m" 类文本/时间戳），
-// 上游没给明确时间才用 RATE_LIMIT_COOLDOWN；
-// 其余故障（401/403、5xx、网络错误）只做故障转移，不冷却 key。
+//
+// 进入冷却的两条路径：
+//   - 上游 429：冷却时长优先取上游明确给出的到期时间（Retry-After 头，或响应体里的
+//     "Try again in 14h 23m" 类文本/时间戳），上游没给明确时间才用 RATE_LIMIT_COOLDOWN；
+//   - 熔断（RecordFailure，对标 go-gateway 的 breaker）：网络/代理错误与 5xx 连续
+//     失败达阈值即按指数退避冷却，成功（RecordSuccess）清零并解除。
+// 探测链路（probe.go / 渠道测试）仍按 429 语义处理。
 package main
 
 import (
@@ -32,9 +35,15 @@ type cooldownPair struct {
 // cooldownEntry 一条冷却记录。explicit 表示时长来自上游明确给出的到期时间
 // （Retry-After 头或错误体文本/时间戳）而非配置兜底——启动探测据此跳过
 // 「确定还在限流中」的账号，只对兜底冷却的账号重新核对状态。
+//
+// failures / level 是熔断（连续失败冷却，对标 go-gateway 的 breaker）的状态：
+// failures 为该 (key, model) 连续失败次数（任意一次成功清零），level 为累计
+// 触发次数（决定指数退避的冷却时长，同样只由成功或人工解除清零）。
 type cooldownEntry struct {
 	until    time.Time
 	explicit bool
+	failures int
+	level    int
 }
 
 // Cooldowns 冷却状态表。
@@ -58,7 +67,8 @@ func newCooldowns() *Cooldowns {
 	return &Cooldowns{until: map[cooldownPair]cooldownEntry{}}
 }
 
-// persistedCooldowns cooldowns.json 的文件格式：只写未过期条目，启动时恢复。
+// persistedCooldowns cooldowns.json 的文件格式：写未过期条目与带失败计数的
+// 条目（熔断计数器跨重启保留），启动时恢复。
 type persistedCooldowns struct {
 	SavedAt int64               `json:"saved_at"`
 	Entries []persistedCooldown `json:"entries"`
@@ -67,8 +77,10 @@ type persistedCooldowns struct {
 type persistedCooldown struct {
 	KeyID    string `json:"key_id"`
 	Model    string `json:"model,omitempty"`    // 空 = 按 key 共享粒度
-	Until    int64  `json:"until_unix"`         // 冷却到期时间（unix 秒）
+	Until    int64  `json:"until_unix"`         // 冷却到期时间（unix 秒）；0 = 无冷却（只有失败计数）
 	Explicit bool   `json:"explicit,omitempty"` // 时长来自上游明确到期时间
+	Failures int    `json:"failures,omitempty"` // 连续失败次数
+	Level    int    `json:"level,omitempty"`    // 熔断触发次数（指数退避层级）
 }
 
 // SetPersistPath 设置冷却持久化文件并加载已有条目（进程启动时调用一次；
@@ -90,25 +102,46 @@ func (c *Cooldowns) SetPersistPath(path string) error {
 	}
 	now := time.Now()
 	for _, e := range data.Entries {
-		if e.KeyID == "" || e.Until <= now.Unix() {
+		if e.KeyID == "" {
 			continue
 		}
-		c.until[cooldownPair{e.KeyID, e.Model}] = cooldownEntry{until: time.Unix(e.Until, 0), explicit: e.Explicit}
+		until := time.Unix(e.Until, 0)
+		expired := e.Until <= now.Unix()
+		if expired && e.Failures <= 0 {
+			continue // 无冷却也无失败计数：无信息可恢复
+		}
+		if expired {
+			until = time.Time{} // 冷却已过期，只恢复失败计数（下次失败立即再触发）
+		}
+		c.until[cooldownPair{e.KeyID, e.Model}] = cooldownEntry{
+			until:    until,
+			explicit: e.Explicit,
+			failures: e.Failures,
+			level:    e.Level,
+		}
 	}
 	return nil
 }
 
-// snapshotLocked 取当前未过期条目快照并推进变更代号（调用方持有 mu）。
+// snapshotLocked 取需要落盘的条目快照并推进变更代号（调用方持有 mu）。
+// 落盘内容包括：未过期的冷却条目，以及带失败计数（熔断状态）的条目——
+// 后者即使冷却已过期也要写，重启后计数才不会被清零。
 // 持久化在锁外据此完成：写盘耗时不再阻塞冷却表读写。
 func (c *Cooldowns) snapshotLocked() ([]persistedCooldown, uint64) {
 	c.gen++
 	now := time.Now()
 	entries := make([]persistedCooldown, 0, len(c.until))
 	for p, e := range c.until {
-		if !now.Before(e.until) {
-			continue
+		until := int64(0)
+		if now.Before(e.until) {
+			until = e.until.Unix()
+		} else if e.failures <= 0 {
+			continue // 冷却已过期且无失败计数：无信息可存
 		}
-		entries = append(entries, persistedCooldown{KeyID: p.keyID, Model: p.model, Until: e.until.Unix(), Explicit: e.explicit})
+		entries = append(entries, persistedCooldown{
+			KeyID: p.keyID, Model: p.model, Until: until,
+			Explicit: e.explicit, Failures: e.failures, Level: e.level,
+		})
 	}
 	return entries, c.gen
 }
@@ -209,6 +242,75 @@ func (c *Cooldowns) mark(keyID, model string, dur time.Duration, explicit bool) 
 	c.persist(entries, gen) // 锁外落盘：不阻塞其它请求的冷却检查
 }
 
+// RecordFailure 记一次「非 429」故障（网络/代理错误、上游 5xx）用于熔断：
+// 连续失败达到阈值（pol.Threshold）即按指数退避冷却该 (key, model)，返回本次
+// 实际生效的冷却时长与是否触发了冷却。
+//
+// 语义与 go-gateway 的 breaker 一致：失败计数在触发后不清零，冷却到期后下一次
+// 失败立即再次触发并把层级 +1（冷却时长 Base × Mult^(level-1)，上限 Max）；
+// 只有请求成功（RecordSuccess）或人工解除才会清零。未开启熔断时不做任何记录。
+func (c *Cooldowns) RecordFailure(keyID, model string, pol BreakerPolicy) (time.Duration, bool) {
+	if keyID == "" || !pol.Enabled {
+		return 0, false
+	}
+	pol = pol.normalize()
+	c.mu.Lock()
+	p := cooldownPair{keyID, model}
+	e := c.until[p]
+	e.failures++
+	var cooled time.Duration
+	if e.failures >= pol.Threshold {
+		e.level++
+		cooled = breakerCooldown(pol, e.level)
+		e.until = time.Now().Add(cooled)
+		e.explicit = false // 熔断冷却时长由网关计算，非上游明确到期时间
+	}
+	c.until[p] = e
+	entries, gen := c.snapshotLocked()
+	c.mu.Unlock()
+	c.persist(entries, gen)
+	if cooled > 0 {
+		log.Printf("breaker: key %s model %q cooled %s after %d consecutive failures (level %d)",
+			keyID, model, cooled, e.failures, e.level)
+	}
+	return cooled, cooled > 0
+}
+
+// RecordSuccess 记一次成功：清零该 (key, model) 的失败计数与熔断层级，并解除
+// 存量冷却（真实请求已打通，冷却与事实相悖——穿透试探成功的自愈也走这里）。
+func (c *Cooldowns) RecordSuccess(keyID, model string) {
+	if keyID == "" {
+		return
+	}
+	c.mu.Lock()
+	p := cooldownPair{keyID, model}
+	if _, ok := c.until[p]; !ok {
+		c.mu.Unlock()
+		return
+	}
+	delete(c.until, p)
+	entries, gen := c.snapshotLocked()
+	c.mu.Unlock()
+	c.persist(entries, gen)
+}
+
+// breakerCooldown 第 level 次触发熔断时的冷却时长：Base × Mult^(level-1)，
+// 上限 Max（对齐 go-gateway 的 cooldown 计算）。
+func breakerCooldown(pol BreakerPolicy, level int) time.Duration {
+	delay := float64(pol.BaseCooldown)
+	maximum := float64(pol.MaxCooldown)
+	for i := 1; i < level; i++ {
+		if delay >= maximum {
+			return pol.MaxCooldown
+		}
+		delay *= pol.Multiplier
+	}
+	if delay > maximum {
+		return pol.MaxCooldown
+	}
+	return time.Duration(delay)
+}
+
 // Clear 解除 (keyID, model) 的冷却。渠道测试成功后调用：
 // 真实请求已打通该 key，存量冷却与事实相悖（表现为「测试通过但网关 502」）。
 func (c *Cooldowns) Clear(keyID, model string) {
@@ -232,6 +334,59 @@ func (c *Cooldowns) ClearKey(keyID string) int {
 	for k := range c.until {
 		if k.keyID == keyID {
 			delete(c.until, k)
+			n++
+		}
+	}
+	if n == 0 {
+		c.mu.Unlock()
+		return 0
+	}
+	entries, gen := c.snapshotLocked()
+	c.mu.Unlock()
+	c.persist(entries, gen)
+	return n
+}
+
+// ClearKeys 解除多个 key 的全部冷却（所有模型粒度），返回清除的条数。
+// WebUI 渠道卡片「清除冷却」的整渠道操作使用（该渠道全部 key）。
+func (c *Cooldowns) ClearKeys(keyIDs []string) int {
+	if len(keyIDs) == 0 {
+		return 0
+	}
+	set := make(map[string]bool, len(keyIDs))
+	for _, id := range keyIDs {
+		set[id] = true
+	}
+	c.mu.Lock()
+	n := 0
+	for k := range c.until {
+		if set[k.keyID] {
+			delete(c.until, k)
+			n++
+		}
+	}
+	if n == 0 {
+		c.mu.Unlock()
+		return 0
+	}
+	entries, gen := c.snapshotLocked()
+	c.mu.Unlock()
+	c.persist(entries, gen)
+	return n
+}
+
+// ClearPairs 按 (keyID, model) 精确批量解除冷却（重复项只计一次），返回清除的条数。
+// WebUI「按模型」层级操作使用：渠道卡片按模型清本渠道所有 key、路由页清某模型的
+// 所有渠道所有 key。model 部分为空串 = 该 key 的跨模型共享条目。
+func (c *Cooldowns) ClearPairs(pairs []cooldownPair) int {
+	if len(pairs) == 0 {
+		return 0
+	}
+	c.mu.Lock()
+	n := 0
+	for _, p := range pairs {
+		if _, ok := c.until[p]; ok {
+			delete(c.until, p)
 			n++
 		}
 	}

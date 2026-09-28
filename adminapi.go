@@ -33,6 +33,9 @@ func adminAPIHandler() http.Handler {
 	mux.HandleFunc("POST /admin/api/cooling/clear", handleAdminClearCooling)
 	mux.HandleFunc("POST /admin/api/cooling/clear-model", handleAdminClearCoolingModel)
 	mux.HandleFunc("POST /admin/api/cooling/clear-all", handleAdminClearCoolingAll)
+	mux.HandleFunc("POST /admin/api/channels/{id}/cooling/clear-all", handleAdminClearChannelCoolingAll)
+	mux.HandleFunc("POST /admin/api/channels/{id}/cooling/clear-model", handleAdminClearChannelCoolingModel)
+	mux.HandleFunc("POST /admin/api/route/cooling/clear-model", handleAdminClearRouteModelCooling)
 	mux.HandleFunc("GET /admin/api/route", handleAdminRoute)
 	mux.HandleFunc("PUT /admin/api/channels/{id}/model-pin", handleAdminPutModelUpstreamPin)
 	mux.HandleFunc("POST /admin/api/channels/{id}/probe-upstreams", handleAdminProbeUpstreams)
@@ -194,6 +197,111 @@ func handleAdminClearCoolingModel(w http.ResponseWriter, r *http.Request) {
 // 返回清除条数。上游整体恢复后的快速恢复操作。
 func handleAdminClearCoolingAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"cleared": cool.ClearAll()})
+}
+
+// ---- 渠道级 / 路由模型级清除冷却 ----
+// WebUI 的层级操作：渠道卡片「清除冷却」可整渠道全清或按模型清本渠道所有 key；
+// 路由页模型分组「清除冷却」清该模型在全部渠道全部 key 上的冷却。
+
+// decodeRequiredModel 解析 {model} 请求体：字段必须存在。空串是合法取值——
+// 冷却键的 model 部分为空 = 按 key 跨模型共享条目（渠道粒度下），路由页
+// 「对全部模型放行」分组同理。
+func decodeRequiredModel(w http.ResponseWriter, r *http.Request) (string, bool) {
+	var body struct {
+		Model *string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
+		return "", false
+	}
+	if body.Model == nil {
+		writeJSONError(w, http.StatusBadRequest, "model required", "bad_request")
+		return "", false
+	}
+	return strings.TrimSpace(*body.Model), true
+}
+
+// channelCoolPairs 某渠道全部 key 在给定模型下应清除的冷却键，含两部分：
+//   - 与网关转发/路由视图一致的候选冷却键（channelUpstreamRows：渠道映射出的
+//     每个上游模型各自一条，key 粒度渠道折叠为空串共享条目）；
+//   - 该模型名的字面量条目（渠道粒度从 key_model 切回 key 后残留的按模型条目，
+//     渠道卡片仍会显示，按模型清除时一并清掉）。
+func channelCoolPairs(ch *Channel, model string) []cooldownPair {
+	routeModel := resolveModelAlias(model)
+	pairs := []cooldownPair{}
+	for _, k := range ch.Keys {
+		for _, row := range channelUpstreamRows(ch, model, routeModel) {
+			pairs = append(pairs, cooldownPair{k.ID, row.cool})
+		}
+		if model != "" {
+			pairs = append(pairs, cooldownPair{k.ID, model})
+		}
+	}
+	return pairs
+}
+
+// modelCoolPairs 某模型（路由页分组名，可为全局别名）在全部渠道的冷却键：
+// 展开规则与 routeStatusData 完全一致（渠道模型匹配 + channelUpstreamRows），
+// 即路由页该分组上显示的每一条冷却，清完该分组必然显示为全部可用。
+func modelCoolPairs(model string) []cooldownPair {
+	snap := store.View()
+	routeModel := resolveModelAlias(model)
+	pairs := []cooldownPair{}
+	for _, ch := range snap.Channels {
+		matcher := newModelMatcher(append(append([]string{}, ch.Models...), ch.modelMapKeys()...))
+		if model != "" && !matcher.match(model) && !matcher.match(routeModel) {
+			continue
+		}
+		for _, k := range ch.Keys {
+			for _, row := range channelUpstreamRows(ch, model, routeModel) {
+				pairs = append(pairs, cooldownPair{k.ID, row.cool})
+			}
+		}
+	}
+	return pairs
+}
+
+// handleAdminClearChannelCoolingAll 清除某渠道全部 key 的全部冷却（所有模型粒度）。
+func handleAdminClearChannelCoolingAll(w http.ResponseWriter, r *http.Request) {
+	ch := findChannel(r.PathValue("id"))
+	if ch == nil {
+		writeJSONError(w, http.StatusNotFound, "channel not found", "not_found")
+		return
+	}
+	ids := make([]string, 0, len(ch.Keys))
+	for _, k := range ch.Keys {
+		ids = append(ids, k.ID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"channel_id": ch.ID, "cleared": cool.ClearKeys(ids)})
+}
+
+// handleAdminClearChannelCoolingModel 按模型清除某渠道所有 key 的冷却：
+// body {model}（空串 = 按 key 跨模型共享条目）。
+func handleAdminClearChannelCoolingModel(w http.ResponseWriter, r *http.Request) {
+	ch := findChannel(r.PathValue("id"))
+	if ch == nil {
+		writeJSONError(w, http.StatusNotFound, "channel not found", "not_found")
+		return
+	}
+	model, ok := decodeRequiredModel(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"channel_id": ch.ID, "model": model, "cleared": cool.ClearPairs(channelCoolPairs(ch, model)),
+	})
+}
+
+// handleAdminClearRouteModelCooling 清除某模型在全部渠道、全部 key 上的冷却：
+// body {model}（路由页模型分组名，可为全局别名；空串 = 「对全部模型放行」分组）。
+func handleAdminClearRouteModelCooling(w http.ResponseWriter, r *http.Request) {
+	model, ok := decodeRequiredModel(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"model": model, "cleared": cool.ClearPairs(modelCoolPairs(model)),
+	})
 }
 
 // handleAdminRoute 路由页视图：按模型聚合候选 (渠道, key) 与实时状态。
@@ -405,7 +513,7 @@ func validateUpstream(ch *Channel, k *UpKey, model, pipeline, upstream string) m
 	if reqBody == nil {
 		reqBody = probeRequestBody(model, "hi", probeHarvestTokens)
 	}
-	cand := candidate{ch: ch, k: k}
+	cand := newCandidate(ch, k, model)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TestTimeout)
 	defer cancel()
 	start := time.Now()
@@ -778,7 +886,8 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// dry-run（默认）：不写回渠道，仅返回候选 + 当前已启用集合
+	// dry-run（默认）：不写回渠道，仅返回候选 + 当前已启用集合 + 上游已不再
+	// 返回的旧条目（stale，供 WebUI 提示「重建将移除这些模型」）
 	if r.URL.Query().Get("replace") != "1" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"channel_id":  ch.ID,
@@ -786,6 +895,7 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 			"free_models": free,
 			"key_used":    usedKey,
 			"enabled":     ch.Models,
+			"stale":       staleModels(ch.Models, fetched),
 			"total":       len(fetched),
 		})
 		return
@@ -811,6 +921,28 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 		"key_used":    usedKey,
 		"total":       len(ch.Models),
 	})
+}
+
+// staleModels 返回渠道当前已启用、但上游本次未返回的模型（模型名归一化后
+// 比较）：拉取重建时会移除这些条目，WebUI 据此提示用户。
+func staleModels(enabled, fetched []string) []string {
+	if len(enabled) == 0 {
+		return nil
+	}
+	live := make(map[string]bool, len(fetched))
+	for _, f := range fetched {
+		if c := canonicalModel(f); c != "" {
+			live[c] = true
+		}
+	}
+	var out []string
+	for _, m := range enabled {
+		if c := canonicalModel(m); c != "" && live[c] {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // testTarget 指定渠道级测试的范围。scope:
@@ -884,7 +1016,7 @@ func testOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user strin
 		"messages": []map[string]string{{"role": "user", "content": msg}},
 		"stream":   false,
 	})
-	cand := candidate{ch: ch, k: k}
+	cand := newCandidate(ch, k, model)
 	target := cand.chatTarget()
 	begin := time.Now()
 	var bytesOut int64

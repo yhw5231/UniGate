@@ -905,7 +905,7 @@ func sendProbeRequest(ch *Channel, k *UpKey, model, question string) probeHTTPRe
 		"messages": []map[string]string{{"role": "user", "content": question}},
 		"stream":   false,
 	})
-	cand := candidate{ch: ch, k: k}
+	cand := newCandidate(ch, k, model)
 	res.target = cand.chatTarget()
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TestTimeout)
 	defer cancel()

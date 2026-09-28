@@ -142,14 +142,24 @@ function fillSettingsForm() {
   $("#setProbeStartup").value = s.probe_startup === undefined ? "" : (s.probe_startup ? "1" : "0");
   $("#setDefaultSchedule").value = s.default_schedule || "";
   $("#setErrLogRetentionDays").value = s.err_log_retention_days ?? "";
+  $("#setBreakerEnabled").value = s.breaker_enabled === undefined ? "" : (s.breaker_enabled ? "1" : "0");
+  $("#setBreakerThreshold").value = s.breaker_threshold ?? "";
+  $("#setBreakerBase").value = s.breaker_base_cooldown_sec ?? "";
+  $("#setBreakerMax").value = s.breaker_max_cooldown_sec ?? "";
+  $("#setBreakerMult").value = s.breaker_multiplier ?? "";
+  $("#setModelAliases").value = Object.entries(s.model_aliases || {}).map(([k, v]) => `${k}=${v}`).join("\n");
   // RoutePolicy 无 json tag：生效值按 Go 字段名下发，Duration 序列化为纳秒
   const ns = (v) => Math.round((v || 0) / 1e9);
   const tries = (p.MaxRouteTries || 0) === 0 ? "全部" : p.MaxRouteTries;
   const ka = ns(p.KeepaliveInterval);
   const pi = ns(p.ProbeIdleInterval);
   const sched = p.DefaultSchedule === "round_robin" ? "顺序轮询" : "故障转移";
+  const br = p.Breaker || {};
+  const alias = Object.keys(s.model_aliases || {}).length;
   $("#policyNow").textContent =
-    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"} · 空闲探测 ${pi > 0 ? pi + "s" : "关闭"} · 启动探测 ${p.ProbeStartup ? "开" : "关"} · 默认账号调度 ${sched}`;
+    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"} · 空闲探测 ${pi > 0 ? pi + "s" : "关闭"} · 启动探测 ${p.ProbeStartup ? "开" : "关"} · 默认账号调度 ${sched}` +
+    ` · 熔断 ${br.Enabled ? `开（连续失败 ${br.Threshold} 次，冷却 ${ns(br.BaseCooldown)}~${ns(br.MaxCooldown)}s ×${br.Multiplier}）` : "关"}` +
+    (alias ? ` · 模型别名 ${alias} 条` : "");
 }
 
 $("#settingsSaveBtn").addEventListener("click", async () => {
@@ -171,6 +181,31 @@ $("#settingsSaveBtn").addEventListener("click", async () => {
     if (ps !== "") body.probe_startup = ps === "1"; // 留空 = 恢复环境变量默认
     const sched = $("#setDefaultSchedule").value;
     if (sched !== "") body.default_schedule = sched; // 留空 = 恢复环境变量默认
+    // 熔断
+    const be = $("#setBreakerEnabled").value;
+    if (be !== "") body.breaker_enabled = be === "1";
+    num("#setBreakerThreshold", "breaker_threshold");
+    num("#setBreakerBase", "breaker_base_cooldown_sec");
+    num("#setBreakerMax", "breaker_max_cooldown_sec");
+    const bm = $("#setBreakerMult").value.trim();
+    if (bm !== "") {
+      const f = parseFloat(bm);
+      if (!Number.isFinite(f) || f < 1) throw new Error("breaker_multiplier 必须是不小于 1 的数字");
+      body.breaker_multiplier = f;
+    }
+    // 模型别名：每行「别名=规范名」
+    const aliases = {};
+    for (const line of $("#setModelAliases").value.split("\n")) {
+      const s = line.trim();
+      if (!s || s.startsWith("#")) continue;
+      const i = s.indexOf("=");
+      if (i <= 0) throw new Error(`模型别名格式应为「别名=规范模型名」：${s}`);
+      const key = s.slice(0, i).trim(), val = s.slice(i + 1).trim();
+      if (!key || !val) throw new Error(`模型别名格式应为「别名=规范模型名」：${s}`);
+      if (key === val) continue;
+      aliases[key] = val;
+    }
+    body.model_aliases = Object.keys(aliases).length ? aliases : null; // null = 清空别名
     await api("PUT", "/admin/api/settings", body);
     toast("设置已保存并生效");
     await loadState();
@@ -272,6 +307,26 @@ function renderRoute() {
       await loadState(); // 同步渠道页的冷却明细
     } catch (e) { toast(e.message, true); }
   }));
+  el.querySelectorAll('[data-act="clearcoolkey"]').forEach((b) => b.addEventListener("click", async () => {
+    try {
+      const r = await api("POST", "/admin/api/cooling/clear", { key_id: b.dataset.key, channel_id: b.dataset.channel });
+      toast(r.cleared > 0 ? `已解除 ${r.cleared} 条冷却` : "该 key 当前没有冷却");
+      await refreshRoute();
+      await loadState();
+    } catch (e) { toast(e.message, true); }
+  }));
+  // 分组头「清除冷却」：该模型在所有渠道、所有 key 上的冷却一次清空
+  el.querySelectorAll('[data-act="clearcoolgroup"]').forEach((b) => b.addEventListener("click", async () => {
+    const m = b.dataset.model;
+    const label = m || "（对全部模型放行）";
+    if (!confirm(`清除模型「${label}」在全部渠道、所有 key 上的冷却？`)) return;
+    try {
+      const r = await api("POST", "/admin/api/route/cooling/clear-model", { model: m });
+      toast(r.cleared > 0 ? `已清除 ${r.cleared} 条冷却` : "该模型当前没有冷却");
+      await refreshRoute();
+      await loadState(); // 同步渠道页的冷却明细
+    } catch (e) { toast(e.message, true); }
+  }));
   // 点击模型头（按钮除外）切换候选明细展开/收起
   el.querySelectorAll(".route-model-head[data-act=toggle]").forEach((h) => h.addEventListener("click", (e) => {
     if (e.target.closest("button")) return;
@@ -289,12 +344,21 @@ function routeModelHTML(g, showOff) {
   const open = routeOpen.has(g.model);
   const rows = keys.map((k) => {
     let badge, extra = "";
+    // 一个下游模型映射到多个上游模型时，同一 key 会展开为多行：标注该行实际
+    // 发往上游的模型名；解除冷却按该行自己的冷却键（cool_model）精确解除。
+    const up = k.upstream_model
+      ? `<span class="badge info" title="该候选实际发往上游的模型名（渠道名称映射的结果）">上游 ${esc(k.upstream_model)}</span>`
+      : "";
     if (k.status === "ok") {
       badge = '<span class="badge on">可用</span>';
     } else if (k.status === "cooling") {
       const left = k.left_ms > 0 ? Math.round(k.left_ms / 1000) : 0;
       badge = `<span class="badge warn" title="冷却到期后自动恢复；点「解除」立即恢复">冷却中 · 剩 ${fmtLeft(left)}</span>`;
-      extra = `<button class="btn small" data-act="clearcoolmodel" data-key="${esc(k.key_id)}" data-model="${esc(g.model)}" title="只解除该 (key, 模型) 的冷却">解除</button>`;
+      // cool_model 非空 = 按 (key, 模型) 粒度的冷却，精确解除该条；为空 =
+      // 渠道按 key 跨模型共享的冷却（含映射候选之外的默认粒度），整条解除
+      extra = k.cool_model
+        ? `<button class="btn small" data-act="clearcoolmodel" data-key="${esc(k.key_id)}" data-model="${esc(k.cool_model)}" title="只解除该 (key, 模型) 的冷却">解除</button>`
+        : `<button class="btn small" data-act="clearcoolkey" data-key="${esc(k.key_id)}" data-channel="${esc(k.channel_id)}" title="解除该 key 的跨模型共享冷却">解除</button>`;
     } else {
       badge = `<span class="badge off">${k.channel_enabled ? "key 停用" : "渠道停用"}</span>`;
     }
@@ -302,6 +366,7 @@ function routeModelHTML(g, showOff) {
       ${badge}
       <span class="rk-name">${esc(k.key || "(未命名)")}</span>
       <span class="muted">@ ${esc(k.channel)}</span>
+      ${up}
       ${k.schedule === "round_robin" ? '<span class="badge info" title="该渠道为顺序轮询调度">轮询</span>' : ""}
       ${extra}
     </div>`;
@@ -315,6 +380,7 @@ function routeModelHTML(g, showOff) {
       <span class="badge on">可用 ${g.available}</span>
       ${g.cooling ? `<span class="badge warn">冷却 ${g.cooling}</span>` : ""}
       <span class="muted">候选 ${g.total}</span>
+      ${g.cooling ? `<button class="btn small" data-act="clearcoolgroup" data-model="${esc(g.model)}" title="清除该模型在全部渠道、全部 key 上的冷却（按分组名解析，含渠道映射出的每个上游模型）">清除冷却</button>` : ""}
     </div>
     ${open ? `<div class="route-keys">${rows ? rows : '<div class="key-line muted">该模型没有候选渠道/key（渠道未启用或模型未声明）</div>'}</div>` : ""}
   </div>`;
@@ -452,6 +518,10 @@ function renderChannels() {
     const modelLine = (ch.models || []).length
       ? `<div class="key-line"><span class="pname">模型 ${ch.models.length} 个：${esc(ch.models.slice(0, 4).join("、"))}${ch.models.length > 4 ? " …" : ""}</span></div>`
       : "";
+    const mapEntries = Object.entries(ch.model_map || {});
+    const mapLine = mapEntries.length
+      ? `<div class="key-line"><span class="pname" title="下游模型名 → 该上游实际模型名（转发时改写请求体 model）；一个下游名可对应多个上游模型，各自成为独立候选并分别冷却">名称映射 ${mapEntries.length} 条：${esc(mapEntries.slice(0, 3).map(([k, v]) => `${k}→${Array.isArray(v) ? v.join("/") : v}`).join("、"))}${mapEntries.length > 3 ? " …" : ""}</span></div>`
+      : "";
     const pinnedModels = Object.keys(ch.model_pins || {}).filter((m) => {
       const p = ch.model_pins[m];
       return p && ((p.upstreams || []).length || (p.exclude || []).length || p.sort);
@@ -476,12 +546,14 @@ function renderChannels() {
         ${pinnedModels ? `<span class="badge info" title="该渠道有模型的内部渠道被固定（请求注入 provider.only/order，不再随机路由）">已固定 ${pinnedModels} 个模型</span>` : ""}
         ${coolingN ? `<span class="badge warn">${coolingN} 个 key 冷却中</span>` : ""}
         <span class="spacer"></span>
+        ${coolingN ? `<button class="btn small" data-act="clearcoolall" title="按模型清除本渠道所有 key 的冷却，或清空本渠道全部 key 的冷却">清除冷却</button>` : ""}
         ${ch.endpoint_type !== "responses" ? `<button class="btn small" data-act="pin">内部渠道固定</button>` : ""}
         <button class="btn small" data-act="edit">编辑</button>
         <button class="btn small danger" data-act="del">删除</button>
       </div>
       <div class="card-body">
       ${modelLine}
+      ${mapLine}
       ${keyLines || '<div class="key-line muted">无 key</div>'}
       </div>
     </div>`;
@@ -528,7 +600,90 @@ function renderChannels() {
       await loadState();
     } catch (e) { toast(e.message, true); }
   }));
+  wrap.querySelectorAll('[data-act="clearcoolall"]').forEach((b) => b.addEventListener("click", () => {
+    const ch = chans.find((c) => c.id === b.closest(".channel-card").dataset.id);
+    if (ch) openCoolClearDialog(ch);
+  }));
 }
+
+// ---- 渠道级清除冷却弹窗 ----
+// 列出该渠道冷却中的条目（按冷却键的 model 部分分组，空串 = 整 key 跨模型共享），
+// 可「按模型」清本渠道所有 key 的该冷却，或一次性清空本渠道全部 key 的冷却。
+let coolClearChannel = null;
+
+function openCoolClearDialog(ch) {
+  coolClearChannel = ch;
+  $("#coolClearTitle").textContent = "清除冷却：" + ch.name;
+  $("#coolClearModal").classList.remove("hidden");
+  renderCoolClearRows();
+}
+
+// channelCoolGroups 该渠道冷却条目的分组（model 部分 → 涉及的 key 集合与最长剩余），
+// 整 key 共享条目（model 为空串）排在最后。
+function channelCoolGroups(ch) {
+  const ids = new Set((ch.keys || []).map((k) => k.id));
+  const groups = new Map();
+  for (const c of (STATE && STATE.cooling) || []) {
+    if (!ids.has(c.key_id) || c.left_ms <= 0) continue;
+    const model = c.model || "";
+    let g = groups.get(model);
+    if (!g) groups.set(model, (g = { model, keys: new Set(), left: 0 }));
+    g.keys.add(c.key_id);
+    if (c.left_ms > g.left) g.left = c.left_ms;
+  }
+  return [...groups.values()].sort((a, b) =>
+    a.model === "" ? 1 : b.model === "" ? -1 : a.model.localeCompare(b.model));
+}
+
+function renderCoolClearRows() {
+  let ch = coolClearChannel;
+  if (!ch) return;
+  const fresh = ((STATE && STATE.channels) || []).find((c) => c.id === ch.id);
+  if (fresh) coolClearChannel = ch = fresh;
+  const hint = $("#coolClearHint");
+  hint.textContent = "按模型清除本渠道所有 key 的该冷却，或一次性清空本渠道全部 key 的冷却。"
+    + (ch.cooldown_scope === "key_model"
+      ? ""
+      : "该渠道为按 Key 冷却粒度：任一模型故障都会冷却整个 key，按模型清除同样会解除该 key 的共享冷却。");
+  const wrap = $("#coolClearRows");
+  const groups = channelCoolGroups(ch);
+  if (!groups.length) {
+    wrap.innerHTML = '<p class="muted" style="font-size:12px">（该渠道当前没有冷却中的 key）</p>';
+    return;
+  }
+  wrap.innerHTML = groups.map((g) => {
+    const n = g.keys.size;
+    const label = g.model
+      ? `<span class="badge warn">模型 ${esc(g.model)}</span>`
+      : '<span class="badge warn" title="该 key 的冷却跨模型共享（按 Key 冷却粒度，或按 (Key, 模型) 渠道里残留的整体条目）：任一模型故障都会冷却整个 key">整 key（跨模型共享）</span>';
+    return `<div class="key-line">
+      ${label}
+      <span class="pname">${n} 个 key 冷却中 · 最长剩 ${fmtLeft(Math.round(g.left / 1000))}</span>
+      <span class="spacer"></span>
+      <button class="btn small" data-clearmodel="${esc(g.model)}">清除（本渠道 ${n} 个 key）</button>
+    </div>`;
+  }).join("");
+  wrap.querySelectorAll("[data-clearmodel]").forEach((b) => b.addEventListener("click", async () => {
+    try {
+      const r = await api("POST", `/admin/api/channels/${encodeURIComponent(ch.id)}/cooling/clear-model`, { model: b.dataset.clearmodel });
+      toast(r.cleared > 0 ? `已清除 ${r.cleared} 条冷却` : "该冷却已过期");
+      await refreshChannels();
+      renderCoolClearRows();
+    } catch (e) { toast(e.message, true); }
+  }));
+}
+
+$("#coolClearAllBtn").addEventListener("click", async () => {
+  const ch = coolClearChannel;
+  if (!ch) return;
+  if (!confirm(`清除渠道「${ch.name}」全部 key 的全部冷却（所有模型粒度）？`)) return;
+  try {
+    const r = await api("POST", `/admin/api/channels/${encodeURIComponent(ch.id)}/cooling/clear-all`, {});
+    toast(r.cleared > 0 ? `已清除 ${r.cleared} 条冷却` : "该渠道当前没有冷却");
+    await refreshChannels();
+    renderCoolClearRows();
+  } catch (e) { toast(e.message, true); }
+});
 $("#channelSearch").addEventListener("input", renderChannels);
 $("#channelGroupFilter").addEventListener("change", renderChannels);
 $("#channelsRefreshBtn").addEventListener("click", async () => {
@@ -902,8 +1057,39 @@ function keyProxyDesc(k, ch) {
 }
 
 // ---- 渠道编辑器 ----
+
+// modelMapToText / textToModelMap 渠道名称映射（model_map）与文本框
+//「每行 下游模型名=上游模型名（多个上游用逗号分隔）」之间的转换。
+// 同一个下游名可以对应上游的多个模型（区域/线路变体），可以写成
+// 「x=cn:x,global:x」或分成多行写同一个键（后者按行顺序累加）。
+function modelMapToText(map) {
+  const entries = Object.entries(map || {});
+  return entries.map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(",") : v}`).join("\n");
+}
+
+function textToModelMap(text) {
+  const out = {};
+  for (const line of String(text || "").split("\n")) {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) continue;
+    const i = s.indexOf("=");
+    if (i <= 0) continue;
+    const key = s.slice(0, i).trim();
+    if (!key) continue;
+    const list = out[key] || (out[key] = []);
+    for (const raw of s.slice(i + 1).split(",")) {
+      const val = raw.trim();
+      // 映射到自身无意义；归一化后重复的目标只留一个
+      if (!val || val === key) continue;
+      if (!list.includes(val)) list.push(val);
+    }
+    if (!list.length) delete out[key];
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 $("#addChannelBtn").addEventListener("click", () => openChannelEditor({
-  id: "", name: "", group: "", base_url: "", models_url: "", endpoint_type: "chat", models: [], headers: {},
+  id: "", name: "", group: "", base_url: "", models_url: "", endpoint_type: "chat", models: [], model_map: {}, headers: {},
   rewrite_reasoning: false, cooldown_scope: "key", auto_probe: false, enabled: true, keys: [],
 }));
 
@@ -916,6 +1102,7 @@ function openChannelEditor(ch) {
   $("#chModelsURL").value = ch.models_url || "";
   $("#chEndpointType").value = ch.endpoint_type || "chat";
   $("#chModels").value = (ch.models || []).join("\n");
+  $("#chModelMap").value = modelMapToText(ch.model_map);
   $("#chEnabled").checked = !!ch.enabled;
   $("#chRewrite").checked = !!ch.rewrite_reasoning;
   $("#chCooldownScope").value = ch.cooldown_scope === "key_model" ? "key_model" : "key";
@@ -1058,6 +1245,7 @@ document.addEventListener("keydown", (e) => {
   if (open.length) closeModal(open[open.length - 1]); // 只关最上层
 });
 $$('[data-close="channelModal"]').forEach((b) => b.addEventListener("click", () => $("#channelModal").classList.add("hidden")));
+$$('[data-close="coolClearModal"]').forEach((b) => b.addEventListener("click", () => $("#coolClearModal").classList.add("hidden")));
 
 // 自定义请求头
 function renderHeaderRows(headers) {
@@ -1286,14 +1474,22 @@ $("#bulkImportBtn").addEventListener("click", () => {
 });
 
 // 从上游拉取模型列表（用渠道 key 鉴权）：dry-run 只取候选清单，
-// 弹出勾选面板，用户勾选要启用的模型后点「确定」写入左侧列表
+// 弹出勾选面板，用户勾选后「按勾选重建」左侧列表——未勾选项与上游已不返回
+// 的旧模型都会从列表移除（勾选「保留上游未返回的旧模型」时例外）。
+// 「拉取并直接重建」按钮则以上游返回为准立即全量替换并保存。
 let fetchedCandidates = [];        // 本次拉取的候选（用于确定时区分手工项）
 let fetchedFreeSet = new Set();
+let fetchedStale = [];             // 上游本次未返回、当前列表里已有的模型
 
 async function fetchModelsDryRun() {
   if (!editChannel.id) throw new Error("请先保存渠道（生成 key 后）再拉取模型列表");
   const r = await api("POST", `/admin/api/channels/${encodeURIComponent(editChannel.id)}/fetch-models`, {});
-  return { fetched: r.fetched || r.models || [], free: r.free_models || [], key: r.key_used || "?" };
+  return {
+    fetched: r.fetched || r.models || [],
+    free: r.free_models || [],
+    stale: r.stale || [],
+    key: r.key_used || "?",
+  };
 }
 
 function fetchSetCheckbox(v) { v.checked = true; }
@@ -1305,18 +1501,24 @@ $("#fetchModelsBtn").addEventListener("click", async () => {
   btn.textContent = "拉取中…";
   $("#channelErr").textContent = "";
   try {
-    const { fetched, free, key } = await fetchModelsDryRun();
+    const { fetched, free, stale, key } = await fetchModelsDryRun();
     if (!fetched.length) throw new Error("上游返回的模型列表为空");
     fetchedCandidates = fetched;
     fetchedFreeSet = new Set(free);
-    const existing = new Set($("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean));
+    fetchedStale = stale;
+    // 默认全选（以上游为准重建）：上游返回什么就启用什么，旧列表中的
+    // 残留模型不会因为「不在候选里」而被静默保留
     const list = $("#fetchList");
     list.innerHTML = fetched.map((m) =>
-      `<label title="${esc(m)}"><input type="checkbox" value="${esc(m)}" ${existing.has(m) ? "checked" : ""}> ${esc(m)}${fetchedFreeSet.has(m) ? '<i class="badge free">免费</i>' : ""}</label>`
+      `<label title="${esc(m)}"><input type="checkbox" value="${esc(m)}" checked> ${esc(m)}${fetchedFreeSet.has(m) ? '<i class="badge free">免费</i>' : ""}</label>`
     ).join("");
     $("#fetchCount").textContent = fetched.length;
+    $("#fetchStale").textContent = stale.length
+      ? `· 上游已不再返回 ${stale.length} 个旧模型（${stale.slice(0, 3).join(", ")}${stale.length > 3 ? " 等" : ""}），重建后将被移除`
+      : "";
+    $("#fetchKeepMissing").checked = false;
     $("#fetchPanel").classList.remove("hidden");
-    toast(`已拉取 ${fetched.length} 个模型（key: ${key}），勾选要启用的后点「确定」`);
+    toast(`已拉取 ${fetched.length} 个模型（key: ${key}），默认全选，点「按勾选重建列表」以上游为准重建`);
   } catch (e) {
     $("#channelErr").textContent = "拉取失败: " + e.message;
     toast("拉取失败: " + e.message, true);
@@ -1326,20 +1528,53 @@ $("#fetchModelsBtn").addEventListener("click", async () => {
   }
 });
 
+// 拉取并直接重建：一次点击以上游返回为准全量替换模型列表并保存渠道
+//（游标：上游现在返回什么就启用什么，旧模型全部移除）。
+$("#fetchRebuildBtn").addEventListener("click", async () => {
+  const btn = $("#fetchRebuildBtn");
+  if (!editChannel.id) { toast("请先保存渠道（生成 key 后）再拉取模型列表", true); return; }
+  if (!confirm("以上游返回的模型列表为准重建？当前列表中上游已不存在的模型会被移除。")) return;
+  btn.disabled = true;
+  btn.textContent = "拉取中…";
+  try {
+    const r = await api("POST", `/admin/api/channels/${encodeURIComponent(editChannel.id)}/fetch-models?replace=1`, {});
+    const models = r.models || [];
+    $("#chModels").value = models.join("\n");
+    freeModelSet = new Set(r.free_models || []);
+    renderModelChips();
+    // 直接重建已写回后端，这里同步编辑态（重新拉取渠道最新配置）
+    await loadState();
+    editChannel = (STATE.channels || []).find((c) => c.id === editChannel.id) || editChannel;
+    toast(`已按上游重建：${models.length} 个模型（key: ${r.key_used || "?"}）`);
+  } catch (e) {
+    toast("拉取重建失败: " + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "⤓ 拉取并直接重建";
+  }
+});
+
 $("#fetchAllBtn").addEventListener("click", () => $$("#fetchList input[type=checkbox]").forEach(fetchSetCheckbox));
 $("#fetchNoneBtn").addEventListener("click", () => $$("#fetchList input[type=checkbox]").forEach(fetchClearCheckbox));
 
-// 确定：勾选模型 + 手工添加的非候选模型 → 写入左侧列表
+// 按勾选重建：勾选模型 = 新列表（保序）；未勾选的候选与上游已不返回的旧模型
+// 都被移除。勾选「保留上游未返回的旧模型」时，旧列表中不在候选里的项（手工
+// 补充项）被保留并追加在末尾。
 $("#fetchApplyBtn").addEventListener("click", () => {
   const chosen = $$("#fetchList input[type=checkbox]:checked").map((c) => c.value);
   const candSet = new Set(fetchedCandidates);
-  const manual = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean).filter((m) => !candSet.has(m));
+  const keepMissing = $("#fetchKeepMissing").checked;
+  const dropped = fetchedCandidates.length - chosen.length;
+  const manual = keepMissing
+    ? $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean).filter((m) => !candSet.has(m))
+    : [];
   const merged = [...new Set([...chosen, ...manual])];
   $("#chModels").value = merged.join("\n");
   freeModelSet = fetchedFreeSet;
   renderModelChips();
   $("#fetchPanel").classList.add("hidden");
-  toast(`已启用 ${chosen.length} 个模型，请点「保存」写入配置`);
+  const removed = dropped + (keepMissing ? 0 : fetchedStale.length);
+  toast(`已重建列表：启用 ${chosen.length} 个模型${removed ? `，移除 ${removed} 个` : ""}${manual.length ? `，保留手工项 ${manual.length} 个` : ""}，请点「保存」写入配置`);
 });
 
 // collectKeyForm 从单个 key 块读取配置（不做校验）。
@@ -1399,6 +1634,7 @@ function collectChannelForm() {
     models_url: $("#chModelsURL").value.trim(),
     endpoint_type: $("#chEndpointType").value,
     models,
+    model_map: textToModelMap($("#chModelMap").value),
     headers,
     rewrite_reasoning: $("#chRewrite").checked,
     cooldown_scope: $("#chCooldownScope").value,
@@ -1431,12 +1667,19 @@ $("#channelSaveBtn").addEventListener("click", async () => {
 });
 
 // ---- 通用密钥 ----
+// 每个密钥可限定可调用的模型（models，支持通配/正则；空 = 不限制）。
+// 修改模型白名单后回车/失焦即保存。
+function parseGWModels(text) {
+  return String(text || "").split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+}
+
 function renderGWKeys() {
   const tbody = $("#gwKeyTable tbody");
   const keys = (STATE && STATE.gateway_keys) || [];
   tbody.innerHTML = keys.map((k) => `<tr data-id="${esc(k.id)}">
     <td>${esc(k.name)}</td>
     <td><code class="gwkey">${esc(k.key)}</code> <button class="btn small" data-act="copy">复制</button></td>
+    <td><input class="gw-models" style="width:100%" placeholder="空=不限（支持 claude-*、re:^gpt-4.*$）" value="${esc((k.models || []).join(", "))}"></td>
     <td><label class="inline"><input type="checkbox" data-act="toggle" ${k.enabled ? "checked" : ""}> ${k.enabled ? "启用" : "停用"}</label></td>
     <td class="muted">${esc(fmtTimeShort(k.created_at))}</td>
     <td><button class="btn small danger" data-act="del">删除</button></td>
@@ -1445,10 +1688,20 @@ function renderGWKeys() {
   tbody.querySelectorAll('[data-act="copy"]').forEach((b) => b.addEventListener("click", () => {
     navigator.clipboard.writeText(b.parentElement.querySelector("code").textContent).then(() => toast("已复制"));
   }));
+  tbody.querySelectorAll(".gw-models").forEach((inp) => inp.addEventListener("change", async () => {
+    const tr = inp.closest("tr");
+    const k = keys.find((x) => x.id === tr.dataset.id);
+    try {
+      const models = parseGWModels(inp.value);
+      await api("PUT", "/admin/api/gwkeys", { id: k.id, name: k.name, key: k.key, enabled: k.enabled, models });
+      toast(models.length ? `已限制为 ${models.length} 个模型` : "已取消模型限制");
+      await loadState();
+    } catch (e) { toast(e.message, true); await loadState(); }
+  }));
   tbody.querySelectorAll('[data-act="toggle"]').forEach((c) => c.addEventListener("change", async () => {
     const tr = c.closest("tr");
     const k = keys.find((x) => x.id === tr.dataset.id);
-    try { await api("PUT", "/admin/api/gwkeys", { id: k.id, name: k.name, key: k.key, enabled: c.checked }); await loadState(); }
+    try { await api("PUT", "/admin/api/gwkeys", { id: k.id, name: k.name, key: k.key, models: k.models || [], enabled: c.checked }); await loadState(); }
     catch (e) { toast(e.message, true); }
   }));
   tbody.querySelectorAll('[data-act="del"]').forEach((b) => b.addEventListener("click", async () => {
@@ -1534,6 +1787,8 @@ function renderLogRows(tbodySel, st, emptyTip) {
     const id = r.id || "";
     const open = !!(id && st.expanded[id]);
     const err = r.error || "";
+    // 收起态错误列只显示单行摘要（CSS 单行限宽省略号截断，悬停 title 看全文），
+    // 完整失败轨迹在展开详情行里展示。
     const errCell = err
       ? `<td class="err" title="${esc(err)}">${esc(err)}</td>`
       : `<td class="err"></td>`;
@@ -1583,7 +1838,7 @@ function logDetailRow(id, r) {
       ${f("下游", userLabel(r.user))}
       ${f("出口", r.client_ip)}
     </div>
-    ${r.error ? `<div class="e">${esc(r.error)}</div>` : ""}
+    ${r.error ? `<div class="e"><div class="k">错误</div>${esc(r.error)}</div>` : ""}
     ${r.request_body ? `<div class="e"><div class="k">请求内容</div>${esc(r.request_body)}</div>` : ""}
     ${r.response_body ? `<div class="e"><div class="k">返回内容</div>${esc(r.response_body)}</div>` : ""}
   </div></td></tr>`;

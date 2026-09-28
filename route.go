@@ -5,16 +5,26 @@
 // 每次请求最多尝试 cfg.MaxRouteTries 个候选；命中冷却的候选直接跳过。
 // 冷却键粒度为渠道级开关 cooldown_scope："key"（默认，含旧配置空值）按 key 跨模型
 // 共享冷却；"key_model" 按 (keyID, model) 独立冷却。
+// 模型名称处理（modelname.go）：路由用别名解析后的模型名，渠道匹配支持通配/正则
+// 与归一化等价（大小写/供应商前缀/变体后缀），发往上游前按渠道名称映射改写
+// 请求体的 model 字段。
 // 故障分类与处理：
-//   - 429                  → 唯一记冷却的故障：冷却时长优先取上游明确的到期时间
+//   - 429                  → 记冷却：冷却时长优先取上游明确的到期时间
 //     （Retry-After 头 > 响应体 "Try again in 14h 23m" 类文本/时间戳），
 //     上游没给明确时间才用 RATE_LIMIT_COOLDOWN（默认 1h）
-//   - 5xx                  → 只换 key 不冷却；按 key 记连续次数（正常请求清零），连续超过
-//     ROTATE_AFTER_5XX（默认 3）自动换出口 IP（ipv6pool key 生效）
-//   - 网络/代理错误         → 只换 key 不冷却；ipv6pool 候选换出口 IP 后同 key 立即
-//     重试一次（坏出口自愈），仍失败再继续下一个 key
-//   - 401/403              → 只换 key，不冷却、不换出口
+//   - 5xx                  → 换 key；按 key 记连续次数（正常请求清零），连续超过
+//     ROTATE_AFTER_5XX（默认 3）自动换出口 IP（ipv6pool key 生效），
+//     并按熔断策略累计失败次数触发冷却（见下）
+//   - 网络/代理错误         → 换 key；ipv6pool 候选换出口 IP 后同 key 立即
+//     重试一次（坏出口自愈），仍失败再继续下一个 key；同样计入熔断
+//   - 401/403              → 只换 key，不冷却、不换出口（熔断不计：鉴权失败
+//     不是上游容量/健康信号，冷却无助于恢复）
 //   - 其他（含上游 400）   → 原样透传给下游（上游的业务语义不动）
+//
+// 熔断（连续失败冷却，对标 go-gateway 的 breaker）：网络/代理错误与 5xx 连续
+// 失败达阈值（默认 3）即按指数退避冷却该 (key, model)（基础 30s × 倍数^(触发
+// 次数-1)，上限 15m）；任意一次成功即清零计数并解除冷却。全部候选都在冷却时
+// 仍会对最早到期者做一次穿透试探，成功自愈。
 //
 // 流式保活：上游排队首包慢或流中途静默时，每 KEEPALIVE_INTERVAL（默认 15s）
 // 向下游写一帧 SSE 注释心跳，保证下游反代/客户端不因空闲超时掐断连接
@@ -47,6 +57,13 @@ type chEntry struct {
 type candidate struct {
 	ch *Channel
 	k  *UpKey
+	// upstreamModel 非空 = 发往上游前把请求体的 model 字段改写为该名称
+	//（渠道名称映射 / 渠道声明列表的原文写法，见 modelname.go）；空 = 原样发送。
+	upstreamModel string
+	// coolModel 非空 = 冷却键中 model 部分的固定取值：渠道映射把下游模型映射到
+	// 多个上游模型时，每个上游模型各自成一个候选并各自独立冷却（cn:/global: 变体
+	// 互不牵连）。空 = 按渠道冷却粒度规则（cooldownModelFor）。
+	coolModel string
 	// pinBody 非空 = 渠道固定注入后的请求体（发往上游时优先于原始 body）；
 	// pinName 为该候选固定的内部渠道（provider slug），空 = 未固定（自动路由）。
 	pinBody []byte
@@ -61,9 +78,14 @@ func (c *candidate) requestBody(raw []byte) []byte {
 	return raw
 }
 
-// cooldownModel 返回冷却键中 model 部分的取值：渠道粒度为 "key_model" 时按
-// (key, model) 独立冷却；默认 "" / "key"（含旧配置空值）按 key 跨模型共享冷却。
+// cooldownModel 返回冷却键中 model 部分的取值：渠道映射出的候选按上游模型独立
+// 冷却（coolModel，如 cn:x 与 global:y 互不牵连）；其余按渠道粒度——
+// 渠道粒度为 "key_model" 时按 (key, model) 独立冷却，默认 "" / "key"（含旧配置
+// 空值）按 key 跨模型共享冷却。
 func (c *candidate) cooldownModel(model string) string {
+	if c.coolModel != "" {
+		return c.coolModel
+	}
 	return c.ch.cooldownModelFor(model)
 }
 
@@ -121,6 +143,11 @@ func (ch *Channel) failoverSameChannel() bool {
 }
 
 // buildCandidates 按优先级构建候选列表（深拷贝自 store）。
+// rawModel 为下游请求的模型名，model 为「路由模型名」——已完成别名解析
+//（见 resolveModelAlias），渠道匹配、冷却键、（key,模型）活动计时都用它；
+// 每个候选另行解析发往上游的模型名（渠道 ModelMap 映射 / 声明列表原文，
+// 见 modelname.go）。渠道级映射优先于全局别名：渠道对下游原名配了映射时按
+// 渠道映射发往上游；一个下游名映射到多个上游模型时，每个上游模型各成一个候选。
 // 渠道顺序：先按渠道优先级（priority，默认 0，越小越靠前）排序，同一优先级内
 // 若存在设置了权重（weight>0）的渠道，按权重比例做平滑加权轮询决定每请求的
 // 渠道先后；否则保持配置顺序。渠道内 key 顺序由调度模式决定
@@ -132,12 +159,12 @@ func (ch *Channel) failoverSameChannel() bool {
 // 渠道配置了模型固定（ModelPins，见 upstreampin.go）时，每个 (渠道, key)
 // 按固定列表展开为多个候选（每个候选注入对应的内部渠道固定请求体），
 // strict 模式按固定顺序逐个内部渠道独占尝试。
-func buildCandidates(model string, rawBody []byte) []candidate {
+func buildCandidates(rawModel, model string, rawBody []byte) []candidate {
 	snap := store.View() // 只读视图：零拷贝（每请求热路径，不做全量配置深拷贝）
 	def := currentPolicy().DefaultSchedule
 	var avail []chEntry
 	for i, ch := range snap.Channels {
-		if !ch.Enabled || !ch.allowsModel(model) {
+		if !ch.Enabled || !(ch.allowsModel(model) || ch.allowsModel(rawModel)) {
 			continue
 		}
 		avail = append(avail, chEntry{ch: ch, idx: i})
@@ -156,18 +183,23 @@ func buildCandidates(model string, rawBody []byte) []candidate {
 		if ch.effectiveSchedule(def) == scheduleRoundRobin {
 			keys = rotateKeysRR(ch.ID, keys)
 		}
+		pins := buildUpstreamPinAttempts(ch, model, rawBody)
 		for _, k := range keys {
 			if !k.Enabled {
 				continue
 			}
-			if att := buildUpstreamPinAttempts(ch, model, rawBody); att != nil {
-				// 有固定配置：按固定列表展开（strict 每个内部渠道一个候选）
-				for _, pa := range att {
-					out = append(out, candidate{ch: ch, k: k, pinBody: pa.body, pinName: pa.upstream})
+			for _, cand := range newCandidates(ch, k, rawModel, model) {
+				if pins == nil {
+					out = append(out, cand)
+					continue
 				}
-				continue
+				// 有固定配置：按固定列表展开（strict 每个内部渠道一个候选）
+				for _, pa := range pins {
+					pinned := cand
+					pinned.pinBody, pinned.pinName = pa.body, pa.upstream
+					out = append(out, pinned)
+				}
 			}
-			out = append(out, candidate{ch: ch, k: k})
 		}
 	}
 	return out
@@ -382,6 +414,8 @@ func forwardOther(w http.ResponseWriter, r *http.Request, rawBody []byte, conten
 
 // forwardRequest 执行故障转移转发，把最终响应写给下游 w。
 // 返回实际服务的候选（用于统计），无可用上游时返回 nil。
+// model 为下游请求的模型名（未解析别名/映射）；路由与冷却用别名解析后的
+// 「路由模型名」，上游请求体按渠道映射改写（名称处理见 modelname.go）。
 // 每个候选的尝试结果（含跳过原因）都会追加到请求日志的错误信息，便于在
 // WebUI 上直接回答「为什么 502」：哪个 key 因什么失败、冷却了多久。
 func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, contentType string, stream bool, model string, mode forwardMode, suffix string) *candidate {
@@ -389,7 +423,11 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 	if !isChat {
 		stream = false // 非对话端点（embeddings/图片/视频）无流式
 	}
-	cands := buildCandidates(model, rawBody)
+	// 名称处理：全局别名解析（下游请求名 → 规范模型名），路由/冷却/活动计时
+	// 都以解析后的名字为准，上游请求体由渠道映射决定（candidate.upstreamModel）；
+	// 渠道级映射优先于全局别名（渠道对下游原名配了映射就按渠道映射发往上游）
+	routeModel := resolveModelAlias(model)
+	cands := buildCandidates(model, routeModel, rawBody)
 	if len(cands) == 0 {
 		writeJSONError(w, http.StatusBadGateway, "no enabled upstream key available", "no_upstream")
 		return nil
@@ -434,7 +472,7 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 		}
 		trace = append(trace, attemptTrace{
 			Key:   name,
-			Model: model,
+			Model: routeModel,
 			Event: event,
 			Err:   detail,
 		})
@@ -444,9 +482,11 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 	// 数十秒即过），试探成功即解除冷却自愈——否则会一直表现为「渠道测试可用
 	// 而网关持续 502」，只能靠手工测试解冻。
 	pierceKey, pierceModel := "", ""
-	if pierce := earliestCooldown(cands, model); pierce != nil {
-		pierceKey, pierceModel = pierce.k.ID, pierce.cooldownModel(model)
+	if pierce := earliestCooldown(cands, routeModel); pierce != nil {
+		pierceKey, pierceModel = pierce.k.ID, pierce.cooldownModel(routeModel)
 	}
+	// 本候选是否为「穿透试探」的一次真实尝试：成功即解除存量冷却（下方
+	// RecordSuccess 一并处理），失败照常继续故障转移
 	pierced := false
 	// egressRetried 记录本轮请求中已做过「换出口重试」的 key（每 key 最多一次）
 	egressRetried := map[string]bool{}
@@ -456,7 +496,7 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 		if !isRetry && attempts >= maxTries {
 			break
 		}
-		cm := cand.cooldownModel(model)
+		cm := cand.cooldownModel(routeModel)
 		if !isRetry && cool.IsCooling(cand.k.ID, cm) {
 			if cand.k.ID != pierceKey || cm != pierceModel {
 				cooled++
@@ -477,13 +517,14 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 			lastErr = "resolve proxy: " + err.Error()
 			recordTrace(&cand, "proxy_error", lastErr)
 			log.Printf("route: key %s proxy resolve failed: %v", cand.k.Name, err)
+			cool.RecordFailure(cand.k.ID, cm, pol.Breaker)
 			i = nextCandidateIndex(cands, i)
 			continue
 		}
 
 		client := newUpstreamClient(route)
 		// 记录 key 活动（空闲探测的计时依据）：任何真实发出的上游请求都算调用
-		noteKeyCall(cand.k.ID, model)
+		noteKeyCall(cand.k.ID, routeModel)
 		target := cand.chatTarget()
 		if !isChat {
 			target = cand.targetFor(suffix)
@@ -497,9 +538,11 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 				recordTrace(&cand, "client_canceled", lastErr)
 				break
 			}
-			// 网络错误只换 key，不冷却（瞬断不该把健康 key 冷停）
+			// 网络错误只换 key，不冷却（瞬断不该把健康 key 冷停）；但连续
+			// 失败达熔断阈值即按指数退避冷却该 key（成功请求清零计数）
 			lastErr = "network: " + err.Error()
 			recordTrace(&cand, "network_error", lastErr)
+			cool.RecordFailure(cand.k.ID, cm, pol.Breaker)
 			// ipv6pool 候选：换出口后同 key 立即重试一次——SOCKS CONNECT 被拒
 			// （rep 0x05）等出口级故障常只影响单个出口 IP，新出口可能立即可用；
 			// 不重试的话单 key 渠道本次请求直接 502，要等下一次请求才用上新 IP。
@@ -563,6 +606,9 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 			recordTrace(&cand, "rejected_5xx", lastErr)
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
+			// 连续 5xx 同样计入熔断：上游整体故障时把 key 冷却一段时间，
+			// 停止无谓冲击（阈值/时长见设置页熔断项）
+			cool.RecordFailure(cand.k.ID, cm, pol.Breaker)
 			// 关闭 body（连接归还连接池）之后再换 IP：换 IP 会作废旧出口的
 			// 空闲隧道，太早调用会漏掉当前这条刚用完的连接
 			if pol.RotateAfter5xx > 0 && n > pol.RotateAfter5xx {
@@ -573,13 +619,10 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 			continue
 		}
 
-		// 正常拿到响应（2xx/3xx/4xx 业务语义）：清零该 key 的 5xx 连续计数
+		// 正常拿到响应（2xx/3xx/4xx 业务语义）：清零该 key 的 5xx 连续计数与
+		// 熔断失败计数；穿透成功时存量冷却同时解除（冷却与事实相悖，立即自愈）
 		streaks.Reset(cand.k.ID)
-
-		// 穿透成功：该 key 的存量冷却与事实相悖，立即解除（后续请求恢复正常路由）
-		if pierced {
-			cool.Clear(cand.k.ID, cand.cooldownModel(model))
-		}
+		cool.RecordSuccess(cand.k.ID, cand.cooldownModel(routeModel))
 
 		// 成功拿到可透传的响应：改写（可选）后回给下游
 		leaseMgr.RecordUse(cand.k.effectiveProxy(cand.ch), cand.k.ID)
@@ -613,13 +656,24 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 	}
 
 	// 无候选成功：把诊断信息写进请求日志（渠道/key/逐 key 原因），再回给下游
-	msg := describeRouteFailure(model, len(cands), attempts, cooled, lastErr, trace)
+	displayModel := routeModel
+	if routeModel != model {
+		displayModel = model + "→" + routeModel // 别名解析结果一并展示
+	}
+	msg := describeRouteFailure(displayModel, len(cands), attempts, cooled, lastErr, trace)
+	// 名称处理可观测：上游实际收到的模型名（渠道映射/声明原文与路由名不同时）
+	if names := candidateModelNames(cands, routeModel); len(names) > 0 {
+		msg += "; upstream model: " + strings.Join(names, ", ")
+	}
+	if pierced {
+		msg += "; cooldown pierced (earliest-expiring key was retried)"
+	}
 	// 429 余波（全部冷却或本轮撞过 429）：附上最早可重试时间，下游可据此退避
 	var retryAfter int64
 	if attempts == 0 || rateLimited {
 		pairs := make([]cooldownPair, 0, len(cands))
 		for _, c := range cands {
-			pairs = append(pairs, cooldownPair{c.k.ID, c.cooldownModel(model)})
+			pairs = append(pairs, cooldownPair{c.k.ID, c.cooldownModel(routeModel)})
 		}
 		if d, ok := cool.EarliestRetry(pairs); ok {
 			retryAfter = int64(d.Seconds()) + 1
@@ -643,6 +697,22 @@ func forwardRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, cont
 	}
 	writeJSONError(w, status, msg, code)
 	return nil
+}
+
+// candidateModelNames 收集候选实际发往上游的模型名（去重保序，只保留与
+// 路由模型名不同的部分），用于失败信息与日志展示名称处理的结果。
+func candidateModelNames(cands []candidate, routeModel string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for i := range cands {
+		m := cands[i].upstreamModel
+		if m == "" || m == routeModel || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	return out
 }
 
 // attemptTrace 一次候选尝试的轨迹（key「名称@渠道」、事件、失败原因）。
@@ -762,7 +832,8 @@ func peekUpstreamError(r *http.Request, resp *http.Response) {
 // 且渠道端点类型为 responses 时，先把 chat/completions 请求体转换为
 // Responses API 格式（仅对话端点）。
 func doUpstreamRequest(ctx context.Context, client *http.Client, cand *candidate, target string, rawBody []byte, contentType string, translateResponses bool, stream bool, srcHeader http.Header) (*http.Response, error) {
-	body := cand.requestBody(rawBody)
+	// 请求体：内部渠道固定注入体优先，再按渠道名称映射改写 model 字段
+	body, contentType := cand.upstreamBody(rawBody, contentType)
 	if translateResponses && cand.ch.EndpointType == endpointResponses {
 		body = chatToResponsesRequest(body)
 	}
@@ -812,7 +883,9 @@ const (
 	routeStatusDisabled = "disabled" // 渠道或 key 被停用：不参与路由
 )
 
-// RouteKeyStatus 路由视图中单个 (渠道, key) 候选的状态。
+// RouteKeyStatus 路由视图中单个 (渠道, key) 候选的状态。一个渠道映射把下游模型
+// 映射到多个上游模型时，同一 (渠道, key) 会展开为多行，各自带 upstream_model
+// 与独立的冷却状态（cool_model 为该行冷却键的 model 部分，解除冷却时用它）。
 type RouteKeyStatus struct {
 	ChannelID string `json:"channel_id"`
 	Channel   string `json:"channel"`
@@ -820,8 +893,10 @@ type RouteKeyStatus struct {
 	KeyID     string `json:"key_id"`
 	Key       string `json:"key"`
 	KeyOn     bool   `json:"key_enabled"`
-	Schedule  string `json:"schedule"` // 渠道生效的账号调度模式
-	Status    string `json:"status"`   // ok / cooling / disabled
+	Schedule  string `json:"schedule"`                 // 渠道生效的账号调度模式
+	Upstream  string `json:"upstream_model,omitempty"` // 该候选实际发往上游的模型名（与分组名不同时展示）
+	CoolModel string `json:"cool_model,omitempty"`     // 冷却键的 model 部分（解除该行冷却时用）
+	Status    string `json:"status"`                   // ok / cooling / disabled
 	Until     int64  `json:"until_unix,omitempty"`
 	LeftMS    int64  `json:"left_ms,omitempty"`
 }
@@ -847,12 +922,18 @@ type RouteStatusData struct {
 // routeStatusData 构建路由页视图：候选顺序与网关实际转发顺序一致
 //（渠道配置序 + key 配置序）。model 非空时只返回该模型的分组。
 //
-// 模型枚举：取各渠道声明模型列表的并集（首次出现序）；渠道未声明模型列表
-// 时对全部模型放行，其 key 会出现在每个模型分组里。若所有渠道都未声明
-// 模型，则合并为单个空模型分组（前端标注「全部模型」）。
+// 模型枚举：取各渠道声明模型列表与渠道模型映射键（下游模型名）的并集（首次出现序）
+// 加上全局别名（标注指向的规范模型），渠道未声明模型列表时对全部模型放行，其 key
+// 会出现在每个模型分组里。若所有渠道都未声明模型，则合并为单个空模型分组
+//（前端标注「全部模型」）。查询参数 model 会先经别名解析再匹配（与网关路由一致）。
+//
+// 渠道把一个下游模型映射到多个上游模型时（如 cn:x、global:y 都对外叫 x），该分组下
+// 每个 (渠道, key) 展开为多行，每行标注 upstream_model 并各自检查冷却——与网关
+// 实际候选一致（每个上游模型独立冷却）。
 func routeStatusData(model string) *RouteStatusData {
 	snap := store.View() // 只读视图，零拷贝
-	def := normalizeScheduleDefault(currentPolicy().DefaultSchedule)
+	pol := currentPolicy()
+	def := normalizeScheduleDefault(pol.DefaultSchedule)
 
 	var order []string
 	groups := map[string]*RouteModelGroup{}
@@ -873,58 +954,71 @@ func routeStatusData(model string) *RouteStatusData {
 			for _, m := range ch.Models {
 				get(m)
 			}
+			// 映射键（下游模型名）也是该渠道支持的可调用名，单独列出分组
+			for _, m := range ch.modelMapKeys() {
+				get(m)
+			}
+		}
+		// 别名分组（如 my-gpt → gpt-4o）：路由候选与目标模型一致，单独列出便于核对
+		for _, alias := range sortedKeys(pol.ModelAliases) {
+			if _, ok := groups[alias]; !ok {
+				get(alias)
+			}
 		}
 		if len(order) == 0 {
 			get("") // 无任何模型声明：单分组代表「对全部模型放行」的候选
 		}
 	}
 
-	// 每个渠道预构建模型允许集合：allowsModel 是模型列表的线性扫描，而下面
-	// 的循环是「模型分组 × 渠道」嵌套，直接调用会退化成 O(模型² × 渠道)。
-	// 集合化后整体回到 O(模型 × 渠道)。nil = 未声明模型列表（对全部模型放行）。
-	allowSets := make([]map[string]bool, len(snap.Channels))
+	// 每个渠道预构建模型匹配器：allowsModel 是模型列表的线性扫描，而下面的
+	// 循环是「模型分组 × 渠道」嵌套，直接调用会退化成 O(模型² × 渠道)。
+	// 匹配器化后整体回到 O(模型 × 渠道)。allowAll = 未声明模型列表（放行全部）。
+	// 映射键（下游名）一并纳入：配了映射即可用该名调用，不必再写进 Models。
+	matchers := make([]*modelMatcher, len(snap.Channels))
 	for i, ch := range snap.Channels {
-		if len(ch.Models) == 0 {
-			continue
-		}
-		set := make(map[string]bool, len(ch.Models))
-		for _, m := range ch.Models {
-			set[m] = true
-		}
-		allowSets[i] = set
+		matchers[i] = newModelMatcher(append(append([]string{}, ch.Models...), ch.modelMapKeys()...))
 	}
 
 	for _, g := range groups {
+		// 冷却键与渠道匹配都用别名解析后的路由模型名
+		routeModel := resolveModelAlias(g.Model)
 		for i, ch := range snap.Channels {
-			if set := allowSets[i]; set != nil && g.Model != "" && !set[g.Model] {
-				continue // 该渠道未声明此模型
+			if g.Model != "" && !matchers[i].match(g.Model) && !matchers[i].match(routeModel) {
+				continue // 该渠道未声明此模型、也没有对应映射
 			}
+			rows := channelUpstreamRows(ch, g.Model, routeModel)
 			for _, k := range ch.Keys {
-				st := RouteKeyStatus{
-					ChannelID: ch.ID,
-					Channel:   ch.Name,
-					ChannelOn: ch.Enabled,
-					KeyID:     k.ID,
-					Key:       k.Name,
-					KeyOn:     k.Enabled,
-					Schedule:  ch.effectiveSchedule(def),
-				}
-				switch {
-				case !ch.Enabled || !k.Enabled:
-					st.Status = routeStatusDisabled
-				default:
-					if until, ok := cool.CoolingKey(k.ID, ch.cooldownModelFor(g.Model)); ok {
-						st.Status = routeStatusCooling
-						st.Until = until.Unix()
-						st.LeftMS = until.Sub(time.Now()).Milliseconds()
-						g.Cooling++
-					} else {
-						st.Status = routeStatusOK
-						g.Available++
+				for _, row := range rows {
+					st := RouteKeyStatus{
+						ChannelID: ch.ID,
+						Channel:   ch.Name,
+						ChannelOn: ch.Enabled,
+						KeyID:     k.ID,
+						Key:       k.Name,
+						KeyOn:     k.Enabled,
+						Schedule:  ch.effectiveSchedule(def),
+						CoolModel: row.cool,
 					}
+					if row.upstream != "" && row.upstream != g.Model {
+						st.Upstream = row.upstream // 与分组名相同则不必重复展示
+					}
+					switch {
+					case !ch.Enabled || !k.Enabled:
+						st.Status = routeStatusDisabled
+					default:
+						if until, ok := cool.CoolingKey(k.ID, row.cool); ok {
+							st.Status = routeStatusCooling
+							st.Until = until.Unix()
+							st.LeftMS = until.Sub(time.Now()).Milliseconds()
+							g.Cooling++
+						} else {
+							st.Status = routeStatusOK
+							g.Available++
+						}
+					}
+					g.Keys = append(g.Keys, st)
+					g.Total++
 				}
-				g.Keys = append(g.Keys, st)
-				g.Total++
 			}
 		}
 	}

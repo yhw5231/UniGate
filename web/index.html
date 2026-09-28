@@ -140,9 +140,9 @@
         <div class="spacer"></div>
         <button id="addGWKeyBtn" class="btn primary">+ 生成密钥</button>
       </div>
-      <p class="muted">客户端以 <code>Authorization: Bearer &lt;通用密钥&gt;</code> 调用 <code>/v1/chat/completions</code> 与 <code>/v1/models</code>。网关按渠道顺序 + key 顺序做故障转移。</p>
+      <p class="muted">客户端以 <code>Authorization: Bearer &lt;通用密钥&gt;</code> 调用 <code>/v1/chat/completions</code> 与 <code>/v1/models</code>。网关按渠道顺序 + key 顺序做故障转移。可为每个密钥限定可调用的模型（支持通配 <code>claude-*</code> 与正则 <code>re:^gpt-4.*$</code>，留空不限制），不在白名单的请求返回 403。</p>
       <table class="tbl" id="gwKeyTable">
-        <thead><tr><th>名称</th><th>密钥</th><th>状态</th><th>创建时间</th><th></th></tr></thead>
+        <thead><tr><th>名称</th><th>密钥</th><th>可用模型（逗号分隔，空=不限）</th><th>状态</th><th>创建时间</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
     </section>
@@ -265,7 +265,7 @@
             <span class="muted" style="font-size:12px">保存后立即生效（持久化，无需重启）。留空 = 使用环境变量默认值。</span>
           </div>
           <div class="settings-grid">
-            <label class="fld" title="上游返回 429 且无 Retry-After 头时的冷却时长；429 是唯一会冷却 key 的故障">429 冷却秒数
+            <label class="fld" title="上游返回 429 且无 Retry-After 头时的冷却时长（429 冷却独立于熔断：上游给了明确到期时间就按到期时间冷却）">429 冷却秒数
               <input id="setRateLimitCooldown" type="number" min="0" placeholder="默认 3600">
               <span class="hint">无 Retry-After 时（秒）</span>
             </label>
@@ -302,6 +302,45 @@
                 <option value="round_robin">顺序轮询（轮流均摊）</option>
               </select>
               <span class="hint">留空 = 使用环境变量默认值</span>
+            </label>
+          </div>
+          <div class="settings-head" style="margin-top:18px">
+            <h3>熔断（连续失败冷却）</h3>
+            <span class="muted" style="font-size:12px">网络/代理错误与上游 5xx 连续失败达阈值后按指数退避冷却该 key（成功即清零并解除冷却）；429 另有独立冷却逻辑。冷却中的 key 在「路由」页可见并可手动解除。</span>
+          </div>
+          <div class="settings-grid">
+            <label class="fld" title="关闭后：网络/代理错误与 5xx 只做故障转移，不冷却 key（429 冷却不受影响）">熔断开关
+              <select id="setBreakerEnabled">
+                <option value="">跟随环境变量默认（开）</option>
+                <option value="1">开启</option>
+                <option value="0">关闭</option>
+              </select>
+              <span class="hint">默认开启</span>
+            </label>
+            <label class="fld" title="同一 (key, 模型) 连续失败达到该次数即触发熔断冷却">连续失败阈值
+              <input id="setBreakerThreshold" type="number" min="1" placeholder="默认 3">
+              <span class="hint">次，默认 3</span>
+            </label>
+            <label class="fld" title="首次触发熔断时的冷却时长">基础冷却
+              <input id="setBreakerBase" type="number" min="1" placeholder="默认 30">
+              <span class="hint">秒，默认 30</span>
+            </label>
+            <label class="fld" title="冷却时长按「基础冷却 × 倍数^(触发次数-1)」指数增长，不超过该上限">最大冷却
+              <input id="setBreakerMax" type="number" min="1" placeholder="默认 900">
+              <span class="hint">秒，默认 900</span>
+            </label>
+            <label class="fld" title="每次触发熔断时冷却时长的增长倍数（>= 1）">冷却倍数
+              <input id="setBreakerMult" type="number" step="0.1" min="1" placeholder="默认 2">
+              <span class="hint">默认 2</span>
+            </label>
+          </div>
+          <div class="settings-head" style="margin-top:18px">
+            <h3>模型别名（名称处理）</h3>
+            <span class="muted" style="font-size:12px">下游请求名 → 规范模型名，每行一条「别名=规范名」；走路由与上游请求体（先按别名解析再匹配渠道模型列表，并按渠道的名称映射改写上游 model）。别名会出现在 /v1/models。</span>
+          </div>
+          <div class="settings-grid">
+            <label class="fld" style="grid-column:1/-1">模型别名（每行「别名=规范模型名」）
+              <textarea id="setModelAliases" rows="3" placeholder="my-gpt=gpt-4o&#10;deepseek-v4-flash=deepseek-v4.1-flash"></textarea>
             </label>
           </div>
           <p class="muted settings-now">
@@ -411,25 +450,42 @@
         <div></div>
       </div>
       <div class="grid2">
-        <label>启用模型列表（每行一个，用于 /v1/models 与路由过滤；留空不设限） <textarea id="chModels" rows="2" placeholder="deepseek/deepseek-v4-flash&#10;gpt-4o-mini"></textarea></label>
+        <label>启用模型列表（每行一个，用于 /v1/models 与路由过滤；留空不设限）
+          <textarea id="chModels" rows="3" placeholder="deepseek/deepseek-v4-flash&#10;gpt-4o-mini&#10;claude-*（通配）&#10;re:^gpt-4.*$（正则）"></textarea>
+        </label>
         <div>
-          <button id="fetchModelsBtn" class="btn" title="用本渠道的 key 请求上游模型列表，弹出候选清单勾选要启用的模型（带价格信息的上游会标出免费模型）">⤓ 从上游拉取模型列表</button>
-          <p class="muted" style="font-size:12px;margin:6px 0 0">拉取后从候选清单中勾选要启用的模型，点「确定」写入左侧列表；勾选结果需点「保存」写入配置。手工添加且不在候选中的模型会保留。</p>
+          <button id="fetchModelsBtn" class="btn" title="用本渠道的 key 请求上游模型列表，弹出候选清单勾选后「按勾选重建」左侧列表（上游已不返回的模型会被移除）">⤓ 从上游拉取模型列表</button>
+          <button id="fetchRebuildBtn" class="btn" style="margin-top:6px" title="拉取上游模型列表后立即以上游返回为准重建（全部启用并保存），上游已不存在的模型会被移除">⤓ 拉取并直接重建</button>
+          <p class="muted" style="font-size:12px;margin:6px 0 0" id="chModelsHint">
+            拉取后从候选清单勾选要启用的模型，点「按勾选重建」写入左侧列表；<b>未勾选与上游已不返回的模型都会从列表中移除</b>（需要保留手工补充项时勾选面板里的「保留上游未返回的旧模型」）。重建结果需点「保存」写入配置。
+          </p>
         </div>
+      </div>
+      <div class="grid2">
+        <label title="模型名映射：下游请求的模型名 → 该上游实际模型名，每行一条「下游名=上游名」，多个上游名用逗号分隔（如 deepseek-v4.1-flash=cn:deepseek-v4.1-flash,global:deepseek-v4.1-flash）。用于同一模型在不同上游的不同叫法，或上游把同一模型分成多个线路/区域变体：转发时按上游模型分别改写请求体的 model 字段，每个上游模型各自成为独立候选、各自冷却（互不牵连）。渠道映射优先于设置页的全局别名。未配置映射时按「启用模型列表」里的原文写法发送（上游 /models 的写法）。">模型名映射（每行「下游模型名=上游模型名」，多个上游名用逗号分隔，可选）
+          <textarea id="chModelMap" rows="3" placeholder="deepseek-v4-flash=deepseek/deepseek-v4-flash&#10;deepseek-v4.1-flash=cn:deepseek-v4.1-flash,global:deepseek-v4.1-flash"></textarea>
+        </label>
+        <p class="muted" style="font-size:12px;align-self:end;margin:0 0 10px">
+          映射的键（下游名）即该渠道「声明支持」的模型：无需再写进上面的模型列表，也会出现在 <code>/v1/models</code> 与路由页。
+          列表项支持精确名、通配（<code>claude-*</code> / <code>gpt-4?</code>）与正则（<code>re:^gpt-4.*$</code>）；
+          精确名按归一化比较（忽略大小写、供应商前缀与 <code>:free</code>/<code>-free</code> 等后缀），
+          即上游报 <code>cline-free/deepseek-v4.1-flash:free</code>、下游写 <code>deepseek-v4.1-flash</code> 也能命中并自动按上游写法发送。
+        </p>
       </div>
       <div id="chModelList" class="chips"></div>
       <div id="fetchPanel" class="fetch-panel hidden">
         <div class="fetch-panel-head">
-          <span class="muted" style="font-size:12px">候选模型（勾选启用，默认勾选当前已启用项）</span>
+          <span class="muted" style="font-size:12px">候选模型（默认全选 = 以上游为准；点「按勾选重建」后未勾选项与上游已不返回的旧模型都会从列表中移除）</span>
           <span class="spacer"></span>
           <button class="btn small" id="fetchAllBtn">全选</button>
           <button class="btn small" id="fetchNoneBtn">全不选</button>
         </div>
         <div id="fetchList" class="fetch-list"></div>
         <div class="row" style="margin-top:8px">
-          <span class="muted" style="font-size:12px">共 <span id="fetchCount">0</span> 个</span>
+          <span class="muted" style="font-size:12px">共 <span id="fetchCount">0</span> 个 <span id="fetchStale"></span></span>
+          <label class="inline" title="勾选后：本次拉取未返回、但当前列表里已有的模型（含手工补充项）会保留，不做重建清理"><input type="checkbox" id="fetchKeepMissing"> 保留上游未返回的旧模型</label>
           <span class="spacer"></span>
-          <button class="btn small" id="fetchApplyBtn">确定启用勾选项</button>
+          <button class="btn small" id="fetchApplyBtn">按勾选重建列表</button>
         </div>
       </div>
       <div class="row">
@@ -519,6 +575,25 @@
       <span class="spacer"></span>
       <button class="btn" data-close="poolModal">取消</button>
       <button class="btn primary" id="poolSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 清除冷却弹窗（渠道级：按模型清本渠道所有 key，或清空本渠道全部 key） -->
+<div id="coolClearModal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3 id="coolClearTitle">清除冷却</h3>
+      <button class="btn ghost" data-close="coolClearModal">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted" id="coolClearHint" style="font-size:12px;margin:0 0 8px"></p>
+      <div id="coolClearRows"></div>
+    </div>
+    <div class="modal-foot">
+      <span class="spacer"></span>
+      <button class="btn" data-close="coolClearModal">关闭</button>
+      <button class="btn danger" id="coolClearAllBtn" title="清除本渠道全部 key 的全部冷却（所有模型粒度）">清除全部（所有模型、所有 key）</button>
     </div>
   </div>
 </div>

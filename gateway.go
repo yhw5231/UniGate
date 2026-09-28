@@ -8,9 +8,19 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// gwKeyCtxKey 上下文键：鉴权通过后注入的下游 key（模型白名单校验用）。
+type gwKeyCtxKey struct{}
+
+// gwKeyFrom 取当前请求命中的下游 key（GW_KEY_AUTH=false 时为 nil）。
+func gwKeyFrom(ctx context.Context) *GWKey {
+	k, _ := ctx.Value(gwKeyCtxKey{}).(*GWKey)
+	return k
+}
 
 // handleGateway 路由下游请求（已通过 GW key 鉴权，user = "gw:" + keyID）。
 func handleGateway(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +42,22 @@ func handleGateway(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown gateway endpoint", "not_found")
 	}
+}
+
+// allowModelForGWKey 校验下游 key 的模型白名单（GWKey.Models，支持通配/正则；
+// 空 = 不限制）。别名解析后的模型名一并校验：白名单写规范名时，用别名调用同样放行。
+func allowModelForGWKey(w http.ResponseWriter, r *http.Request, model string) bool {
+	k := gwKeyFrom(r.Context())
+	if k == nil || model == "" {
+		return true
+	}
+	if gwKeyAllowsModel(k, model, resolveModelAlias(model)) {
+		return true
+	}
+	writeJSONError(w, http.StatusForbidden,
+		"model "+strconv.Quote(model)+" is not allowed for gateway key "+strconv.Quote(k.Name),
+		"model_not_allowed")
+	return false
 }
 
 func matchesPath(path string, candidates ...string) bool {
@@ -56,6 +82,9 @@ func gatewayChat(w http.ResponseWriter, r *http.Request) {
 	}
 	stream := isStreamRequest(rawBody)
 	model := extractModel(rawBody)
+	if !allowModelForGWKey(w, r, model) {
+		return
+	}
 
 	if rs := reqStatsFrom(r.Context()); rs != nil {
 		rs.model = model
@@ -86,6 +115,9 @@ func gatewayOther(w http.ResponseWriter, r *http.Request, suffix string) {
 	}
 	ct := r.Header.Get("Content-Type")
 	model := extractModelAny(rawBody, ct)
+	if !allowModelForGWKey(w, r, model) {
+		return
+	}
 	// multipart 的 boundary 必须保留：只透传 multipart 类型的原始 Content-Type，
 	// 普通 JSON 请求继续用网关默认的 application/json
 	upstreamCT := ""
@@ -120,13 +152,15 @@ type modelsEntry struct {
 
 // gatewayModels 聚合所有启用渠道的模型列表（去重）。
 // 渠道声明了模型列表（静态配置或拉取结果）时直接使用；否则尝试拉取其 models
-// 端点（失败不阻塞其它渠道）。
+// 端点（失败不阻塞其它渠道）。全局别名（设置页 model_aliases）作为可调用名一并
+// 暴露；下游 key 配置了模型白名单时只返回其允许的模型。
 func gatewayModels(w http.ResponseWriter, r *http.Request) {
 	snap := store.View() // 只读视图，零拷贝
+	gk := gwKeyFrom(r.Context())
 	seen := map[string]bool{}
 	var ids []string
 	addModel := func(id string) {
-		if id == "" || seen[id] {
+		if id == "" || seen[id] || !gwKeyAllowsModel(gk, id, resolveModelAlias(id)) {
 			return
 		}
 		seen[id] = true
@@ -144,6 +178,10 @@ func gatewayModels(w http.ResponseWriter, r *http.Request) {
 	for _, ch := range snap.Channels {
 		if !ch.Enabled {
 			continue
+		}
+		// 模型映射的键（下游模型名）也是该渠道的可调用名，一并暴露
+		for _, m := range ch.modelMapKeys() {
+			addModel(m)
 		}
 		if len(ch.Models) > 0 {
 			for _, m := range ch.Models {
@@ -182,6 +220,11 @@ func gatewayModels(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
+	}
+
+	// 全局别名：以别名调用同样合法（路由时解析为规范模型名），一并暴露
+	for alias := range currentPolicy().ModelAliases {
+		addModel(alias)
 	}
 
 	list := modelsList{Object: "list"}
@@ -246,21 +289,22 @@ func fetchChannelModels(ctx context.Context, url string, headers map[string]stri
 // ---- 下游鉴权 ----
 
 // authorizeGW 校验下游请求的 Bearer key（gw keys）。
-// GW_KEY_AUTH=false 时跳过校验（内网使用）。返回 (keyName, ok)。
-func authorizeGW(w http.ResponseWriter, r *http.Request) (string, bool) {
+// GW_KEY_AUTH=false 时跳过校验（内网使用）。返回 (命中的 key, keyName, ok)，
+// 未鉴权模式下 key 为 nil。
+func authorizeGW(w http.ResponseWriter, r *http.Request) (*GWKey, string, bool) {
 	if !cfg.GWKeyAuth {
-		return "", true
+		return nil, "", true
 	}
 	token := bearerToken(r)
 	if token == "" {
 		writeJSONError(w, http.StatusUnauthorized, "missing gateway key", "unauthorized")
-		return "", false
+		return nil, "", false
 	}
 	for _, k := range store.View().GWKeys { // 只读视图（热路径，零拷贝）
 		if k.Enabled && k.Key == token {
-			return k.Name, true
+			return k, k.Name, true
 		}
 	}
 	writeJSONError(w, http.StatusUnauthorized, "invalid gateway key", "unauthorized")
-	return "", false
+	return nil, "", false
 }

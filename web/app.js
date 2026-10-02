@@ -1710,7 +1710,9 @@ function applyFetchFilter() {
     : `共 ${labels.length} 个（已选 ${checked}）`;
 }
 $("#fetchSearch").addEventListener("input", applyFetchFilter);
-$("#fetchList").addEventListener("change", applyFetchFilter);
+// 勾选变化即时生效：候选勾选值就是发往上游的写法，勾上/取消直接写进启用模型列表与模型映射，
+// 不依赖下面的按钮（避免「勾选完忘了点重建/直接保存」导致勾选丢失）。
+$("#fetchList").addEventListener("change", () => { applyFetchSelection(true); applyFetchFilter(); });
 function visibleFetchBoxes() {
   return $$("#fetchList label").filter((l) => !l.classList.contains("hidden")).map((l) => l.querySelector("input"));
 }
@@ -1755,8 +1757,8 @@ $("#fetchModelsBtn").addEventListener("click", async () => {
     $("#fetchPanel").classList.remove("hidden");
     applyFetchFilter();
     toast(allChecked
-      ? `已拉取 ${fetched.length} 个模型（key: ${key}），已全选，点「按勾选重建列表」以上游为准重建`
-      : `已拉取 ${fetched.length} 个模型（key: ${key}），已勾选当前启用的 ${fetchedEnabled.size} 个，勾选需要的模型后点「按勾选重建列表」`);
+      ? `已拉取 ${fetched.length} 个模型（key: ${key}），候选已全选（列表留空=不设限，勾选后才会写进列表）；点「按勾选重建列表」以上游为准重建`
+      : `已拉取 ${fetched.length} 个模型（key: ${key}），已勾选当前生效的 ${fetchedEnabled.size} 个；勾选/取消即时写入左侧启用列表，点「按勾选重建列表」额外清理上游已不返回的旧模型`);
   } catch (e) {
     $("#channelErr").textContent = "拉取失败: " + e.message;
     toast("拉取失败: " + e.message, true);
@@ -1766,10 +1768,34 @@ $("#fetchModelsBtn").addEventListener("click", async () => {
   }
 });
 
-// 拉取并直接重建：一次点击以上游返回为准全量替换模型列表（与模型映射）并保存渠道
-//（上游现在返回什么就启用什么，旧模型全部移除），保存成功即关闭弹窗。
+// 拉取并直接重建：面板已打开（刚拉取过、可能已经勾选）时按**当前勾选**重建并保存，
+// 未勾选与上游已不返回的旧模型都会移除；面板没打开时先拉取，再以上游返回的全部模型
+// 全量替换并保存（上游现在返回什么就启用什么）。保存成功即关闭弹窗。
 $("#fetchRebuildBtn").addEventListener("click", async () => {
   const btn = $("#fetchRebuildBtn");
+  const panelOpen = !$("#fetchPanel").classList.contains("hidden");
+  if (panelOpen) { // 面板里的勾选就是用户的选择：直接按勾选重建并保存
+    const keepMissing = $("#fetchKeepMissing").checked;
+    const r = applyFetchSelection(keepMissing);
+    $("#fetchPanel").classList.add("hidden");
+    if (!r.ids.length && !r.manual.length) {
+      toast("没有勾选任何上游模型：启用列表已清空（留空=不设限），未保存——确认无误请点「保存」", true);
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "保存中…";
+    try {
+      await saveChannel();
+      toast(`已按勾选重建并保存：${r.chosen.length} 个上游模型 / ${r.ids.length} 个对外名`);
+    } catch (e) {
+      $("#channelErr").textContent = "保存失败: " + e.message;
+      toast("保存失败: " + e.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "⤓ 拉取并直接重建";
+    }
+    return;
+  }
   if (!confirm("以上游返回的模型列表为准重建？当前列表中上游已不存在的模型（及其映射）会被移除。")) return;
   btn.disabled = true;
   btn.textContent = "拉取中…";
@@ -1794,30 +1820,32 @@ $("#fetchRebuildBtn").addEventListener("click", async () => {
   }
 });
 
-$("#fetchAllBtn").addEventListener("click", () => { visibleFetchBoxes().forEach(fetchSetCheckbox); applyFetchFilter(); });
-$("#fetchNoneBtn").addEventListener("click", () => { visibleFetchBoxes().forEach(fetchClearCheckbox); applyFetchFilter(); });
+$("#fetchAllBtn").addEventListener("click", () => { visibleFetchBoxes().forEach(fetchSetCheckbox); applyFetchSelection(true); applyFetchFilter(); });
+$("#fetchNoneBtn").addEventListener("click", () => { visibleFetchBoxes().forEach(fetchClearCheckbox); applyFetchSelection(true); applyFetchFilter(); });
 
-// 按勾选重建：勾选的上游模型 = 新列表的候选；未勾选的候选与上游已不返回的旧模型
-// 都被移除。勾选「保留上游未返回的旧模型」时，旧列表中既不是本次候选、对外名也不在
-// 候选里的项（手工补充项）被保留并追加在末尾。模型映射同步：勾选项按「对外名 →
-// 勾选的上游写法（多个则按顺序各成一个候选）」重建，手工项的映射保留，列表里已没有
-// 的映射键删除。
-$("#fetchApplyBtn").addEventListener("click", () => {
-  const chosen = $$("#fetchList input[type=checkbox]:checked").map((c) => c.value);
+// fetchSelection 面板里当前勾选的上游写法（勾选值就是发往上游的模型名）。
+function fetchSelection() {
+  return $$("#fetchList input[type=checkbox]:checked").map((c) => c.value);
+}
+
+// applyFetchSelection 把勾选结果写进启用模型列表与模型映射，勾选即生效：
+// 勾选的每个上游写法都是一个候选（同一对外名的多个写法各一条，请求按顺序故障转移、
+// 冷却各自独立），对外名去重后进列表；取消勾选即从列表/映射里去掉该写法。
+// keepStale=true（勾选过程中）时，不在候选里的旧项（上游已不返回的旧模型、手工补充项）
+// 原样保留、映射不动；keepStale=false（按勾选重建）时它们按「重建」语义清理掉。
+// 返回本次结果供提示文案使用。
+function applyFetchSelection(keepStale) {
+  const chosen = fetchSelection();
   const candSet = new Set(fetchedCandidates);
   const candIDs = new Set(fetchedCandidates.map(exposedModelName));
-  const keepMissing = $("#fetchKeepMissing").checked;
-  const dropped = fetchedCandidates.length - chosen.length;
   const current = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  const manual = keepMissing
-    ? current.filter((m) => !candSet.has(m) && !candIDs.has(exposedModelName(m)))
-    : [];
+  const manual = current.filter((m) => !candSet.has(m) && !candIDs.has(exposedModelName(m)));
   const derived = deriveDeclaration(chosen);
-  const models = [...new Set([...derived.models, ...manual])];
+  const models = [...new Set([...derived.models, ...(keepStale ? manual : [])])];
   const keep = new Set(models.map(modelIdentity));
   const oldMap = textToModelMap($("#chModelMap").value) || {};
   const map = {};
-  for (const k of Object.keys(oldMap)) { // 手工补充项的映射保留，其余按勾选重建
+  for (const k of Object.keys(oldMap)) { // 未勾选/手工项的映射原样保留，其余按勾选重建
     if (keep.has(modelIdentity(k)) && !derived.map[modelIdentity(k)]) map[k] = oldMap[k];
   }
   for (const id of Object.keys(derived.map)) map[id] = derived.map[id];
@@ -1826,10 +1854,18 @@ $("#fetchApplyBtn").addEventListener("click", () => {
   syncModelMapHint();
   freeModelSet = new Set([...new Set(fetchedFreeSet)].map(exposedModelName).filter((m) => models.includes(m)));
   renderModelChips();
+  return { chosen, ids: derived.models, manual, dropped: fetchedCandidates.length - chosen.length };
+}
+
+// 按勾选重建列表：以勾选结果重建启用模型列表与模型映射（未勾选的候选、上游已不再返回的
+// 旧模型都会被移除；勾选「保留上游未返回的旧模型」时手工补充项保留）。
+$("#fetchApplyBtn").addEventListener("click", () => {
+  const keepMissing = $("#fetchKeepMissing").checked;
+  const r = applyFetchSelection(keepMissing);
   $("#fetchPanel").classList.add("hidden");
-  const removed = dropped + (keepMissing ? 0 : fetchedStale.length);
-  toast(`已重建列表：勾选 ${chosen.length} 个上游模型 / ${derived.models.length} 个对外名`
-    + `${removed ? `，移除 ${removed} 个` : ""}${manual.length ? `，保留手工项 ${manual.length} 个` : ""}，请点「保存」写入配置`);
+  const removed = r.dropped + (keepMissing ? 0 : fetchedStale.length);
+  toast(`已重建列表：勾选 ${r.chosen.length} 个上游模型 / ${r.ids.length} 个对外名`
+    + `${removed ? `，移除 ${removed} 个` : ""}${keepMissing && r.manual.length ? `，保留手工项 ${r.manual.length} 个` : ""}，请点「保存」写入配置`);
 });
 
 // collectKeyForm 从单个 key 块读取配置（不做校验）。

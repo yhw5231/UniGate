@@ -456,15 +456,16 @@
           <textarea id="chModels" rows="3" placeholder="deepseek-v4.1-flash&#10;gpt-4o-mini&#10;claude-*（通配）&#10;re:^gpt-4.*$（正则）"></textarea>
         </label>
         <div>
-          <button id="fetchModelsBtn" class="btn" title="用本渠道的 key 请求上游模型列表（以弹窗里当前填写的内容为准，无需先保存）：候选按上游模型逐个列出（每个写法一条，可分别勾选），已生效的预勾选，勾选后「按勾选重建」写入左侧列表与模型映射（上游已不返回的模型会被移除）">⤓ 从上游拉取模型列表</button>
-          <button id="fetchRebuildBtn" class="btn" style="margin-top:6px" title="拉取上游模型列表后立即以上游返回为准重建（全部启用并保存），上游已不存在的模型（及其映射）会被移除">⤓ 拉取并直接重建</button>
+          <button id="fetchModelsBtn" class="btn" title="用本渠道的 key 请求上游模型列表（以弹窗里当前填写的内容为准，无需先保存）：候选按上游模型逐个列出（每个写法一条，可分别勾选），已生效的预勾选；勾选/取消即时写入左侧启用列表与模型映射（勾完直接保存即可），点「按勾选重建列表」额外清理上游已不返回的旧模型">⤓ 从上游拉取模型列表</button>
+          <button id="fetchRebuildBtn" class="btn" style="margin-top:6px" title="面板已打开（刚拉取过）时：按当前勾选重建并保存；面板未打开时：拉取上游模型列表，以上游返回的全部模型全量替换并保存（上游已不存在的模型及其映射会被移除）">⤓ 拉取并直接重建</button>
           <p class="muted" style="font-size:12px;margin:6px 0 0" id="chModelsHint">
             拉取用的 key / Base URL / 代理都取上方当前填写内容（新建渠道也可以直接拉取，不必先保存）；
-            拉取后从候选清单勾选要启用的上游模型，点「按勾选重建」写入左侧列表；
+            拉取后从候选清单勾选要启用的上游模型——<b>勾选即写入左侧列表</b>，勾完直接「保存」即可；
             <b>列表里存的是对外名</b>（小写、去供应商前缀与 <code>:free</code>/<code>-free</code> 后缀，同一模型只暴露一个名字），
             上游写法自动写进下面的模型映射，发往上游时仍用它自己的名字——
             <b>同一对外名在上游的多个写法各是一个候选，请求按顺序故障转移、冷却各自独立</b>；
-            <b>未勾选与上游已不返回的模型都会从列表中移除</b>（需要保留手工补充项时勾选面板里的「保留上游未返回的旧模型」）。重建结果需点「保存」写入配置。
+            「按勾选重建列表」会在写入的同时把未勾选项与上游已不返回的旧模型一并清理
+            （需要保留手工补充项时勾选面板里的「保留上游未返回的旧模型」）。
           </p>
         </div>
       </div>
@@ -485,7 +486,7 @@
       <div id="chModelList" class="chips"></div>
       <div id="fetchPanel" class="fetch-panel hidden">
         <div class="fetch-panel-head">
-          <span class="muted" style="font-size:12px">候选模型（<b>每个上游模型一行</b>，勾选值就是发往上游的名字；同一对外名在上游的多个写法分别勾选、分别成为转发候选与独立冷却，默认勾选当前已生效的；点「按勾选重建」后未勾选项与上游已不返回的旧模型都会从列表中移除）</span>
+          <span class="muted" style="font-size:12px">候选模型（<b>每个上游模型一行</b>，勾选值就是发往上游的名字；同一对外名在上游的多个写法分别勾选、分别成为转发候选与独立冷却，默认勾选当前已生效的）——<b>勾选/取消即时写入左侧启用模型列表与模型映射</b>，勾完直接点「保存」即可；点「按勾选重建列表」额外把未勾选项与上游已不返回的旧模型从列表中清理掉）</span>
           <span class="spacer"></span>
           <button class="btn small" id="fetchAllBtn" title="全选当前筛选结果">全选</button>
           <button class="btn small" id="fetchNoneBtn" title="全不选当前筛选结果">全不选</button>
@@ -497,9 +498,9 @@
         <div id="fetchList" class="fetch-list"></div>
         <div class="row" style="margin-top:8px">
           <span class="muted" style="font-size:12px">共 <span id="fetchCount">0</span> 个 <span id="fetchStale"></span></span>
-          <label class="inline" title="勾选后：本次拉取未返回、但当前列表里已有的模型（含手工补充项）会保留，不做重建清理"><input type="checkbox" id="fetchKeepMissing"> 保留上游未返回的旧模型</label>
+          <label class="inline" title="勾选后：本次拉取未返回、但当前列表里已有的模型（含手工补充项）会保留，不做重建清理（勾选过程中这些旧项始终保留）"><input type="checkbox" id="fetchKeepMissing"> 保留上游未返回的旧模型</label>
           <span class="spacer"></span>
-          <button class="btn small" id="fetchApplyBtn">按勾选重建列表</button>
+          <button class="btn small" id="fetchApplyBtn" title="以勾选结果重建启用模型列表与模型映射：未勾选的候选、上游已不返回的旧模型（及其映射）都会被移除；勾选「保留上游未返回的旧模型」时手工补充项保留。只勾选不点它也行——勾选已即时写入列表，直接「保存」即可">按勾选重建列表</button>
         </div>
       </div>
       <div class="opt-row">

@@ -198,7 +198,7 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 .key-line { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
 .key-line .pname { color: var(--muted); font-size: 12px; }
 
-/* 路由页：按模型分组展示候选 key */
+/* 路由页：模型 → 渠道（优先级/权限）→ 映射的真实上游模型名 → key 的分层展示 */
 .route-list { display: flex; flex-direction: column; gap: 10px; }
 .route-model {
   background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
@@ -206,13 +206,35 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 }
 .route-model-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .rk-model { font-weight: 700; font-size: 14px; word-break: break-all; }
-.route-keys { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.route-keys { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+/* 渠道节点：左侧竖线形成层级感 */
+.route-ch {
+  border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 8px; background: var(--panel2); padding: 6px 10px 8px;
+}
+.route-ch.off { border-left-color: var(--err); opacity: .7; }
+.route-ch-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; cursor: pointer; }
+.route-ch-head .rc-name { font-weight: 600; font-size: 13px; }
+.route-ch-head .muted { font-size: 12px; }
+.route-ch-body { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+/* 上游模型节点：映射后的真实模型名 */
+.route-up { padding-left: 10px; border-left: 2px dotted var(--border); }
+.route-up-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.route-up-head .ru-arrow { color: var(--muted); }
+.route-up-head .ru-name {
+  font-family: ui-monospace, Consolas, monospace; font-size: 13px; word-break: break-all;
+}
+.route-up-head .muted { font-size: 12px; }
+.route-up-keys { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 2px 18px; }
 .route-key {
   display: inline-flex; align-items: center; gap: 8px;
-  background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
   padding: 4px 10px; font-size: 13px;
 }
 .route-key .rk-name { font-weight: 600; }
+.route-key .rk-idx {
+  color: var(--muted); font-size: 11px; font-family: ui-monospace, Consolas, monospace;
+}
 .route-key.disabled { opacity: .55; }
 
 /* 设置页：紧凑双列布局 */
@@ -275,15 +297,18 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 }
 .mp-row:hover { background: var(--border); }
 .mp-row input[type="checkbox"] { flex: none; }
+/* 对外名占满剩余宽度（模型名普遍较长，窄列会把名字截断）；过长时换行而不是截断，
+   上游模型名一列可压缩 */
 .mp-name {
-  flex: 1; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  font-family: ui-monospace, Consolas, monospace;
+  flex: 1 1 340px; min-width: 240px; font-family: ui-monospace, Consolas, monospace;
+  white-space: normal; overflow-wrap: anywhere;
 }
 .mp-name .badge { margin-left: 6px; }
 .mp-target {
-  flex: none; width: 260px; font-size: 12px;
+  flex: 0 1 320px; width: 320px; min-width: 200px; font-size: 12px;
   font-family: ui-monospace, Consolas, monospace;
 }
+@media (max-width: 1100px) { .mp-target { flex-basis: 240px; width: 240px; } }
 @media (max-width: 800px) {
   .mp-row { flex-wrap: wrap; }
   .mp-name, .mp-target { flex: 1 1 100%; width: auto; }

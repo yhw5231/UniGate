@@ -1411,6 +1411,7 @@ func TestRoundRobinFollowsGlobalDefault(t *testing.T) {
 func TestRouteStatusData(t *testing.T) {
 	setupGateway(t)
 	mustPutChannel(t, &Channel{Name: "a", BaseURL: "http://up-a", Enabled: true, CooldownScope: cooldownScopeKeyModel,
+		Priority: 7, Weight: 2, Group: "海外",
 		Models: []string{"m1", "m2"},
 		Keys: []*UpKey{
 			{Name: "a1", APIKey: "sk-1", Enabled: true},
@@ -1472,6 +1473,16 @@ func TestRouteStatusData(t *testing.T) {
 	// 已禁用的 key 仍然列出（渠道内的停用 key 是可核对的配置），只是状态为停用
 	if statusOf(m1, a2) != routeStatusDisabled {
 		t.Fatal("disabled key must be marked disabled")
+	}
+	// 每行冗余带上渠道级信息，供路由页按「模型 → 渠道（优先级/权限）→ 上游模型 → key」分层展示
+	var first RouteKeyStatus
+	for _, k := range m1.Keys {
+		if k.KeyID == a1 {
+			first = k
+		}
+	}
+	if first.ChannelPriority != 7 || first.ChannelWeight != 2 || first.ChannelGroup != "海外" || !first.ChannelOn {
+		t.Fatalf("route row must carry channel info: %+v", first)
 	}
 	if m2.Keys[0].Channel != "a" || m2.Keys[0].Key != "a1" {
 		t.Fatalf("candidate order must follow config order, got %+v", m2.Keys[0])

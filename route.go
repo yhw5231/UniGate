@@ -879,19 +879,26 @@ const (
 // RouteKeyStatus 路由视图中单个 (渠道, key) 候选的状态。一个渠道映射把下游模型
 // 映射到多个上游模型时，同一 (渠道, key) 会展开为多行，各自带 upstream_model
 // 与独立的冷却状态（cool_model 为该行冷却键的 model 部分，解除冷却时用它）。
+//
+// 行内还冗余带上渠道级信息（优先级/权重/分组/渠道生效调度），供 WebUI 按
+//「模型 → 渠道 → 上游模型 → key」分层展示：同一渠道的多个候选行分组到渠道节点下，
+// 渠道节点显示优先级与启用状态（权限），上游模型节点显示映射出的真实模型名。
 type RouteKeyStatus struct {
-	ChannelID string `json:"channel_id"`
-	Channel   string `json:"channel"`
-	ChannelOn bool   `json:"channel_enabled"`
-	KeyID     string `json:"key_id"`
-	Key       string `json:"key"`
-	KeyOn     bool   `json:"key_enabled"`
-	Schedule  string `json:"schedule"`                 // 渠道生效的账号调度模式
-	Upstream  string `json:"upstream_model,omitempty"` // 该候选实际发往上游的模型名（映射行一律展示，含与分组名同名的写法）
-	CoolModel string `json:"cool_model,omitempty"`     // 冷却键的 model 部分（解除该行冷却时用）
-	Status    string `json:"status"`                   // ok / cooling / disabled
-	Until     int64  `json:"until_unix,omitempty"`
-	LeftMS    int64  `json:"left_ms,omitempty"`
+	ChannelID       string `json:"channel_id"`
+	Channel         string `json:"channel"`
+	ChannelOn       bool   `json:"channel_enabled"`
+	ChannelPriority int    `json:"channel_priority"`           // 渠道优先级（越小越靠前）
+	ChannelWeight   int    `json:"channel_weight,omitempty"`   // 渠道权重（同优先级内加权轮询）
+	ChannelGroup    string `json:"channel_group,omitempty"`    // 渠道分组（WebUI 归类用）
+	KeyID           string `json:"key_id"`
+	Key             string `json:"key"`
+	KeyOn           bool   `json:"key_enabled"`
+	Schedule        string `json:"schedule"`                 // 渠道生效的账号调度模式
+	Upstream        string `json:"upstream_model,omitempty"` // 该候选实际发往上游的模型名（映射行一律展示，含与分组名同名的写法）
+	CoolModel       string `json:"cool_model,omitempty"`     // 冷却键的 model 部分（解除该行冷却时用）
+	Status          string `json:"status"`                   // ok / cooling / disabled
+	Until           int64  `json:"until_unix,omitempty"`
+	LeftMS          int64  `json:"left_ms,omitempty"`
 }
 
 // RouteModelGroup 按模型聚合的路由视图。
@@ -996,14 +1003,17 @@ func routeStatusData(model string) *RouteStatusData {
 			for _, k := range ch.Keys {
 				for _, row := range rows {
 					st := RouteKeyStatus{
-						ChannelID: ch.ID,
-						Channel:   ch.Name,
-						ChannelOn: ch.Enabled,
-						KeyID:     k.ID,
-						Key:       k.Name,
-						KeyOn:     k.Enabled,
-						Schedule:  ch.effectiveSchedule(def),
-						CoolModel: row.cool,
+						ChannelID:       ch.ID,
+						Channel:         ch.Name,
+						ChannelOn:       ch.Enabled,
+						ChannelPriority: ch.Priority,
+						ChannelWeight:   ch.Weight,
+						ChannelGroup:    ch.Group,
+						KeyID:           k.ID,
+						Key:             k.Name,
+						KeyOn:           k.Enabled,
+						Schedule:        ch.effectiveSchedule(def),
+						CoolModel:       row.cool,
 					}
 					if row.upstream != "" && (row.mapped || row.upstream != g.Model) {
 						st.Upstream = row.upstream // 映射行即使与分组名相同也标注（多候选可核对）

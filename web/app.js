@@ -271,6 +271,11 @@ $("#acctSavePassBtn").addEventListener("click", async () => {
 let routeState = null;
 // routeOpen 记录「已展开」的模型分组（Set）；未在集合内的分组默认收起。
 let routeOpen = new Set();
+// routeClosedCh 记录「已收起」的渠道节点（键为 模型 + 渠道 ID）：模型展开后渠道
+// 默认也展开（一次点开就能看全「渠道 → 上游模型 → key」三层），可单独收起某个渠道。
+let routeClosedCh = new Set();
+function routeChannelKey(model, chID) { return `${model}\u0000${chID}`; }
+function routeChannelOpen(model, chID) { return !routeClosedCh.has(routeChannelKey(model, chID)); }
 
 // refreshRoute 拉取路由视图并重绘。quiet=true（轮询）时失败静默，
 // 避免后台定时器每 5s 弹一次错误条。
@@ -334,43 +339,82 @@ function renderRoute() {
     if (routeOpen.has(m)) routeOpen.delete(m); else routeOpen.add(m);
     renderRoute();
   }));
+  // 点击渠道头（按钮除外）单独展开/收起该渠道的「上游模型 → key」明细
+  el.querySelectorAll('.route-ch-head[data-act="togglech"]').forEach((h) => h.addEventListener("click", (e) => {
+    if (e.target.closest("button")) return;
+    const m = h.closest(".route-model").dataset.model;
+    const key = routeChannelKey(m, h.dataset.channel);
+    if (routeClosedCh.has(key)) routeClosedCh.delete(key); else routeClosedCh.add(key);
+    renderRoute();
+  }));
 }
 
-// routeModelHTML 单个模型分组的候选行。候选顺序 = 网关实际转发顺序
-//（渠道配置序 + key 配置序），可直接当作「下一个请求会用谁」的预览。
-// 分组头点击展开/收起候选明细（默认收起，只头部展示可用/冷却概况）。
+// routeModelHTML 单个模型分组的候选树：模型 → 渠道（优先级/权限/调度）→ 映射出的
+// 真实上游模型名 → key。叶子顺序 = 网关实际转发顺序（渠道配置序 + key 配置序），
+// 可直接当作「下一个请求会用谁」的预览。模型头与渠道头都可点击展开/收起
+//（默认收起，只头部展示可用/冷却概况）。
 function routeModelHTML(g, showOff) {
   const keys = (g.keys || []).filter((k) => showOff || k.status !== "disabled");
   const open = routeOpen.has(g.model);
-  const rows = keys.map((k) => {
-    let badge, extra = "";
-    // 一个下游模型映射到多个上游模型时，同一 key 会展开为多行：标注该行实际
-    // 发往上游的模型名；解除冷却按该行自己的冷却键（cool_model）精确解除。
-    const up = k.upstream_model
-      ? `<span class="badge info" title="该候选实际发往上游的模型名（渠道名称映射的结果）">上游 ${esc(k.upstream_model)}</span>`
-      : "";
-    if (k.status === "ok") {
-      badge = '<span class="badge on">可用</span>';
-    } else if (k.status === "cooling") {
-      const left = k.left_ms > 0 ? Math.round(k.left_ms / 1000) : 0;
-      badge = `<span class="badge warn" title="冷却到期后自动恢复；点「解除」立即恢复">冷却中 · 剩 ${fmtLeft(left)}</span>`;
-      // cool_model 非空 = 按 (key, 模型) 粒度的冷却，精确解除该条；为空 =
-      // 渠道按 key 跨模型共享的冷却（含映射候选之外的默认粒度），整条解除
-      extra = k.cool_model
-        ? `<button class="btn small" data-act="clearcoolmodel" data-key="${esc(k.key_id)}" data-model="${esc(k.cool_model)}" title="只解除该 (key, 模型) 的冷却">解除</button>`
-        : `<button class="btn small" data-act="clearcoolkey" data-key="${esc(k.key_id)}" data-channel="${esc(k.channel_id)}" title="解除该 key 的跨模型共享冷却">解除</button>`;
-    } else {
-      badge = `<span class="badge off">${k.channel_enabled ? "key 停用" : "渠道停用"}</span>`;
+  // 网关实际尝试顺序（扁平列表下标 +1）：分层展示后仍能看出「下一个请求会用谁」
+  const order = new Map(keys.map((k, i) => [k, i + 1]));
+
+  // 按渠道分组（保持首次出现顺序 = 转发顺序），渠道内再按上游模型分组
+  const chOrder = [];
+  const chMap = new Map();
+  for (const k of keys) {
+    let ch = chMap.get(k.channel_id);
+    if (!ch) {
+      ch = {
+        id: k.channel_id, name: k.channel, enabled: k.channel_enabled,
+        priority: k.channel_priority || 0, weight: k.channel_weight || 0,
+        group: k.channel_group || "", schedule: k.schedule,
+        total: 0, available: 0, cooling: 0,
+        upOrder: [], upMap: new Map(),
+      };
+      chMap.set(k.channel_id, ch);
+      chOrder.push(ch);
     }
-    return `<div class="route-key ${k.status}">
-      ${badge}
-      <span class="rk-name">${esc(k.key || "(未命名)")}</span>
-      <span class="muted">@ ${esc(k.channel)}</span>
-      ${up}
-      ${k.schedule === "round_robin" ? '<span class="badge info" title="该渠道为顺序轮询调度">轮询</span>' : ""}
-      ${extra}
+    ch.total++;
+    if (k.status === "ok") ch.available++;
+    if (k.status === "cooling") ch.cooling++;
+    const upName = k.upstream_model || g.model;
+    let up = ch.upMap.get(upName);
+    if (!up) { up = { name: upName, mapped: !!k.upstream_model, rows: [] }; ch.upMap.set(upName, up); ch.upOrder.push(up); }
+    up.rows.push(k);
+  }
+
+  const channels = chOrder.map((ch) => {
+    const chOpen = routeChannelOpen(g.model, ch.id);
+    const upNodes = ch.upOrder.map((up) => {
+      const upChanged = up.mapped && up.name !== g.model;
+      const rows = up.rows.map((k) => routeKeyRowHTML(k, order.get(k))).join("");
+      return `<div class="route-up">
+        <div class="route-up-head">
+          <span class="ru-arrow">↳</span>
+          <span class="ru-name" title="${esc(up.mapped ? "渠道名称映射后实际发往上游的模型名" : "该渠道直接用这个名字发往上游")}">${esc(up.name)}</span>
+          ${up.mapped ? `<span class="badge info" title="渠道名称映射：下游调用 ${esc(g.model)} → 上游收到 ${esc(up.name)}">映射</span>` : '<span class="badge src" title="未配置映射，直接用该名字发往上游">直发</span>'}
+          ${upChanged ? `<span class="badge group" title="与对外名不同：该候选在上游是另一个模型">改名</span>` : ""}
+          <span class="muted">${up.rows.filter((r) => r.status === "ok").length}/${up.rows.length} 可用</span>
+        </div>
+        <div class="route-up-keys">${rows}</div>
+      </div>`;
+    }).join("");
+    return `<div class="route-ch${ch.enabled ? "" : " off"}">
+      <div class="route-ch-head" data-act="togglech" data-channel="${esc(ch.id)}" title="点击展开/收起该渠道的候选">
+        <span class="chev">${chOpen ? "▾" : "▸"}</span>
+        <span class="rc-name">${esc(ch.name || "(未命名渠道)")}</span>
+        ${ch.group ? `<span class="badge src">${esc(ch.group)}</span>` : ""}
+        <span class="badge info" title="渠道优先级：数值越小越先被路由（同优先级保持配置顺序）">优先级 ${ch.priority}</span>
+        ${ch.weight > 0 ? `<span class="badge info" title="渠道权重：同优先级内按权重比例轮流分配请求">权重 ${ch.weight}</span>` : ""}
+        <span class="badge ${ch.enabled ? "on" : "off"}" title="${ch.enabled ? "渠道已启用：参与路由" : "渠道已停用：整体不参与路由"}">${ch.enabled ? "启用" : "停用"}</span>
+        <span class="badge info" title="账号调度模式：failover = 按 key 顺序用满才换；round_robin = 轮流分配">${ch.schedule === "round_robin" ? "顺序轮询" : "故障转移"}</span>
+        <span class="muted">可用 ${ch.available}${ch.cooling ? ` · 冷却 ${ch.cooling}` : ""} · key ${ch.total}</span>
+      </div>
+      <div class="route-ch-body${chOpen ? "" : " hidden"}">${upNodes}</div>
     </div>`;
   }).join("");
+
   const zero = g.available === 0 ? '<span class="badge off" title="该模型当前没有可路由的 key，请求会失败（全部冷却时网关会穿透最早到期的候选试探）">无可用 key</span>' : "";
   return `<div class="route-model ${open ? "open" : ""}" data-model="${esc(g.model)}">
     <div class="route-model-head" data-act="toggle" title="点击展开/收起该模型的候选明细">
@@ -379,10 +423,36 @@ function routeModelHTML(g, showOff) {
       ${zero}
       <span class="badge on">可用 ${g.available}</span>
       ${g.cooling ? `<span class="badge warn">冷却 ${g.cooling}</span>` : ""}
-      <span class="muted">候选 ${g.total}</span>
+      <span class="muted">候选 ${g.total} · 渠道 ${chOrder.length}</span>
       ${g.cooling ? `<button class="btn small" data-act="clearcoolgroup" data-model="${esc(g.model)}" title="清除该模型在全部渠道、全部 key 上的冷却（按分组名解析，含渠道映射出的每个上游模型）">清除冷却</button>` : ""}
     </div>
-    ${open ? `<div class="route-keys">${rows ? rows : '<div class="key-line muted">该模型没有候选渠道/key（渠道未启用或模型未声明）</div>'}</div>` : ""}
+    ${open ? `<div class="route-keys">${channels || '<div class="key-line muted">该模型没有候选渠道/key（渠道未启用或模型未声明）</div>'}</div>` : ""}
+  </div>`;
+}
+
+// routeKeyRowHTML 叶子行：一个 key 在一个上游模型下的状态（可用 / 冷却中 / 停用）。
+// idx = 该候选在网关实际尝试顺序里的序号（分层展示后仍能看出转发先后）。
+function routeKeyRowHTML(k, idx) {
+  let badge, extra = "";
+  if (k.status === "ok") {
+    badge = '<span class="badge on">可用</span>';
+  } else if (k.status === "cooling") {
+    const left = k.left_ms > 0 ? Math.round(k.left_ms / 1000) : 0;
+    badge = `<span class="badge warn" title="冷却到期后自动恢复；点「解除」立即恢复">冷却中 · 剩 ${fmtLeft(left)}</span>`;
+    // cool_model 非空 = 按 (key, 模型) 粒度的冷却，精确解除该条；为空 =
+    // 渠道按 key 跨模型共享的冷却（含映射候选之外的默认粒度），整条解除
+    extra = k.cool_model
+      ? `<button class="btn small" data-act="clearcoolmodel" data-key="${esc(k.key_id)}" data-model="${esc(k.cool_model)}" title="只解除该 (key, 模型) 的冷却">解除</button>`
+      : `<button class="btn small" data-act="clearcoolkey" data-key="${esc(k.key_id)}" data-channel="${esc(k.channel_id)}" title="解除该 key 的跨模型共享冷却">解除</button>`;
+  } else {
+    badge = `<span class="badge off">${k.channel_enabled ? "key 停用" : "渠道停用"}</span>`;
+  }
+  const seq = idx ? `<span class="rk-idx" title="网关实际尝试顺序中的第 ${idx} 个候选（按渠道优先级 + key 调度决定）">#${idx}</span>` : "";
+  return `<div class="route-key ${k.status}">
+    ${seq}
+    ${badge}
+    <span class="rk-name">${esc(k.key || "(未命名)")}</span>
+    ${extra}
   </div>`;
 }
 

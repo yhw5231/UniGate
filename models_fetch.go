@@ -84,10 +84,112 @@ func fetchModelsWithKey(ctx context.Context, cand *candidate) (models []string, 
 	return parseModelsPayload(body)
 }
 
+// modelCandidate 拉取到的一个候选：上游返回的**一个**模型（上游写法 Raw）及其
+// 对外名 Name（modelIdentity）。同一对外名在上游有多个写法时是**多条候选**，
+// 各自勾选、各自成为转发候选、各自独立冷却；对外只暴露一个 Name。
+type modelCandidate struct {
+	Name string `json:"name"` // 对外名（小写、去供应商前缀与变体后缀）
+	Raw  string `json:"raw"`  // 上游写法（发往上游的名字）
+	Free bool   `json:"free"`
+}
+
+// fetchedCandidates 把上游返回的模型列表转成候选（上游顺序，字面去重）：
+// 每个上游写法各占一条，便于 WebUI 逐个勾选——不按对外名合并，因为上游的
+// 不同写法是不同的上游模型（请求与冷却都分别计算），合并会让用户没法分别启用。
+func fetchedCandidates(models, free []string) []modelCandidate {
+	freeRaw := make(map[string]bool, len(free))
+	for _, f := range free {
+		if p := strings.TrimSpace(f); p != "" {
+			freeRaw[p] = true
+		}
+	}
+	var out []modelCandidate
+	seen := map[string]bool{}
+	for _, raw := range models {
+		p := strings.TrimSpace(raw)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, modelCandidate{Name: exposedModelName(p), Raw: p, Free: freeRaw[p]})
+	}
+	return out
+}
+
+// fetchedRawModels 候选的上游写法列表（WebUI 勾选值 = 上游模型名）。
+func fetchedRawModels(cands []modelCandidate) []string {
+	out := make([]string, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, c.Raw)
+	}
+	return out
+}
+
+// fetchedFreeModels 免费候选的上游写法（免费清单不落盘，仅随响应展示）。
+func fetchedFreeModels(cands []modelCandidate) []string {
+	var out []string
+	for _, c := range cands {
+		if c.Free {
+			out = append(out, c.Raw)
+		}
+	}
+	return out
+}
+
+// enabledUpstreamModels 本次拉取的候选里「当前已生效」的上游写法（WebUI 预勾选）：
+//   - 渠道未声明任何模型（含映射键）= 对全部模型放行：返回全部候选（全选）；
+//   - 否则取渠道当前真正会发往上游的名字（映射目标优先，其次声明列表的原写法）；
+//   - 声明了通配/正则的渠道：模式命中的候选也算已生效（与「全选 = 以上游为准」
+//     的默认一致，避免重建时静默丢掉通配覆盖的模型）。
+//
+// 返回顺序与 cands 一致，便于前端直接按下标/值取用。
+func enabledUpstreamModels(ch *Channel, cands []modelCandidate) []string {
+	if ch == nil || (len(ch.Models) == 0 && len(ch.ModelMap) == 0) {
+		return fetchedRawModels(cands)
+	}
+	live := map[string]bool{}
+	for _, m := range append(append([]string{}, ch.Models...), ch.modelMapKeys()...) {
+		p := strings.TrimSpace(m)
+		if p == "" || !modelPatternIsPlain(p) {
+			continue // 模式不是上游模型名
+		}
+		for _, up := range ch.upstreamModelsFor(p) {
+			live[up] = true
+		}
+	}
+	var out []string
+	for _, c := range cands {
+		if live[c.Raw] || ch.matchesDeclaredPattern(c.Raw) {
+			out = append(out, c.Raw)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// matchesDeclaredPattern 该模型名是否被渠道声明列表里的通配/正则模式覆盖。
+func (c *Channel) matchesDeclaredPattern(model string) bool {
+	if c == nil || strings.TrimSpace(model) == "" {
+		return false
+	}
+	for _, p := range c.Models {
+		p = strings.TrimSpace(p)
+		if p == "" || modelPatternIsPlain(p) {
+			continue
+		}
+		if modelMatchesPattern(model, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // modelsTarget 返回该候选的上游模型列表端点（key BaseURL 优先，覆盖渠道配置）。
 func (c *candidate) modelsTarget() string {
 	if u := c.k.BaseURL; u != "" {
-		base := trimSlash(u)
+		base := normalizeBaseURL(u)
 		if strings.HasSuffix(base, "/models") {
 			return base
 		}

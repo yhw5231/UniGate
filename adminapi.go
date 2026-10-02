@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -41,6 +42,7 @@ func adminAPIHandler() http.Handler {
 	mux.HandleFunc("POST /admin/api/channels/{id}/probe-upstreams", handleAdminProbeUpstreams)
 	mux.HandleFunc("POST /admin/api/channels/{id}/validate-upstreams", handleAdminValidateUpstreams)
 	mux.HandleFunc("POST /admin/api/channels/{id}/fetch-models", handleAdminFetchModels)
+	mux.HandleFunc("POST /admin/api/fetch-models", handleAdminFetchModelsInline)
 	mux.HandleFunc("GET /admin/api/requests", handleAdminRequests)
 	mux.HandleFunc("GET /admin/api/errors", handleAdminErrors)
 	mux.HandleFunc("POST /admin/api/logs/clear", handleAdminClearLogs)
@@ -370,7 +372,9 @@ func handleAdminPutModelUpstreamPin(w http.ResponseWriter, r *http.Request) {
 	if ch.ModelPins == nil {
 		ch.ModelPins = map[string]*ModelUpstreamPin{}
 	}
-	pin := ch.ModelPins[model]
+	// 复用等价的已有键（历史配置里可能存的是上游原写法），避免同一模型两条固定配置
+	key := pinKeyFor(ch, model)
+	pin := ch.ModelPins[key]
 	if pin == nil {
 		pin = &ModelUpstreamPin{}
 	}
@@ -385,9 +389,9 @@ func handleAdminPutModelUpstreamPin(w http.ResponseWriter, r *http.Request) {
 		pin.Sort = normalizeSortValue(body.Sort)
 	}
 	if pin.normalize() {
-		ch.ModelPins[model] = pin
+		ch.ModelPins[key] = pin
 	} else {
-		delete(ch.ModelPins, model)
+		delete(ch.ModelPins, key)
 	}
 	if err := store.PutChannel(ch); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
@@ -430,7 +434,7 @@ func handleAdminProbeUpstreams(w http.ResponseWriter, r *http.Request) {
 	if ch.ModelPins == nil {
 		ch.ModelPins = map[string]*ModelUpstreamPin{}
 	}
-	ch.ModelPins[model] = pin
+	ch.ModelPins[pinKeyFor(ch, model)] = pin
 	if err := store.PutChannel(ch); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "save channel: "+err.Error(), "internal")
 		return
@@ -718,13 +722,40 @@ func handleAdminDeleteGWKey(w http.ResponseWriter, r *http.Request) {
 // poolActionBody Admin 池操作的请求体。
 // 指定 lease_id 时直接操作本地代理池中的该租约；否则按 channel_id+key_id 定位。
 // pool_id 用于按代理池实体操作（测试连通性）；pool_url/pool_token 为旧格式直连参数。
+// proxy 用于「编辑器里尚未保存的 key」：直接带内联代理配置 + 客户端生成的 key_id
+// 操作（WebUI 新增/编辑渠道弹窗的「换IP / 释放租约」无需先保存）。
 type poolActionBody struct {
-	PoolID    string `json:"pool_id"`
-	PoolURL   string `json:"pool_url"`
-	PoolToken string `json:"pool_token"`
-	ChannelID string `json:"channel_id"`
-	KeyID     string `json:"key_id"`
-	LeaseID   string `json:"lease_id"`
+	PoolID    string     `json:"pool_id"`
+	PoolURL   string     `json:"pool_url"`
+	PoolToken string     `json:"pool_token"`
+	ChannelID string     `json:"channel_id"`
+	KeyID     string     `json:"key_id"`
+	LeaseID   string     `json:"lease_id"`
+	Proxy     *ProxySpec `json:"proxy"`
+	KeyName   string     `json:"key_name"`
+}
+
+// actionProxySpec 解析池操作的目标代理配置：请求体带内联 proxy 时直接用（编辑器
+// 当前内容，支持未保存的渠道/key），否则按 channel_id+key_id 从存储快照取生效代理。
+func actionProxySpec(body *poolActionBody) (spec *ProxySpec, keyName string, err error) {
+	if body.Proxy != nil {
+		if body.Proxy.Kind == "" {
+			return nil, "", errors.New("key has no proxy configured")
+		}
+		if strings.TrimSpace(body.KeyID) == "" {
+			return nil, "", errors.New("key id required for inline pool action")
+		}
+		name := strings.TrimSpace(body.KeyName)
+		if name == "" {
+			name = "（未保存）"
+		}
+		return body.Proxy, name, nil
+	}
+	spec, keyName, ok := findKeySpec(body.ChannelID, body.KeyID)
+	if !ok {
+		return nil, "", errors.New("key is not bound to an ipv6pool proxy")
+	}
+	return spec, keyName, nil
 }
 
 // handleAdminPoolTest 测试池子连通性（返回池状态）。支持 pool_id（新格式，
@@ -791,10 +822,9 @@ func handleAdminPoolRotate(w http.ResponseWriter, r *http.Request) {
 	} else {
 		var spec *ProxySpec
 		var keyName string
-		var ok bool
-		spec, keyName, ok = findKeySpec(body.ChannelID, body.KeyID)
-		if !ok {
-			writeJSONError(w, http.StatusBadRequest, "key is not bound to an ipv6pool proxy", "bad_request")
+		spec, keyName, err = actionProxySpec(&body)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
 			return
 		}
 		lease, err = leaseMgr.Rotate(ctx, spec, body.KeyID)
@@ -829,21 +859,19 @@ func handleAdminPoolRelease(w http.ResponseWriter, r *http.Request) {
 	} else {
 		var spec *ProxySpec
 		var keyName string
-		var ok bool
-		spec, keyName, ok = findKeySpec(body.ChannelID, body.KeyID)
-		if !ok {
-			writeJSONError(w, http.StatusBadRequest, "key is not bound to an ipv6pool proxy", "bad_request")
-			return
-		}
-		resolved, err := poolSpecReady(spec)
+		spec, keyName, err = actionProxySpec(&body)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
 			return
 		}
-		spec = resolved
-		leaseID := leaseMgr.leaseIDForKey(spec, body.KeyID)
-		err = leaseMgr.ReleaseLease(ctx, spec.PoolURL, leaseID)
-		desc = keyName + " lease " + leaseID + " @ " + spec.PoolURL
+		resolved, rerr := poolSpecReady(spec)
+		if rerr != nil {
+			writeJSONError(w, http.StatusBadRequest, rerr.Error(), "bad_request")
+			return
+		}
+		leaseID := leaseMgr.leaseIDForKey(resolved, body.KeyID)
+		err = leaseMgr.ReleaseLease(ctx, resolved.PoolURL, leaseID)
+		desc = keyName + " lease " + leaseID + " @ " + resolved.PoolURL
 	}
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "release failed: "+err.Error(), "pool_error")
@@ -868,6 +896,105 @@ func findChannel(id string) *Channel {
 	return nil
 }
 
+// inlineChannel 校验并规范化请求体内联的渠道定义（WebUI 编辑器当前内容）：
+// 未命名渠道给占位名，未保存的 key 给稳定占位 ID（池租约 ID 幂等复用，渠道保存时
+// 由 Reconcile 作为孤儿分配回收），其余字段与保存时同一套归一化规则。
+func inlineChannel(src *Channel) (*Channel, error) {
+	if src == nil {
+		return nil, errors.New("channel required")
+	}
+	ch := *src
+	if strings.TrimSpace(ch.Name) == "" {
+		ch.Name = "（未保存）"
+	}
+	if strings.TrimSpace(ch.BaseURL) == "" {
+		return nil, errors.New("请先填写 Base URL")
+	}
+	keys := make([]*UpKey, 0, len(src.Keys))
+	for i, k := range src.Keys {
+		if k == nil {
+			continue
+		}
+		kc := *k
+		if strings.TrimSpace(kc.ID) == "" {
+			// 首个 key 固定 "preview"（测试/池操作的租约 ID 幂等复用），其余 previewN
+			kc.ID = "preview"
+			if i > 0 {
+				kc.ID = "preview" + strconv.Itoa(i+1)
+			}
+		}
+		keys = append(keys, &kc)
+	}
+	ch.Keys = keys
+	if err := normalizeChannel(&ch); err != nil {
+		return nil, err
+	}
+	return &ch, nil
+}
+
+// fetchedModelsPayload 拉取结果的统一响应体：
+//   - fetched：上游候选（**上游写法**，每个上游模型一条，同一对外名的多个写法各自
+//     一条，WebUI 逐个勾选）；
+//   - free_models：免费候选（fetched 的子集，仅展示不落盘）；
+//   - enabled / enabled_ids：渠道当前声明的模型（原文 / 对外名）；
+//   - enabled_upstream：候选里当前已生效的上游写法（WebUI 预勾选；渠道未声明模型
+//     时等于全部候选 = 全选）；
+//   - stale：渠道当前声明、但上游本次未返回的模型（重建会移除，供提示）。
+//
+// 对外名与上游写法的关系是「多对一」：WebUI 用每个候选的 modelIdentity 显示对外名、
+// 用 fetched 里的原文写回模型映射，从而对外只暴露一个名字、上游仍收到各自写法。
+func fetchedModelsPayload(ch *Channel, fetched, free []string, usedKey string) map[string]any {
+	cands := fetchedCandidates(fetched, free)
+	raws := fetchedRawModels(cands)
+	enabledIDs := make([]string, 0, len(ch.Models))
+	for _, m := range ch.Models {
+		if id := exposedModelName(m); id != "" {
+			enabledIDs = append(enabledIDs, id)
+		}
+	}
+	enabledUpstream := enabledUpstreamModels(ch, cands)
+	if enabledUpstream == nil {
+		enabledUpstream = []string{}
+	}
+	return map[string]any{
+		"channel_id":       ch.ID,
+		"fetched":          raws,
+		"free_models":      fetchedFreeModels(cands),
+		"key_used":         usedKey,
+		"enabled":          ch.Models,
+		"enabled_ids":      enabledIDs,
+		"enabled_upstream": enabledUpstream,
+		"stale":            staleModels(ch.Models, raws),
+		"total":            len(raws),
+	}
+}
+
+// handleAdminFetchModelsInline 用「编辑器里当前填写的渠道内容」拉取上游模型列表，
+// 不要求渠道已保存（WebUI 新增/编辑弹窗的「从上游拉取模型列表」，见 web/app.js）。
+// 只读操作：不落盘，返回候选 + 免费标注 + 当前列表里上游已不返回的 stale。
+func handleAdminFetchModelsInline(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Channel *Channel `json:"channel"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json: "+err.Error(), "bad_request")
+		return
+	}
+	ch, err := inlineChannel(body.Channel)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), fetchModelsTimeout+10*time.Second)
+	defer cancel()
+	fetched, free, usedKey, err := fetchUpstreamModels(ctx, ch)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "fetch models failed: "+err.Error(), "upstream_error")
+		return
+	}
+	writeJSON(w, http.StatusOK, fetchedModelsPayload(ch, fetched, free, usedKey))
+}
+
 // handleAdminFetchModels 用渠道的 key 拉取上游模型列表。
 // 默认（dry_run=1 或未带 replace）只返回候选列表供 WebUI 勾选启用，不写回渠道；
 // replace=1 时全量替换写回渠道（兼容旧脚本）。返回拉取结果供 WebUI 展示。
@@ -889,38 +1016,29 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 	// dry-run（默认）：不写回渠道，仅返回候选 + 当前已启用集合 + 上游已不再
 	// 返回的旧条目（stale，供 WebUI 提示「重建将移除这些模型」）
 	if r.URL.Query().Get("replace") != "1" {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"channel_id":  ch.ID,
-			"fetched":     fetched,
-			"free_models": free,
-			"key_used":    usedKey,
-			"enabled":     ch.Models,
-			"stale":       staleModels(ch.Models, fetched),
-			"total":       len(fetched),
-		})
+		writeJSON(w, http.StatusOK, fetchedModelsPayload(ch, fetched, free, usedKey))
 		return
 	}
 
-	// 兼容旧行为：全量替换写回渠道
+	// 兼容旧行为：全量替换写回渠道。模型名归一化为对外名（上游报的
+	// "cline-free/x:free" 存成 "x"），上游原写法记进 ModelMap 保证转发仍用
+	// 上游认识的写法；同时丢弃已不在列表里的旧映射键（以上游为准）
 	oldModels := ch.Models
-	ch.Models = normalizeModelList(fetched)
+	ch.Models = fetched
+	ch.normalizeDeclaredModels(true)
 	if err := store.PutChannel(ch); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "save channel: "+err.Error(), "internal")
 		return
 	}
 	log.Printf("admin replaced models for channel %q via key %q: %d models (%d free)",
-		ch.Name, usedKey, len(fetched), len(free))
+		ch.Name, usedKey, len(ch.Models), len(free))
 	// 新增模型尽早探测（替换只动模型列表，key 集合不变；同一套范围/节流/队列）
 	oldCh := *ch
 	oldCh.Models = oldModels
 	probes.ChannelUpdated(&oldCh, ch)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"channel_id":  ch.ID,
-		"models":      ch.Models,
-		"free_models": free,
-		"key_used":    usedKey,
-		"total":       len(ch.Models),
-	})
+	out := fetchedModelsPayload(ch, fetched, free, usedKey)
+	out["models"] = ch.Models
+	writeJSON(w, http.StatusOK, out)
 }
 
 // staleModels 返回渠道当前已启用、但上游本次未返回的模型（模型名归一化后
@@ -1119,21 +1237,19 @@ func handleAdminTestKey(w http.ResponseWriter, r *http.Request) {
 	var ch *Channel
 	var k *UpKey
 	if body.Channel != nil {
-		ich := body.Channel
-		if len(ich.Keys) == 0 {
+		if len(body.Channel.Keys) == 0 {
 			writeJSONError(w, http.StatusBadRequest, "channel has no key to test", "bad_request")
 			return
 		}
-		// 未保存的 key 赋固定临时 ID：池租约 ID（gw-<keyID>）幂等复用，
-		// 渠道保存时由 Reconcile 作为孤儿分配回收
-		if strings.TrimSpace(ich.Keys[0].ID) == "" {
-			ich.Keys[0].ID = "preview"
-		}
-		if strings.TrimSpace(ich.Name) == "" {
-			ich.Name = "（未保存）" // 测试不强制命名，日志展示用
-		}
-		if err := normalizeChannel(ich); err != nil {
+		// 未保存的渠道/修改直接按页面内容测试（不落盘）：内联定义走同一套归一化，
+		// 未保存的 key 赋固定临时 ID（池租约 ID 幂等复用，保存时作为孤儿回收）
+		ich, err := inlineChannel(body.Channel)
+		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error(), "bad_request")
+			return
+		}
+		if len(ich.Keys) == 0 {
+			writeJSONError(w, http.StatusBadRequest, "channel has no key to test", "bad_request")
 			return
 		}
 		ch, k = ich, ich.Keys[0]

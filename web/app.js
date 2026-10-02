@@ -1096,6 +1096,51 @@ function keyProxyDesc(k, ch) {
 
 // ---- 渠道编辑器 ----
 
+// ---- 模型名归一化（与后端 modelIdentity / canonicalModel 同规则）----
+// 上游报 "cline-free/DeepSeek-V4.1-Flash:free"、客户端写 "DeepSeek-V4.1-Flash" 指的是
+// 同一个模型。归一化 = 小写 → 去最后一个 "/" 之前的供应商前缀 → 去 ":free" 类变体
+// 后缀 → 去结尾 "-free"。列表与路由对外用归一化名，上游仍收到它自己的写法
+//（渠道模型映射记录，见后端 normalizeDeclaredModels）。
+const MODEL_VARIANT_TAGS = new Set([
+  "free", "nitro", "thinking", "online", "extended", "floor", "beta", "self-moderated",
+]);
+function isModelVariantTag(tag) { return tag === "" || MODEL_VARIANT_TAGS.has(tag); }
+function canonicalModel(name) {
+  let s = String(name ?? "").trim().toLowerCase();
+  const slash = s.lastIndexOf("/");
+  if (slash >= 0) s = s.slice(slash + 1);
+  const colon = s.lastIndexOf(":");
+  if (colon >= 0 && isModelVariantTag(s.slice(colon + 1))) s = s.slice(0, colon);
+  return s.endsWith("-free") ? s.slice(0, -5) : s;
+}
+function modelIdentity(name) { return canonicalModel(name) || String(name ?? "").trim(); }
+// 通配/正则模式不是模型名，不能归一化（"re:^gpt-4/.*$" 会被截断）
+function modelPatternIsPlain(p) {
+  const s = String(p ?? "").trim();
+  if (s.length > 3 && s.slice(0, 3).toLowerCase() === "re:") return false;
+  return !/[*?]/.test(s);
+}
+function exposedModelName(name) {
+  const p = String(name ?? "").trim();
+  if (!p || !modelPatternIsPlain(p)) return p;
+  return modelIdentity(p);
+}
+// mapTargetFor 模型映射里该下游名对应的上游名（精确键优先，其次归一化等价键）；
+// 与自身相同（无需改写）时返回 ""。
+function mapTargetFor(map, model) {
+  if (!map) return "";
+  let targets = map[model];
+  if (!targets) {
+    const id = modelIdentity(model);
+    for (const k of Object.keys(map)) {
+      if (modelIdentity(k) === id) { targets = map[k]; break; }
+    }
+  }
+  if (!targets || !targets.length) return "";
+  const up = targets.join(", ");
+  return up === model ? "" : up;
+}
+
 // modelMapToText / textToModelMap 渠道名称映射（model_map）与文本框
 //「每行 下游模型名=上游模型名（多个上游用逗号分隔）」之间的转换。
 // 同一个下游名可以对应上游的多个模型（区域/线路变体），可以写成
@@ -1117,13 +1162,51 @@ function textToModelMap(text) {
     const list = out[key] || (out[key] = []);
     for (const raw of s.slice(i + 1).split(",")) {
       const val = raw.trim();
-      // 映射到自身无意义；归一化后重复的目标只留一个
-      if (!val || val === key) continue;
-      if (!list.includes(val)) list.push(val);
+      // 目标按字面去重：同一模型在上游的多个写法各自是一个候选（各自独立冷却），
+      // 只有「只写了自身」等价于不配置映射（与后端 normalizeModelMap 同规则）
+      if (!val || list.includes(val)) continue;
+      list.push(val);
     }
-    if (!list.length) delete out[key];
+    if (!list.length || (list.length === 1 && list[0] === key)) delete out[key];
   }
   return Object.keys(out).length ? out : undefined;
+}
+
+// ---- Base URL 自适应（与后端 normalizeBaseURL 同规则）----
+// 「OpenAI 兼容前缀」默认自动补全版本段：裸站点 https://api.deepseek.com 补成
+// .../v1，自定义前缀 https://host/openai 补成 .../openai/v1；已含版本段
+//（/v1、/api/v1、/v4、/v1beta…）或已指向具体端点时保持原样，避免 /v1/v1。
+const BASE_ENDPOINT_SUFFIXES = [
+  "/chat/completions", "/responses", "/models", "/embeddings",
+  "/images/generations", "/images/edits", "/images/variations", "/videos/generations",
+];
+function looksLikeVersionSeg(seg) { return /^v\d[a-z0-9._-]*$/i.test(seg); }
+
+function normalizeBaseURL(raw) {
+  let s = String(raw ?? "").trim();
+  while (s.endsWith("/")) s = s.slice(0, -1);
+  if (!s || /[?#]/.test(s)) return s; // 带查询串/片段的地址（Azure 风格）不改写
+  let rest = s;
+  const scheme = rest.indexOf("://");
+  if (scheme >= 0) rest = rest.slice(scheme + 3);
+  const slash = rest.indexOf("/");
+  if (slash < 0) return s + "/v1"; // 裸 host[:port]
+  const path = rest.slice(slash);
+  const lower = path.toLowerCase();
+  if (BASE_ENDPOINT_SUFFIXES.some((suf) => lower.endsWith(suf))) return s;
+  if (path.split("/").filter(Boolean).some(looksLikeVersionSeg)) return s;
+  return s + "/v1";
+}
+
+// syncBaseURLHint 展示自动补全提示（未补全/为空时不显示）。
+function syncBaseURLHint(before) {
+  const hint = $("#chBaseURLHint");
+  const now = $("#chBaseURL").value.trim();
+  if (before !== undefined && before !== now && now) {
+    hint.textContent = `已自动补全为 ${now}（自适应 /v1，已有版本段或完整端点时不补）`;
+    return;
+  }
+  hint.textContent = "";
 }
 
 $("#addChannelBtn").addEventListener("click", () => openChannelEditor({
@@ -1131,12 +1214,22 @@ $("#addChannelBtn").addEventListener("click", () => openChannelEditor({
   rewrite_reasoning: false, cooldown_scope: "key", auto_probe: false, enabled: true, keys: [],
 }));
 
+// 失焦/回车即补全 Base URL（以当前填写内容为准，不必先保存）
+$("#chBaseURL").addEventListener("change", () => {
+  const before = $("#chBaseURL").value;
+  $("#chBaseURL").value = normalizeBaseURL(before);
+  syncBaseURLHint(before);
+});
+
 function openChannelEditor(ch) {
   editChannel = ch;
   $("#channelModalTitle").textContent = ch.id ? "编辑渠道：" + ch.name : "新建渠道";
   $("#chName").value = ch.name || "";
   $("#chGroup").value = ch.group || "";
-  $("#chBaseURL").value = ch.base_url || "";
+  // 打开时即按自适应规则补全（历史配置里可能存的是裸站点），改动只影响本次编辑
+  const rawBase = ch.base_url || "";
+  $("#chBaseURL").value = normalizeBaseURL(rawBase);
+  syncBaseURLHint(rawBase);
   $("#chModelsURL").value = ch.models_url || "";
   $("#chEndpointType").value = ch.endpoint_type || "chat";
   $("#chModels").value = (ch.models || []).join("\n");
@@ -1153,7 +1246,18 @@ function openChannelEditor(ch) {
   renderHeaderRows(ch.headers || {});
   renderKeyBlocks(ch.keys || []);
   renderModelChips();
+  syncModelMapHint();
   renderCoolingKeys(ch);
+  // 上一个渠道的拉取候选 / 批量导入草稿不跨渠道残留
+  $("#fetchPanel").classList.add("hidden");
+  $("#fetchSearch").value = "";
+  $("#fetchList").innerHTML = "";
+  fetchedCandidates = [];
+  fetchedFreeSet = new Set();
+  fetchedStale = [];
+  fetchedEnabled = new Set();
+  $("#bulkImportBox").classList.add("hidden");
+  $("#bulkKeysInput").value = "";
   $("#channelErr").textContent = "";
   $("#channelModal").classList.remove("hidden");
 }
@@ -1260,23 +1364,40 @@ function renderCoolingKeys(ch) {
   }));
 }
 
-// 可用模型 chips 展示（跟随左侧文本框实时变化）；freeSet 非空时为对应模型标注「免费」
+// 可用模型 chips 展示（跟随左侧文本框实时变化）；freeSet 非空时为对应模型标注「免费」，
+// 模型映射里配了上游写法时一并标出（对外是干净名字，发往上游的是它，多上游按顺序）。
 let freeModelSet = new Set();
 function renderModelChips() {
   const el = $("#chModelList");
   const models = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  el.innerHTML = models.map((m) =>
-    `<span class="chip">${esc(m)}${freeModelSet.has(m) ? '<i class="badge free">免费</i>' : ""}</span>`
-  ).join("") || '<span class="muted" style="font-size:12px">（暂无模型：可手工填写，或保存后点「从上游拉取模型列表」）</span>';
+  const map = textToModelMap($("#chModelMap").value);
+  el.innerHTML = models.map((m) => {
+    const up = mapTargetFor(map, m);
+    return `<span class="chip"${up ? ` title="${esc("发往上游（按顺序尝试，各自独立冷却）：" + up)}"` : ""}>${esc(m)}`
+      + (up ? `<i class="badge src">→ ${esc(up)}</i>` : "")
+      + (freeModelSet.has(m) ? '<i class="badge free">免费</i>' : "")
+      + `</span>`;
+  }).join("") || '<span class="muted" style="font-size:12px">（暂无模型：可手工填写，或点「从上游拉取模型列表」按当前填写内容拉取）</span>';
 }
 $("#chModels").addEventListener("input", () => { renderModelChips(); freeModelSet = new Set(); });
 
-// ---- 弹窗通用交互：Esc 关闭、点击遮罩关闭 ----
-// 模态框统一由 .modal 容器承载；除内容卡片外的区域即遮罩。
+// syncModelMapHint 模型映射文本框下的提示：自动补进来的条目说明清楚
+//（下游用左边名字调用，上游收到右边名字）。
+function syncModelMapHint() {
+  const el = $("#chModelMapHint");
+  if (!el) return;
+  const n = Object.keys(textToModelMap($("#chModelMap").value) || {}).length;
+  el.textContent = n
+    ? `共 ${n} 条映射：下游用「=」左边的名字调用，上游收到右边的名字（拉取模型时按上游写法自动补全）`
+    : "留空时上游收到的是左侧模型列表里的写法；拉取模型时会自动补上上游的原写法（如 x=cline-free/x:free）";
+}
+$("#chModelMap").addEventListener("input", () => { renderModelChips(); syncModelMapHint(); });
+
+// ---- 弹窗通用交互：Esc 关闭；点击遮罩**不**关闭 ----
+// 模态框统一由 .modal 容器承载，除内容卡片外的区域即遮罩。遮罩点击不关闭是有意
+// 为之：新增/编辑弹窗里往往已填了不少内容（key、代理、模型清单），误点遮罩即
+// 丢失。关闭方式：右上角 ×、底部「取消 / 关闭」按钮，或 Esc。
 function closeModal(el) { if (el) el.classList.add("hidden"); }
-$$(".modal").forEach((m) => {
-  m.addEventListener("click", (e) => { if (e.target === m) closeModal(m); });
-});
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   const open = $$(".modal").filter((m) => !m.classList.contains("hidden"));
@@ -1323,10 +1444,21 @@ function keyInheritInfo(k) {
 // 多 key 渠道会互相取消选中导致保存/测试读不到代理类型
 let keyBlockSeq = 0;
 
+// newKeyID 为「尚未保存的新 key」预生成 ID：后端保存时保留非空 ID，因此弹窗里的
+// 换IP/释放租约/测试（都按 key ID 定位租约）在保存前就能用，且保存后沿用同一 ID
+// （池租约随之复用，不会因保存换 ID 而重新申请）。
+function newKeyID() {
+  const buf = new Uint8Array(6);
+  if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(buf);
+  else for (let i = 0; i < buf.length; i++) buf[i] = Math.floor(Math.random() * 256);
+  return Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function keyBlock(k, inheritInfo) {
   const div = document.createElement("div");
   div.className = "keyblock";
-  div.dataset.keyId = k.id || ""; // 已保存 key 的真实 ID：测试/换IP/释放租约依赖
+  // 已保存 key 用真实 ID；新 key 用客户端预生成的稳定 ID（见 newKeyID）
+  div.dataset.keyId = k.id || newKeyID();
   // proxy == null 时 key 未单独配置代理（跟随渠道级设置）；
   // proxy 为空规格（kind 空对象）表示 key 显式直连，覆盖渠道级代理
   const followsChannel = !k.proxy;
@@ -1352,9 +1484,9 @@ function keyBlock(k, inheritInfo) {
         <label class="inline"><input type="radio" class="pk" name="${pkName}" value="ipv6pool" ${kind === "ipv6pool" ? "checked" : ""}> IPv6 代理池</label>
         <span class="spacer"></span>
         ${inheritLabel}
-        <button class="btn small kb-test">测试</button>
-        <button class="btn small kb-rotate">换IP</button>
-        <button class="btn small kb-release">释放租约</button>
+        <button class="btn small kb-test" title="用上方当前填写的内容（Base URL / key / 代理）发一条测试请求，无需先保存">测试</button>
+        <button class="btn small kb-rotate" title="按当前填写内容立即更换该 key 的出口 IP（无需先保存；新建 key 用预生成 ID，保存后沿用同一 ID）">换IP</button>
+        <button class="btn small kb-release" title="释放该 key 当前的池租约（无需先保存）">释放租约</button>
       </div>
       <div class="kb-static ${kind === "static" ? "" : "hidden"}">
         <label>代理 URL <input class="kb-url" placeholder="http://user:pass@host:port 或 socks5://user:pass@host:port" value="${esc(k.proxy && k.proxy.url || "")}"></label>
@@ -1396,12 +1528,26 @@ function keyBlock(k, inheritInfo) {
   };
   div.querySelectorAll("input.pk").forEach((r) => r.addEventListener("change", syncProxyKind));
 
-  // 池操作（换IP/释放租约）：作用于已保存租约，须先保存
-  const needSaved = () => {
-    if (!editChannel.id) { toast("请先保存渠道，再执行池操作", true); return false; }
+  // 池操作（换IP/释放租约）：同样以页面当前填写内容为准——代理配置取本 key 的选择
+  //（「跟随渠道」时取渠道级代理块），key ID 用块上的稳定 ID（新 key 为客户端预生成）。
+  // 因此新建/未保存的渠道也能直接换 IP、释放租约，不必先保存。
+  const poolAction = async (path) => {
+    const k = collectKeyForm(div);
+    const spec = k.proxy || collectChannelProxy();
+    if (!spec || spec.kind !== "ipv6pool") {
+      toast("该 key 当前未使用 IPv6 代理池（选择「IPv6 代理池」或让渠道级代理使用代理池后再操作）", true);
+      return;
+    }
     const keyID = div.dataset.keyId || "";
-    if (!keyID) { toast("请先保存渠道以生成 key ID", true); return false; }
-    return true;
+    if (!keyID) { toast("该 key 缺少 ID，无法定位租约", true); return; }
+    try {
+      const r = await api("POST", path, {
+        proxy: spec, key_id: keyID, key_name: k.name,
+        channel_id: (editChannel && editChannel.id) || "",
+      });
+      if (path.endsWith("/rotate")) toast("已换 IP: " + ((r && r.ipv6) || "(未知)"));
+      else toast("租约已释放");
+    } catch (e) { toast(e.message, true); }
   };
   // 测试：以页面当前填写内容为准（支持未保存的渠道与修改，无需先保存）。
   // 只发送被点击 key 的配置（keys[0]），后端直接按内联定义发起请求。
@@ -1421,20 +1567,8 @@ function keyBlock(k, inheritInfo) {
       }
     } catch (e) { toast(e.message, true); }
   });
-  div.querySelector(".kb-rotate").addEventListener("click", async () => {
-    if (!needSaved()) return;
-    try {
-      const lease = await api("POST", "/admin/api/pool/rotate", { channel_id: editChannel.id, key_id: div.dataset.keyId });
-      toast("已换 IP: " + (lease.ipv6 || "(未知)"));
-    } catch (e) { toast(e.message, true); }
-  });
-  div.querySelector(".kb-release").addEventListener("click", async () => {
-    if (!needSaved()) return;
-    try {
-      await api("POST", "/admin/api/pool/release", { channel_id: editChannel.id, key_id: div.dataset.keyId });
-      toast("租约已释放");
-    } catch (e) { toast(e.message, true); }
-  });
+  div.querySelector(".kb-rotate").addEventListener("click", () => poolAction("/admin/api/pool/rotate"));
+  div.querySelector(".kb-release").addEventListener("click", () => poolAction("/admin/api/pool/release"));
   return div;
 }
 $("#addKeyBtn").addEventListener("click", () => $("#chKeys").appendChild(keyBlock({ name: "", api_key: "", enabled: true }, keyInheritInfo({}))));
@@ -1511,27 +1645,75 @@ $("#bulkImportBtn").addEventListener("click", () => {
   else toast(`已导入 ${imported} 个 key，请点「保存」写入配置`);
 });
 
-// 从上游拉取模型列表（用渠道 key 鉴权）：dry-run 只取候选清单，
-// 弹出勾选面板，用户勾选后「按勾选重建」左侧列表——未勾选项与上游已不返回
-// 的旧模型都会从列表移除（勾选「保留上游未返回的旧模型」时例外）。
-// 「拉取并直接重建」按钮则以上游返回为准立即全量替换并保存。
-let fetchedCandidates = [];        // 本次拉取的候选（用于确定时区分手工项）
-let fetchedFreeSet = new Set();
+// 从上游拉取模型列表（用渠道 key 鉴权）：**以弹窗里当前填写的内容为准**（Base URL、
+// key、代理、模型清单都取表单值，新建渠道未保存也能拉），dry-run 只取候选清单，
+// 弹出勾选面板（候选按对外名列出、预勾选当前已启用的模型），用户勾选后
+// 「按勾选重建」左侧列表与模型映射——未勾选项与上游已不返回的旧模型都会从列表
+// 移除（勾选「保留上游未返回的旧模型」时例外）。
+// 「拉取并直接重建」按钮则以上游返回为准立即全量替换并保存（保存后关闭弹窗）。
+let fetchedCandidates = [];        // 本次拉取的候选：上游写法（勾选值 = 上游模型名）
+let fetchedEnabled = new Set();    // 候选里当前已生效的上游写法（预勾选）
+let fetchedFreeSet = new Set();    // 免费候选（上游写法）
 let fetchedStale = [];             // 上游本次未返回、当前列表里已有的模型
 
 async function fetchModelsDryRun() {
-  if (!editChannel.id) throw new Error("请先保存渠道（生成 key 后）再拉取模型列表");
-  const r = await api("POST", `/admin/api/channels/${encodeURIComponent(editChannel.id)}/fetch-models`, {});
+  const ch = collectChannelForm();
+  if (!ch.base_url) throw new Error("请先填写 Base URL");
+  const r = await api("POST", "/admin/api/fetch-models", { channel: ch });
   return {
     fetched: r.fetched || r.models || [],
     free: r.free_models || [],
     stale: r.stale || [],
+    enabledUpstream: r.enabled_upstream || [],
     key: r.key_used || "?",
   };
 }
 
+// deriveDeclaration 由勾选的上游写法推导「对外模型列表 + 模型映射」：
+//   - 对外名去重后进列表（首次出现序，同一模型只暴露一个名字）；
+//   - 同一对外名的每个上游写法都进映射 → 每个写法各成一个转发候选、各自独立冷却；
+//   - 只有一个写法且与对外名相同时不建映射（无需改写上游请求）。
+function deriveDeclaration(raws) {
+  const order = [];
+  const targets = new Map();
+  for (const raw of raws) {
+    const id = exposedModelName(raw);
+    if (!id) continue;
+    if (!targets.has(id)) { targets.set(id, []); order.push(id); }
+    const arr = targets.get(id);
+    if (!arr.includes(raw)) arr.push(raw);
+  }
+  const map = {};
+  for (const id of order) {
+    const arr = targets.get(id);
+    if (arr.length > 1 || arr[0] !== id) map[id] = arr;
+  }
+  return { models: order, map };
+}
+
 function fetchSetCheckbox(v) { v.checked = true; }
 function fetchClearCheckbox(v) { v.checked = false; }
+
+// applyFetchFilter 候选清单搜索过滤：多个关键词（空格分隔）全部命中才显示；
+// 计数展示「匹配 N / 共 M（已选 K）」。全选/全不选只作用于当前筛选结果。
+function applyFetchFilter() {
+  const terms = $("#fetchSearch").value.toLowerCase().split(/\s+/).filter(Boolean);
+  const labels = $$("#fetchList label");
+  let shown = 0, checked = 0;
+  labels.forEach((l) => {
+    const hit = !terms.length || terms.every((t) => (l.dataset.model || "").toLowerCase().includes(t));
+    l.classList.toggle("hidden", !hit);
+    if (hit) { shown++; if (l.querySelector("input").checked) checked++; }
+  });
+  $("#fetchMatch").textContent = terms.length
+    ? `匹配 ${shown} / 共 ${labels.length}（已选 ${checked}）`
+    : `共 ${labels.length} 个（已选 ${checked}）`;
+}
+$("#fetchSearch").addEventListener("input", applyFetchFilter);
+$("#fetchList").addEventListener("change", applyFetchFilter);
+function visibleFetchBoxes() {
+  return $$("#fetchList label").filter((l) => !l.classList.contains("hidden")).map((l) => l.querySelector("input"));
+}
 
 $("#fetchModelsBtn").addEventListener("click", async () => {
   const btn = $("#fetchModelsBtn");
@@ -1539,24 +1721,42 @@ $("#fetchModelsBtn").addEventListener("click", async () => {
   btn.textContent = "拉取中…";
   $("#channelErr").textContent = "";
   try {
-    const { fetched, free, stale, key } = await fetchModelsDryRun();
+    const { fetched, free, stale, enabledUpstream, key } = await fetchModelsDryRun();
     if (!fetched.length) throw new Error("上游返回的模型列表为空");
     fetchedCandidates = fetched;
     fetchedFreeSet = new Set(free);
     fetchedStale = stale;
-    // 默认全选（以上游为准重建）：上游返回什么就启用什么，旧列表中的
-    // 残留模型不会因为「不在候选里」而被静默保留
+    fetchedEnabled = new Set(enabledUpstream);
+    // 每个上游模型一行（上游写法就是勾选值）：同一对外名在上游的多个写法各自一条，
+    // 可分别勾选、分别成为转发候选与独立冷却；行尾标出对外名/免费/已启用。
+    // 预勾选当前已生效的上游写法（渠道未声明模型 = 对全部放行 → 全选）。
+    const declared = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
+    const allChecked = declared.length === 0;
+    const multi = new Map();
+    fetched.forEach((raw) => { const id = exposedModelName(raw); multi.set(id, (multi.get(id) || 0) + 1); });
     const list = $("#fetchList");
-    list.innerHTML = fetched.map((m) =>
-      `<label title="${esc(m)}"><input type="checkbox" value="${esc(m)}" checked> ${esc(m)}${fetchedFreeSet.has(m) ? '<i class="badge free">免费</i>' : ""}</label>`
-    ).join("");
+    list.innerHTML = fetched.map((raw) => {
+      const id = exposedModelName(raw);
+      const on = fetchedEnabled.has(raw);
+      let bits = "";
+      if (id !== raw) bits += `<i class="badge src">对外 ${esc(id)}</i>`;
+      else if (multi.get(id) > 1) bits += '<i class="badge src">对外同名</i>';
+      if (fetchedFreeSet.has(raw)) bits += '<i class="badge free">免费</i>';
+      if (on) bits += '<i class="badge on">已启用</i>';
+      return `<label data-model="${esc(raw + " " + id)}" title="${esc(`上游模型 ${raw}｜对外名 ${id}（发往上游用的就是这个名字）`)}">`
+        + `<input type="checkbox" value="${esc(raw)}"${allChecked || on ? " checked" : ""}> ${esc(raw)}${bits}</label>`;
+    }).join("");
     $("#fetchCount").textContent = fetched.length;
     $("#fetchStale").textContent = stale.length
       ? `· 上游已不再返回 ${stale.length} 个旧模型（${stale.slice(0, 3).join(", ")}${stale.length > 3 ? " 等" : ""}），重建后将被移除`
       : "";
     $("#fetchKeepMissing").checked = false;
+    $("#fetchSearch").value = "";
     $("#fetchPanel").classList.remove("hidden");
-    toast(`已拉取 ${fetched.length} 个模型（key: ${key}），默认全选，点「按勾选重建列表」以上游为准重建`);
+    applyFetchFilter();
+    toast(allChecked
+      ? `已拉取 ${fetched.length} 个模型（key: ${key}），已全选，点「按勾选重建列表」以上游为准重建`
+      : `已拉取 ${fetched.length} 个模型（key: ${key}），已勾选当前启用的 ${fetchedEnabled.size} 个，勾选需要的模型后点「按勾选重建列表」`);
   } catch (e) {
     $("#channelErr").textContent = "拉取失败: " + e.message;
     toast("拉取失败: " + e.message, true);
@@ -1566,25 +1766,27 @@ $("#fetchModelsBtn").addEventListener("click", async () => {
   }
 });
 
-// 拉取并直接重建：一次点击以上游返回为准全量替换模型列表并保存渠道
-//（游标：上游现在返回什么就启用什么，旧模型全部移除）。
+// 拉取并直接重建：一次点击以上游返回为准全量替换模型列表（与模型映射）并保存渠道
+//（上游现在返回什么就启用什么，旧模型全部移除），保存成功即关闭弹窗。
 $("#fetchRebuildBtn").addEventListener("click", async () => {
   const btn = $("#fetchRebuildBtn");
-  if (!editChannel.id) { toast("请先保存渠道（生成 key 后）再拉取模型列表", true); return; }
-  if (!confirm("以上游返回的模型列表为准重建？当前列表中上游已不存在的模型会被移除。")) return;
+  if (!confirm("以上游返回的模型列表为准重建？当前列表中上游已不存在的模型（及其映射）会被移除。")) return;
   btn.disabled = true;
   btn.textContent = "拉取中…";
+  $("#channelErr").textContent = "";
   try {
-    const r = await api("POST", `/admin/api/channels/${encodeURIComponent(editChannel.id)}/fetch-models?replace=1`, {});
-    const models = r.models || [];
-    $("#chModels").value = models.join("\n");
-    freeModelSet = new Set(r.free_models || []);
+    const { fetched, free, key } = await fetchModelsDryRun();
+    if (!fetched.length) throw new Error("上游返回的模型列表为空");
+    const derived = deriveDeclaration(fetched);
+    $("#chModels").value = derived.models.join("\n");
+    $("#chModelMap").value = modelMapToText(derived.map);
+    freeModelSet = new Set([...new Set(free)].map(exposedModelName));
     renderModelChips();
-    // 直接重建已写回后端，这里同步编辑态（重新拉取渠道最新配置）
-    await loadState();
-    editChannel = (STATE.channels || []).find((c) => c.id === editChannel.id) || editChannel;
-    toast(`已按上游重建：${models.length} 个模型（key: ${r.key_used || "?"}）`);
+    syncModelMapHint();
+    await saveChannel();
+    toast(`已按上游重建并保存：${fetched.length} 个上游模型 / ${derived.models.length} 个对外名（key: ${key}）`);
   } catch (e) {
+    $("#channelErr").textContent = "拉取重建失败: " + e.message;
     toast("拉取重建失败: " + e.message, true);
   } finally {
     btn.disabled = false;
@@ -1592,27 +1794,42 @@ $("#fetchRebuildBtn").addEventListener("click", async () => {
   }
 });
 
-$("#fetchAllBtn").addEventListener("click", () => $$("#fetchList input[type=checkbox]").forEach(fetchSetCheckbox));
-$("#fetchNoneBtn").addEventListener("click", () => $$("#fetchList input[type=checkbox]").forEach(fetchClearCheckbox));
+$("#fetchAllBtn").addEventListener("click", () => { visibleFetchBoxes().forEach(fetchSetCheckbox); applyFetchFilter(); });
+$("#fetchNoneBtn").addEventListener("click", () => { visibleFetchBoxes().forEach(fetchClearCheckbox); applyFetchFilter(); });
 
-// 按勾选重建：勾选模型 = 新列表（保序）；未勾选的候选与上游已不返回的旧模型
-// 都被移除。勾选「保留上游未返回的旧模型」时，旧列表中不在候选里的项（手工
-// 补充项）被保留并追加在末尾。
+// 按勾选重建：勾选的上游模型 = 新列表的候选；未勾选的候选与上游已不返回的旧模型
+// 都被移除。勾选「保留上游未返回的旧模型」时，旧列表中既不是本次候选、对外名也不在
+// 候选里的项（手工补充项）被保留并追加在末尾。模型映射同步：勾选项按「对外名 →
+// 勾选的上游写法（多个则按顺序各成一个候选）」重建，手工项的映射保留，列表里已没有
+// 的映射键删除。
 $("#fetchApplyBtn").addEventListener("click", () => {
   const chosen = $$("#fetchList input[type=checkbox]:checked").map((c) => c.value);
   const candSet = new Set(fetchedCandidates);
+  const candIDs = new Set(fetchedCandidates.map(exposedModelName));
   const keepMissing = $("#fetchKeepMissing").checked;
   const dropped = fetchedCandidates.length - chosen.length;
+  const current = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
   const manual = keepMissing
-    ? $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean).filter((m) => !candSet.has(m))
+    ? current.filter((m) => !candSet.has(m) && !candIDs.has(exposedModelName(m)))
     : [];
-  const merged = [...new Set([...chosen, ...manual])];
-  $("#chModels").value = merged.join("\n");
-  freeModelSet = fetchedFreeSet;
+  const derived = deriveDeclaration(chosen);
+  const models = [...new Set([...derived.models, ...manual])];
+  const keep = new Set(models.map(modelIdentity));
+  const oldMap = textToModelMap($("#chModelMap").value) || {};
+  const map = {};
+  for (const k of Object.keys(oldMap)) { // 手工补充项的映射保留，其余按勾选重建
+    if (keep.has(modelIdentity(k)) && !derived.map[modelIdentity(k)]) map[k] = oldMap[k];
+  }
+  for (const id of Object.keys(derived.map)) map[id] = derived.map[id];
+  $("#chModels").value = models.join("\n");
+  $("#chModelMap").value = modelMapToText(map);
+  syncModelMapHint();
+  freeModelSet = new Set([...new Set(fetchedFreeSet)].map(exposedModelName).filter((m) => models.includes(m)));
   renderModelChips();
   $("#fetchPanel").classList.add("hidden");
   const removed = dropped + (keepMissing ? 0 : fetchedStale.length);
-  toast(`已重建列表：启用 ${chosen.length} 个模型${removed ? `，移除 ${removed} 个` : ""}${manual.length ? `，保留手工项 ${manual.length} 个` : ""}，请点「保存」写入配置`);
+  toast(`已重建列表：勾选 ${chosen.length} 个上游模型 / ${derived.models.length} 个对外名`
+    + `${removed ? `，移除 ${removed} 个` : ""}${manual.length ? `，保留手工项 ${manual.length} 个` : ""}，请点「保存」写入配置`);
 });
 
 // collectKeyForm 从单个 key 块读取配置（不做校验）。
@@ -1668,7 +1885,7 @@ function collectChannelForm() {
     id: editChannel.id || "",
     name: $("#chName").value.trim(),
     group: $("#chGroup").value.trim(),
-    base_url: $("#chBaseURL").value.trim(),
+    base_url: normalizeBaseURL($("#chBaseURL").value),
     models_url: $("#chModelsURL").value.trim(),
     endpoint_type: $("#chEndpointType").value,
     models,
@@ -1688,17 +1905,22 @@ function collectChannelForm() {
   };
 }
 
+// saveChannel 保存渠道（新增/编辑共用）：整体替换写入后端，成功后刷新状态并
+// **关闭弹窗**（保存即完成，不再停留在弹窗里）。失败时抛出，由调用方展示错误。
+async function saveChannel() {
+  const ch = collectChannelForm();
+  const saved = await api("PUT", "/admin/api/channels", ch);
+  editChannel = saved;
+  await loadState();
+  closeModal($("#channelModal"));
+  return saved;
+}
+
 // 保存渠道
 $("#channelSaveBtn").addEventListener("click", async () => {
-  const ch = collectChannelForm();
   try {
-    const saved = await api("PUT", "/admin/api/channels", ch);
-    editChannel = saved;
-    // 回填 key ID，便于后续池操作
-    const savedKeys = saved.keys || [];
-    $$("#chKeys .keyblock").forEach((div, i) => { div.dataset.keyId = savedKeys[i] ? savedKeys[i].id : ""; });
+    await saveChannel();
     toast("已保存");
-    await loadState();
   } catch (e) {
     $("#channelErr").textContent = e.message;
   }
@@ -2294,11 +2516,34 @@ function openPoolEditor(p) {
   $("#plToken").value = p.pool_token || "";
   $("#plSocks").value = p.socks_host || "";
   $("#poolErr").textContent = "";
+  $("#poolTestResult").textContent = "";
   $("#poolModal").classList.remove("hidden");
 }
 
 $("#poolAddBtn").addEventListener("click", () => openPoolEditor({}));
 $$('[data-close="poolModal"]').forEach((b) => b.addEventListener("click", () => $("#poolModal").classList.add("hidden")));
+// 测试连接：以弹窗当前填写内容为准（新建/未保存的池也能测），不落盘
+$("#poolTestBtn").addEventListener("click", async () => {
+  const btn = $("#poolTestBtn");
+  const url = $("#plURL").value.trim();
+  if (!url) { $("#poolErr").textContent = "请先填写管理端 URL"; return; }
+  btn.disabled = true;
+  btn.textContent = "测试中…";
+  $("#poolErr").textContent = "";
+  try {
+    const st = await api("POST", "/admin/api/pool/test", { pool_url: url, pool_token: $("#plToken").value.trim() });
+    const desc = `状态 ${st.status || "ok"} · 租约 ${st.lease_count || 0}/${st.max_leases || "?"}`;
+    $("#poolTestResult").textContent = desc;
+    toast("测试成功：" + desc);
+  } catch (e) {
+    $("#poolTestResult").textContent = "";
+    $("#poolErr").textContent = e.message;
+    toast("测试失败: " + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "测试连接";
+  }
+});
 $("#poolSaveBtn").addEventListener("click", async () => {
   const p = {
     id: editPool.id || "",

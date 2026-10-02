@@ -154,6 +154,9 @@ type modelsEntry struct {
 // 渠道声明了模型列表（静态配置或拉取结果）时直接使用；否则尝试拉取其 models
 // 端点（失败不阻塞其它渠道）。全局别名（设置页 model_aliases）作为可调用名一并
 // 暴露；下游 key 配置了模型白名单时只返回其允许的模型。
+//
+// 暴露的名字统一走 exposedModelName：上游报 "cline-free/x:free"、历史配置里存着
+// 带前缀的写法时，下游看到的仍是 "x"（发往上游的写法由渠道模型映射决定）。
 func gatewayModels(w http.ResponseWriter, r *http.Request) {
 	snap := store.View() // 只读视图，零拷贝
 	gk := gwKeyFrom(r.Context())
@@ -181,11 +184,11 @@ func gatewayModels(w http.ResponseWriter, r *http.Request) {
 		}
 		// 模型映射的键（下游模型名）也是该渠道的可调用名，一并暴露
 		for _, m := range ch.modelMapKeys() {
-			addModel(m)
+			addModel(exposedModelName(m))
 		}
 		if len(ch.Models) > 0 {
 			for _, m := range ch.Models {
-				addModel(m)
+				addModel(exposedModelName(m))
 			}
 			continue
 		}
@@ -215,7 +218,7 @@ func gatewayModels(w http.ResponseWriter, r *http.Request) {
 		select {
 		case list := <-results:
 			for _, m := range list {
-				addModel(m)
+				addModel(exposedModelName(m))
 			}
 		case <-r.Context().Done():
 			return

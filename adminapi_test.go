@@ -360,8 +360,8 @@ func TestAdminTestKeyRequestFormat(t *testing.T) {
 	mu.Lock()
 	body, accept, ua, path := gotBody, gotAccept, gotUA, gotPath
 	mu.Unlock()
-	if path != "/chat/completions" {
-		t.Fatalf("path = %s, want /chat/completions", path)
+	if path != "/v1/chat/completions" {
+		t.Fatalf("path = %s, want /v1/chat/completions", path)
 	}
 	if accept != "application/json" {
 		t.Fatalf("Accept = %q, want application/json", accept)
@@ -1376,5 +1376,109 @@ func TestAdminPutChannelTriggersNewModelProbe(t *testing.T) {
 	mu.Unlock()
 	if n != 4 {
 		t.Fatalf("unchanged save should probe nothing, got %d requests", n)
+	}
+}
+
+// TestAdminPoolActionInlineProxy：编辑器里尚未保存的 key（内联 proxy + 客户端预生成
+// key_id）也能直接「换IP / 释放租约」，无需先保存渠道。
+func TestAdminPoolActionInlineProxy(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	pool, poolSrv := startFakePool(t)
+
+	p := &ProxyPool{Name: "p", PoolURL: poolSrv.URL, PoolToken: "tok"}
+	if err := store.PutProxyPool(p); err != nil {
+		t.Fatalf("PutProxyPool: %v", err)
+	}
+	spec := &ProxySpec{Kind: "ipv6pool", PoolID: p.ID}
+	// 该 key（客户端预生成 ID）已有租约：换 IP / 释放都按它定位
+	if _, err := leaseMgr.Ensure(context.Background(), spec, "clientkey1", "grp"); err != nil {
+		t.Fatalf("ensure lease: %v", err)
+	}
+
+	action := func(path string) *httptest.ResponseRecorder {
+		body := `{"proxy":{"kind":"ipv6pool","pool_id":"` + p.ID + `"},"key_id":"clientkey1","key_name":"草稿key"}`
+		rr := httptest.NewRecorder()
+		rootHandler(rr, adminReq(http.MethodPost, path, body, tok))
+		return rr
+	}
+
+	rr := action("/admin/api/pool/rotate")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("inline rotate status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var lease PoolLease
+	_ = json.Unmarshal(rr.Body.Bytes(), &lease)
+	if lease.ID != "gw-clientkey1" {
+		t.Fatalf("rotated lease = %+v, want gw-clientkey1", lease)
+	}
+	pool.mu.Lock()
+	_, exists := pool.leases["gw-clientkey1"]
+	pool.mu.Unlock()
+	if !exists {
+		t.Fatalf("inline rotate did not touch gw-clientkey1, leases: %v", pool.leases)
+	}
+
+	rr2 := action("/admin/api/pool/release")
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("inline release status=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+	pool.mu.Lock()
+	n := pool.releaseN
+	_, still := pool.leases["gw-clientkey1"]
+	pool.mu.Unlock()
+	if n == 0 || still {
+		t.Fatalf("inline release should drop gw-clientkey1 (released=%d, still=%v)", n, still)
+	}
+}
+
+// TestAdminPoolActionInlineProxyValidation：内联池操作缺 key_id / 非代理池配置时给出可读错误。
+func TestAdminPoolActionInlineProxyValidation(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+	pool, poolSrv := startFakePool(t)
+	p := &ProxyPool{Name: "p", PoolURL: poolSrv.URL, PoolToken: "tok"}
+	if err := store.PutProxyPool(p); err != nil {
+		t.Fatal(err)
+	}
+
+	// 缺 key_id：无法生成租约 ID
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/pool/rotate",
+		`{"proxy":{"kind":"ipv6pool","pool_id":"`+p.ID+`"},"key_id":""}`, tok))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400 body=%s", rr.Code, rr.Body.String())
+	}
+	// 未知 ID（既无内联 proxy、也无已保存 key）：仍回落到按存储定位并报错
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodPost, "/admin/api/pool/release", `{"channel_id":"nope","key_id":"nope"}`, tok))
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400 body=%s", rr2.Code, rr2.Body.String())
+	}
+	_ = pool
+}
+
+// TestNilUpKeyIgnored：请求体里出现 null key（JSON `[null]`）时丢弃而非 panic
+//（保存与内联测试两条路径都覆盖）。
+func TestNilUpKeyIgnored(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPut, "/admin/api/channels",
+		`{"name":"c","base_url":"http://127.0.0.1:1","enabled":true,
+		 "keys":[null,{"name":"k1","api_key":"sk-1","enabled":true}]}`, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if n := len(store.Snapshot().Channels[0].Keys); n != 1 {
+		t.Fatalf("null key should be dropped, got %d keys", n)
+	}
+
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodPost, "/admin/api/testkey",
+		`{"channel":{"name":"x","base_url":"http://127.0.0.1:1","keys":[null]},"model":"m"}`, tok))
+	if rr2.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400 body=%s", rr2.Code, rr2.Body.String())
 	}
 }

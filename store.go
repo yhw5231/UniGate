@@ -288,9 +288,76 @@ func (c *Channel) cooldownModelFor(model string) string {
 	return ""
 }
 
+// baseEndpointSuffixes 已指向具体上游端点的 BaseURL 末段：命中时不再补版本段
+// （用户把完整端点地址粘进 BaseURL 时按原样使用）。
+var baseEndpointSuffixes = []string{
+	"/chat/completions", "/responses", "/models", "/embeddings",
+	"/images/generations", "/images/edits", "/images/variations", "/videos/generations",
+}
+
+// looksLikeVersionSeg 判断路径段是否为 API 版本段（v1 / v2 / v4.1 / v1beta 之类）。
+func looksLikeVersionSeg(seg string) bool {
+	if len(seg) < 2 || (seg[0] != 'v' && seg[0] != 'V') {
+		return false
+	}
+	if seg[1] < '0' || seg[1] > '9' {
+		return false
+	}
+	for i := 2; i < len(seg); i++ {
+		c := seg[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeBaseURL 规范化「OpenAI 兼容前缀」（渠道 / Key 的 BaseURL），自适应补全
+// 版本段：
+//   - 去首尾空白与末尾 "/"；
+//   - 已含版本段（/v1、/api/v1、/v4、/v1beta…）或已指向具体端点（/chat/completions、
+//     /responses、/models、/embeddings…）时原样返回；
+//   - 其余自动补 "/v1"：裸站点 https://api.deepseek.com → https://api.deepseek.com/v1，
+//     自定义前缀 https://host/openai → https://host/openai/v1。
+//
+// 这样「只填站点根」也能直接工作，同时不会把写好版本段/完整端点的地址补成
+// /v1/v1。带查询串或片段的地址（如 Azure 的 ?api-version=…）不做改写。
+func normalizeBaseURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	for strings.HasSuffix(s, "/") {
+		s = s[:len(s)-1]
+	}
+	if s == "" || strings.ContainsAny(s, "?#") {
+		return s
+	}
+	rest := s
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	}
+	i := strings.Index(rest, "/")
+	if i < 0 {
+		return s + "/v1" // 裸 host[:port]：补版本段
+	}
+	path := rest[i:]
+	lower := strings.ToLower(path)
+	for _, suf := range baseEndpointSuffixes {
+		if strings.HasSuffix(lower, suf) {
+			return s
+		}
+	}
+	for _, seg := range strings.Split(strings.Trim(path, "/"), "/") {
+		if looksLikeVersionSeg(seg) {
+			return s
+		}
+	}
+	return s + "/v1"
+}
+
 // chatURL 返回该渠道的 chat/completions 端点。
 func (c *Channel) chatURL() string {
-	base := strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
+	base := normalizeBaseURL(c.BaseURL)
 	if base == "" {
 		return ""
 	}
@@ -302,7 +369,7 @@ func (c *Channel) chatURL() string {
 
 // responsesURL 返回该渠道的 OpenAI Responses API 端点（/v1/responses）。
 func (c *Channel) responsesURL() string {
-	return responsesURLOf(strings.TrimRight(strings.TrimSpace(c.BaseURL), "/"))
+	return responsesURLOf(normalizeBaseURL(c.BaseURL))
 }
 
 // responsesURLOf 在给定 base 上推导 Responses API 端点。
@@ -355,7 +422,7 @@ func (c *Channel) modelsURL() string {
 	if u := strings.TrimSpace(c.ModelsURL); u != "" {
 		return u
 	}
-	base := strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
+	base := normalizeBaseURL(c.BaseURL)
 	if base == "" {
 		return ""
 	}
@@ -513,6 +580,29 @@ func (c *Channel) upstreamPinFor(model string) *ModelUpstreamPin {
 		}
 	}
 	return nil
+}
+
+// pinKeyFor 返回该渠道里与 model 等价的固定配置键（无则用 model 本身）：
+// 模型名归一化后，路由页分组名（对外名）与历史配置里的写法可能不同，复用等价键
+// 才不会让同一个模型留下两条固定配置。
+func pinKeyFor(c *Channel, model string) string {
+	model = strings.TrimSpace(model)
+	if c == nil || model == "" || len(c.ModelPins) == 0 {
+		return model
+	}
+	if _, ok := c.ModelPins[model]; ok {
+		return model
+	}
+	canon := canonicalModel(model)
+	if canon == "" {
+		return model
+	}
+	for _, k := range sortedKeys(c.ModelPins) {
+		if canonicalModel(k) == canon {
+			return k
+		}
+	}
+	return model
 }
 
 // GWKey 下游通用 key（供客户端调用本网关）。
@@ -728,11 +818,27 @@ func (s *GatewayStore) load() error {
 	}
 	// 迁移在发布前完成：发布出去的对象必须已定稿（不可变）
 	migrated := migrateInlinePools(&data)
+	// 历史配置里的模型名可能带上游前缀/变体后缀/大写写法（旧版直接把上游
+	// /models 的原文写进列表）：迁移为对外名 + 模型映射（转发仍用上游原写法），
+	// 使路由页与 /v1/models 不再出现带前缀的名字
+	migrated = migrateDeclaredModels(&data) || migrated
 	s.publishLocked(&data)
 	if migrated {
 		return s.saveLocked() // 迁移写回，保证之后保存的都是新的引用格式
 	}
 	return nil
+}
+
+// migrateDeclaredModels 把历史配置里的声明模型名归一化为对外名（原写法记进
+// 模型映射，转发行为不变）。无变化返回 false。
+func migrateDeclaredModels(data *gatewayConfig) bool {
+	changed := false
+	for _, ch := range data.Channels {
+		if ch != nil && ch.normalizeDeclaredModels(false) {
+			changed = true
+		}
+	}
+	return changed
 }
 
 // migrateInlinePools 把旧格式的内联代理池连接信息（key 上的 pool_url/
@@ -856,7 +962,7 @@ func (s *GatewayStore) PutChannel(ch *Channel) error {
 func normalizeChannel(ch *Channel) error {
 	ch.Name = strings.TrimSpace(ch.Name)
 	ch.Group = strings.TrimSpace(ch.Group)
-	ch.BaseURL = strings.TrimSpace(ch.BaseURL)
+	ch.BaseURL = normalizeBaseURL(ch.BaseURL)
 	if ch.Name == "" {
 		return errors.New("channel name required")
 	}
@@ -898,6 +1004,16 @@ func normalizeChannel(ch *Channel) error {
 	if ch.Keys == nil {
 		ch.Keys = []*UpKey{}
 	}
+	// 丢弃 null key（请求体里的 [null]）：后续归一化要解引用，留着会 panic
+	if keys := ch.Keys; len(keys) > 0 {
+		cleaned := make([]*UpKey, 0, len(keys))
+		for _, k := range keys {
+			if k != nil {
+				cleaned = append(cleaned, k)
+			}
+		}
+		ch.Keys = cleaned
+	}
 	// 模型固定配置归一化：非法/全空的条目直接删除
 	for m, p := range ch.ModelPins {
 		if p == nil || !p.normalize() {
@@ -909,6 +1025,9 @@ func normalizeChannel(ch *Channel) error {
 	}
 	ch.Models = normalizeModelList(ch.Models)
 	ch.ModelMap = normalizeModelMap(ch.ModelMap)
+	// 声明列表归一化：对外名（小写、去供应商前缀/变体后缀）对外暴露，原写法记进
+	// ModelMap 作为上游模型名（见 normalizeDeclaredModels）
+	ch.normalizeDeclaredModels(false)
 	for _, k := range ch.Keys {
 		if err := normalizeUpKey(k); err != nil {
 			return fmt.Errorf("key %q: %w", k.Name, err)
@@ -938,9 +1057,16 @@ func normalizeModelList(list []string) []string {
 	return out
 }
 
-// normalizeModelMap 清理渠道级模型映射：去空白、丢弃空键、丢弃「映射到自身」的
-// 无意义目标、目标去重保序；归一化后重复的键（不同写法指向同一模型）只保留首个
-// （按键名排序决定保留者）。某键的目标全部无效时删除该键；全空返回 nil。
+// normalizeModelMap 清理渠道级模型映射：去空白、丢弃空键、目标按字面去重保序；
+// 归一化后重复的键（不同写法指向同一模型）只保留首个（按键名排序决定保留者）。
+// 某键的目标全部无效时删除该键；全空返回 nil。
+//
+// 目标是按「字面」判重与判自身的，不是按归一化名：
+//   - 归一化只用于「同一个模型」的等价判定，而映射记录的是**上游真正认识的写法**
+//     ——"x=cline-free/x:free" 里两边归一化后同名，但上游要的正是后者，必须保留；
+//   - 与键字面相同的目标**单独出现**时等价于「不配置映射」（丢弃，省一条冗余配置），
+//     与其它上游模型**并列**时保留：它表示「也按这个名字原样发往上游」，是该模型
+//     在上游的另一个候选（如 x=x,cline-free/x:free：两个候选，各自独立冷却）。
 func normalizeModelMap(in ModelMap) ModelMap {
 	if len(in) == 0 {
 		return nil
@@ -965,18 +1091,14 @@ func normalizeModelMap(in ModelMap) ModelMap {
 		targetSeen := map[string]bool{}
 		for _, raw := range in[k] {
 			v := strings.TrimSpace(raw)
-			if v == "" || canonicalModel(v) == canonKey {
-				continue // 空值 / 映射到自身：不产生改写
-			}
-			c := canonicalModel(v)
-			if targetSeen[c] {
+			if v == "" || targetSeen[v] {
 				continue
 			}
-			targetSeen[c] = true
+			targetSeen[v] = true
 			targets = append(targets, v)
 		}
-		if len(targets) == 0 {
-			continue
+		if len(targets) == 0 || (len(targets) == 1 && targets[0] == key) {
+			continue // 空 / 只映射到自身：不产生改写
 		}
 		seen[canonKey] = key
 		out[key] = targets
@@ -990,7 +1112,7 @@ func normalizeModelMap(in ModelMap) ModelMap {
 func normalizeUpKey(k *UpKey) error {
 	k.Name = strings.TrimSpace(k.Name)
 	k.APIKey = strings.TrimSpace(k.APIKey)
-	k.BaseURL = strings.TrimSpace(k.BaseURL)
+	k.BaseURL = normalizeBaseURL(k.BaseURL)
 	if k.APIKey != "" {
 		if err := validateAPIKey(k.APIKey); err != nil {
 			return err

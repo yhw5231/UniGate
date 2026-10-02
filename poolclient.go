@@ -373,16 +373,17 @@ func leaseIDFor(spec *ProxySpec, keyID string) string {
 }
 
 // proxyGroup 计算代理共享分组（生效 BaseURL）：key 级 BaseURL 覆盖优先，否则渠道 BaseURL。
-// 尾部斜杠归一化，避免同一渠道因书写差异被拆成两组。
+// 按 BaseURL 归一化（含版本段自适应补全）后比较，避免同一站点因书写差异
+//（尾部斜杠、少写 /v1）被拆成两组而让同站点的 key 落到同一出口 IP。
 func proxyGroup(ch *Channel, k *UpKey) string {
 	u := ""
 	if k != nil {
-		u = strings.TrimSpace(k.BaseURL)
+		u = k.BaseURL
 	}
-	if u == "" && ch != nil {
-		u = strings.TrimSpace(ch.BaseURL)
+	if strings.TrimSpace(u) == "" && ch != nil {
+		u = ch.BaseURL
 	}
-	return strings.TrimRight(u, "/")
+	return normalizeBaseURL(u)
 }
 
 // leaseUsageLocked 统计某池下每个租约的占用情况（调用方持有写锁）：

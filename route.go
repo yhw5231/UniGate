@@ -93,7 +93,7 @@ func (c *candidate) cooldownModel(model string) string {
 // 选择 /chat/completions 或 OpenAI Responses API 的 /responses）。
 func (c *candidate) chatTarget() string {
 	if u := c.k.BaseURL; u != "" {
-		base := trimSlash(u)
+		base := normalizeBaseURL(u)
 		if c.ch.EndpointType == endpointResponses {
 			return responsesURLOf(base)
 		}
@@ -105,21 +105,14 @@ func (c *candidate) chatTarget() string {
 	return c.ch.endpointURL()
 }
 
-func trimSlash(s string) string {
-	for len(s) > 0 && s[len(s)-1] == '/' {
-		s = s[:len(s)-1]
-	}
-	return s
-}
-
 // targetFor 返回该候选的非对话端点（embeddings/图片/视频等，suffix 如
 // "/embeddings"）：key BaseURL 优先，其次渠道 BaseURL；BaseURL 已以该路径
 // 结尾（配置了完整端点地址）时原样使用，否则拼接。不做 Responses 转换与
 // 版本段推导——非对话接口不与 chatTarget 的端点类型逻辑混用。
 func (c *candidate) targetFor(suffix string) string {
-	base := trimSlash(c.k.BaseURL)
+	base := normalizeBaseURL(c.k.BaseURL)
 	if base == "" {
-		base = strings.TrimRight(strings.TrimSpace(c.ch.BaseURL), "/")
+		base = normalizeBaseURL(c.ch.BaseURL)
 	}
 	if base == "" {
 		return ""
@@ -894,7 +887,7 @@ type RouteKeyStatus struct {
 	Key       string `json:"key"`
 	KeyOn     bool   `json:"key_enabled"`
 	Schedule  string `json:"schedule"`                 // 渠道生效的账号调度模式
-	Upstream  string `json:"upstream_model,omitempty"` // 该候选实际发往上游的模型名（与分组名不同时展示）
+	Upstream  string `json:"upstream_model,omitempty"` // 该候选实际发往上游的模型名（映射行一律展示，含与分组名同名的写法）
 	CoolModel string `json:"cool_model,omitempty"`     // 冷却键的 model 部分（解除该行冷却时用）
 	Status    string `json:"status"`                   // ok / cooling / disabled
 	Until     int64  `json:"until_unix,omitempty"`
@@ -927,6 +920,10 @@ type RouteStatusData struct {
 // 会出现在每个模型分组里。若所有渠道都未声明模型，则合并为单个空模型分组
 //（前端标注「全部模型」）。查询参数 model 会先经别名解析再匹配（与网关路由一致）。
 //
+// 分组名统一走 exposedModelName：历史配置里存着上游原写法（"cline-free/x:free"）
+// 时，路由页展示的仍是下游可调用的干净名字；实际发往上游的名字在该分组的
+// upstream_model 列（渠道模型映射/原写法）里给出。
+//
 // 渠道把一个下游模型映射到多个上游模型时（如 cn:x、global:y 都对外叫 x），该分组下
 // 每个 (渠道, key) 展开为多行，每行标注 upstream_model 并各自检查冷却——与网关
 // 实际候选一致（每个上游模型独立冷却）。
@@ -948,15 +945,15 @@ func routeStatusData(model string) *RouteStatusData {
 	}
 
 	if model != "" {
-		get(model)
+		get(exposedModelName(model))
 	} else {
 		for _, ch := range snap.Channels {
 			for _, m := range ch.Models {
-				get(m)
+				get(exposedModelName(m))
 			}
 			// 映射键（下游模型名）也是该渠道支持的可调用名，单独列出分组
 			for _, m := range ch.modelMapKeys() {
-				get(m)
+				get(exposedModelName(m))
 			}
 		}
 		// 别名分组（如 my-gpt → gpt-4o）：路由候选与目标模型一致，单独列出便于核对
@@ -999,8 +996,8 @@ func routeStatusData(model string) *RouteStatusData {
 						Schedule:  ch.effectiveSchedule(def),
 						CoolModel: row.cool,
 					}
-					if row.upstream != "" && row.upstream != g.Model {
-						st.Upstream = row.upstream // 与分组名相同则不必重复展示
+					if row.upstream != "" && (row.mapped || row.upstream != g.Model) {
+						st.Upstream = row.upstream // 映射行即使与分组名相同也标注（多候选可核对）
 					}
 					switch {
 					case !ch.Enabled || !k.Enabled:

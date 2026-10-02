@@ -123,8 +123,8 @@ func TestEmbeddingsForward(t *testing.T) {
 		t.Fatalf("status=%d, body=%s", rr.Code, rr.Body.String())
 	}
 	path, auth, ct, got := up.last()
-	if path != "/embeddings" {
-		t.Fatalf("upstream path=%q, want /embeddings", path)
+	if path != "/v1/embeddings" {
+		t.Fatalf("upstream path=%q, want /v1/embeddings", path)
 	}
 	if auth != "Bearer sk-1" {
 		t.Fatalf("upstream auth=%q", auth)
@@ -174,8 +174,8 @@ func TestImageGenerationsForward(t *testing.T) {
 		t.Fatalf("status=%d, body=%s", rr.Code, rr.Body.String())
 	}
 	path, auth, _, _ := up.last()
-	if path != "/images/generations" {
-		t.Fatalf("upstream path=%q, want /images/generations", path)
+	if path != "/v1/images/generations" {
+		t.Fatalf("upstream path=%q, want /v1/images/generations", path)
 	}
 	if auth != "Bearer sk-1" {
 		t.Fatalf("upstream auth=%q", auth)
@@ -201,8 +201,8 @@ func TestImageEditsMultipartForward(t *testing.T) {
 		t.Fatalf("status=%d, body=%s", rr.Code, rr.Body.String())
 	}
 	path, _, ct, got := up.last()
-	if path != "/images/edits" {
-		t.Fatalf("upstream path=%q, want /images/edits", path)
+	if path != "/v1/images/edits" {
+		t.Fatalf("upstream path=%q, want /v1/images/edits", path)
 	}
 	if ct != ctype {
 		t.Fatalf("upstream content-type=%q, want original %q", ct, ctype)
@@ -227,8 +227,8 @@ func TestVideoGenerationsForward(t *testing.T) {
 		t.Fatalf("status=%d, body=%s", rr.Code, rr.Body.String())
 	}
 	path, _, _, _ := up.last()
-	if path != "/videos/generations" {
-		t.Fatalf("upstream path=%q, want /videos/generations", path)
+	if path != "/v1/videos/generations" {
+		t.Fatalf("upstream path=%q, want /v1/videos/generations", path)
 	}
 	if !strings.Contains(rr.Body.String(), `"task_id":"task-123"`) {
 		t.Fatalf("downstream body not passthrough: %q", rr.Body.String())
@@ -251,8 +251,8 @@ func TestOtherEndpointSkipsResponsesTranslation(t *testing.T) {
 		t.Fatalf("status=%d, body=%s", rr.Code, rr.Body.String())
 	}
 	path, _, _, got := up.last()
-	if path != "/embeddings" {
-		t.Fatalf("upstream path=%q, want /embeddings (not /responses)", path)
+	if path != "/v1/embeddings" {
+		t.Fatalf("upstream path=%q, want /v1/embeddings (not /responses)", path)
 	}
 	if string(got) != body {
 		t.Fatalf("upstream body was translated: got %q want %q", got, body)
@@ -300,7 +300,7 @@ func TestOtherEndpointFailoverOn429(t *testing.T) {
 		t.Fatalf("status=%d, body=%s", rr.Code, rr.Body.String())
 	}
 	path, auth, _, _ := up2.last()
-	if path != "/embeddings" || auth != "Bearer sk-2" {
+	if path != "/v1/embeddings" || auth != "Bearer sk-2" {
 		t.Fatalf("second key not served: path=%q auth=%q", path, auth)
 	}
 	// 首 key 已按 key 粒度（默认冷却域，跨模型共享）记冷却

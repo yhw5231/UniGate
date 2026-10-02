@@ -152,6 +152,8 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 .badge.group { background: rgba(224,168,60,.15); color: var(--warn); }
 .badge.warn { background: rgba(224,168,60,.2); color: var(--warn); }
 .badge.free { background: rgba(53,194,110,.15); color: var(--ok); font-size: 11px; padding: 1px 6px; font-style: normal; }
+/* 上游原写法标记（对外名 → 上游名）：中性灰，提示「发往上游用的是这个名字」 */
+.badge.src { background: rgba(139,149,163,.18); color: var(--muted); font-size: 11px; padding: 1px 6px; font-style: normal; font-weight: normal; }
 
 /* 版本号 */
 .ver {
@@ -232,6 +234,10 @@ tr.tog-open .tr-toggle { color: var(--accent); }
   background: var(--panel2); padding: 8px 10px;
 }
 .fetch-panel-head { display: flex; align-items: center; gap: 8px; }
+/* 候选模型搜索过滤：输入框占满，右侧显示匹配/已选计数 */
+.fetch-filter { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.fetch-filter input { flex: 1; min-width: 120px; }
+.fetch-filter .muted { white-space: nowrap; }
 .fetch-list {
   max-height: 220px; overflow: auto; margin-top: 6px;
   display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px; font-size: 12px;

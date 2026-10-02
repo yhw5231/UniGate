@@ -54,6 +54,184 @@ func isModelVariantTag(tag string) bool {
 	return tag == "" || modelVariantTags[tag]
 }
 
+// modelIdentity 模型对外暴露的名字（对标 go-gateway 的 modelIdentity）：归一化名
+// ——小写、去掉供应商前缀（"cline-free/x" → "x"）与变体后缀（"x:free" → "x"）。
+// 归一化结果为空（名字里没有模型名，如 "cn:"）时退回原样去空白。
+//
+// 上游用什么写法、下游看到什么名字由此分开：上游 /models 报
+// "cline-free/deepseek-v4.1-flash:free" 时，路由与 /v1/models 对外都是
+// "deepseek-v4.1-flash"，而上游仍然收到它自己的写法（见 Channel.ModelMap）。
+func modelIdentity(name string) string {
+	if c := canonicalModel(name); c != "" {
+		return c
+	}
+	return strings.TrimSpace(name)
+}
+
+// exposedModelName 对外展示/可调用的模型名：普通名取 modelIdentity，通配/正则
+// 模式原样保留——模式不是模型名，归一化会把 "re:^gpt-4/.*$" 这类写法截断。
+// /v1/models 与路由视图统一用它，避免上游报的前缀/后缀/大小写漏到下游。
+func exposedModelName(name string) string {
+	p := strings.TrimSpace(name)
+	if p == "" || !modelPatternIsPlain(p) {
+		return p
+	}
+	return modelIdentity(p)
+}
+
+// normalizeDeclaredModels 归一化渠道声明的模型列表，并把上游原写法记进模型映射：
+//   - 通配/正则模式原样保留（模式不参与归一化）；
+//   - 普通名归一化为对外名（小写、去供应商前缀与 ":free" 类变体后缀），原写法
+//     作为该名字的上游模型写进 ModelMap——转发时按原写法发往上游，与 go-gateway
+//     「路由用规范名、渠道记 source_model」是同一套语义；
+//   - 同一个对外名在上游的多个写法各记一条映射目标，路由时**各成一个候选**：
+//     请求按顺序尝试、冷却各自独立计算（"x" 与 "x:free" 同列时两个都是候选，
+//     不会只留下其中一个）；对外始终只暴露一个名字（ModelMap 的键）；
+//   - 归一化后重复的条目合并（映射目标按出现顺序累加，字面去重保序）。
+//
+// pruneStale 为真（「以上游为准」全量替换）时丢弃规范名不在新列表里的映射键。
+// 返回列表或映射是否发生了变化（加载历史配置时的迁移据此决定要不要写回）。
+func (c *Channel) normalizeDeclaredModels(pruneStale bool) bool {
+	if c == nil {
+		return false
+	}
+	oldModels, oldMap := c.Models, c.ModelMap
+	models := normalizeModelList(c.Models)
+	mapping := make(ModelMap, len(c.ModelMap))
+	for k, v := range c.ModelMap {
+		mapping[k] = append([]string{}, v...)
+	}
+	// 已有映射键按规范名索引：新的原写法合并进等价键，而不是另起一个等价键
+	//（normalizeModelMap 对等价键只保留一个，另起会把已有目标丢掉）
+	byCanon := map[string]string{}
+	for k := range mapping {
+		if canon := canonicalModel(k); canon != "" {
+			if prev, ok := byCanon[canon]; !ok || k < prev {
+				byCanon[canon] = k
+			}
+		}
+	}
+	// 先统计每个对外名在声明列表里出现的写法：同一对外名有多个写法时，与对外名
+	// 字面相同的那个也要记成候选（"x" 与 "x:free" 同时声明 = 两个候选）；只有一个
+	// 写法时不记（否则保存后再保存会不断给同一个名字加一个自身候选）。
+	spellings := map[string][]string{}
+	for _, raw := range models {
+		p := strings.TrimSpace(raw)
+		if p == "" || !modelPatternIsPlain(p) {
+			continue
+		}
+		id := modelIdentity(p)
+		if id == "" {
+			continue
+		}
+		if !containsString(spellings[id], p) {
+			spellings[id] = append(spellings[id], p)
+		}
+	}
+	out := make([]string, 0, len(models))
+	order := make([]string, 0, len(models)) // 对外名出现顺序
+	targets := map[string][]string{}        // 对外名 → 该名字的上游写法（保序去重）
+	seen := map[string]bool{}
+	for _, raw := range models {
+		p := strings.TrimSpace(raw)
+		if p == "" {
+			continue
+		}
+		if !modelPatternIsPlain(p) {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+			continue
+		}
+		id := modelIdentity(p)
+		if id == "" {
+			continue
+		}
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+			order = append(order, id)
+		}
+		if (p != id || len(spellings[id]) > 1) && !containsString(targets[id], p) {
+			targets[id] = append(targets[id], p)
+		}
+	}
+	for _, id := range order {
+		key := id
+		if canon := canonicalModel(id); canon != "" {
+			if existing, ok := byCanon[canon]; ok {
+				key = existing
+			} else {
+				byCanon[canon] = id
+			}
+		}
+		for _, up := range targets[id] {
+			if !containsString(mapping[key], up) {
+				mapping[key] = append(mapping[key], up)
+			}
+		}
+	}
+	if pruneStale {
+		live := map[string]bool{}
+		for _, m := range out {
+			if canon := canonicalModel(m); canon != "" {
+				live[canon] = true
+			}
+		}
+		for k := range mapping {
+			if canon := canonicalModel(k); canon == "" || !live[canon] {
+				delete(mapping, k)
+			}
+		}
+	}
+	c.Models = out
+	c.ModelMap = normalizeModelMap(mapping)
+	return !sameModelList(oldModels, c.Models) || !sameModelMap(oldMap, c.ModelMap)
+}
+
+// containsString 列表里是否已有该值（字面比较）。
+func containsString(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+// sameModelList 两个模型名列表是否完全相同（含顺序）。
+func sameModelList(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameModelMap 两个模型映射是否完全相同（键、目标与顺序）。
+func sameModelMap(a, b ModelMap) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok || len(va) != len(vb) {
+			return false
+		}
+		for i := range va {
+			if va[i] != vb[i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // modelPatternRegexBody "re:" 前缀的正则模式体（大小写不敏感前缀）。
 func modelPatternRegexBody(pattern string) (string, bool) {
 	if len(pattern) > 3 && strings.EqualFold(pattern[:3], "re:") {
@@ -220,20 +398,19 @@ func modelMapTargets(mapping ModelMap, model string) []string {
 	return nil
 }
 
-// cleanModelTargets 清理映射目标列表：去空白、去空项、按归一化名去重、保序。
+// cleanModelTargets 清理映射目标列表：去空白、去空项、按**字面**去重、保序。
+//
+// 不按归一化名去重：映射的目标是上游真正认识的写法，同一模型在上游的多个写法
+// （如 x 与 cline-free/x:free）各自是一个候选、各自独立冷却，合并会丢掉候选。
 func cleanModelTargets(in []string) []string {
 	var out []string
 	seen := map[string]bool{}
 	for _, raw := range in {
 		v := strings.TrimSpace(raw)
-		if v == "" {
+		if v == "" || seen[v] {
 			continue
 		}
-		c := canonicalModel(v)
-		if seen[c] {
-			continue
-		}
-		seen[c] = true
+		seen[v] = true
 		out = append(out, v)
 	}
 	return out
@@ -396,6 +573,7 @@ func newCandidate(ch *Channel, k *UpKey, model string) candidate {
 type upstreamRow struct {
 	upstream string // 发往上游的模型名（"" = 原样发送下游请求名）
 	cool     string // 冷却键 model 部分（"" = 按 key 跨模型共享）
+	mapped   bool   // 该行来自渠道模型映射（与分组名相同也要展示，便于核对）
 }
 
 // channelUpstreamRows 该渠道对一个模型分组应展开的候选行，规则与 newCandidates
@@ -412,7 +590,7 @@ func channelUpstreamRows(ch *Channel, rawModel, routeModel string) []upstreamRow
 		}
 		rows := make([]upstreamRow, 0, len(targets))
 		for _, up := range targets {
-			rows = append(rows, upstreamRow{upstream: up, cool: up})
+			rows = append(rows, upstreamRow{upstream: up, cool: up, mapped: true})
 		}
 		return rows
 	}

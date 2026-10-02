@@ -131,8 +131,8 @@ func TestAdminFetchModelsSetsAvailableModels(t *testing.T) {
 		t.Fatalf("response enabled: %v", out.Enabled)
 	}
 	mu.Lock()
-	if auths["/models"] != "Bearer sk-test" {
-		t.Fatalf("models fetch should send Bearer key, got %q", auths["/models"])
+	if auths["/v1/models"] != "Bearer sk-test" {
+		t.Fatalf("models fetch should send Bearer key, got %q", auths["/v1/models"])
 	}
 	mu.Unlock()
 

@@ -396,7 +396,8 @@ func TestGatewayKeyModelRestriction(t *testing.T) {
 	}
 }
 
-// TestRouteStatusDataModelGrouping 路由页视图：模型分组包含通配/归一化命中的渠道。
+// TestRouteStatusDataModelGrouping 路由页视图：模型分组按对外名（归一化后）列出，
+// 声明里写上游原写法（供应商前缀）时也只出现干净的分组名，不出现带前缀的重复分组。
 func TestRouteStatusDataModelGrouping(t *testing.T) {
 	setupGateway(t)
 	mustPutChannel(t, &Channel{Name: "a", BaseURL: "https://a.example/v1", Enabled: true,
@@ -405,26 +406,38 @@ func TestRouteStatusDataModelGrouping(t *testing.T) {
 	mustPutChannel(t, &Channel{Name: "b", BaseURL: "https://b.example/v1", Enabled: true,
 		Keys: []*UpKey{{Name: "k2", APIKey: "sk-2", Enabled: true}}})
 
+	// 声明列表归一化：上游原写法进了模型映射（发往上游仍用它自己的写法）
+	if got := store.View().Channels[0].Models; len(got) != 2 || got[0] != "deepseek-v4-flash" {
+		t.Fatalf("declared models should be canonical: %v", got)
+	}
+	if got := store.View().Channels[0].ModelMap["deepseek-v4-flash"]; len(got) != 1 || got[0] != "deepseek/deepseek-v4-flash" {
+		t.Fatalf("upstream spelling should be kept in model_map: %+v", store.View().Channels[0].ModelMap)
+	}
+
 	data := routeStatusData("")
 	byModel := map[string]*RouteModelGroup{}
 	for i := range data.Models {
 		byModel[data.Models[i].Model] = &data.Models[i]
 	}
-	g := byModel["deepseek/deepseek-v4-flash"]
+	g := byModel["deepseek-v4-flash"]
 	if g == nil || len(g.Keys) != 2 {
-		t.Fatalf("model group with declared prefix: %+v", g)
+		t.Fatalf("canonical model group: %+v (all=%v)", g, byModel)
+	}
+	if _, dup := byModel["deepseek/deepseek-v4-flash"]; dup {
+		t.Fatalf("带前缀的写法不应另成分组: %v", byModel)
+	}
+	// 该分组发往上游的名字仍是上游原写法
+	if g.Keys[0].Upstream != "deepseek/deepseek-v4-flash" {
+		t.Fatalf("upstream model should keep the declared spelling: %+v", g.Keys[0])
 	}
 	// 通配命中的渠道
-	if g := byModel["claude-3-5-sonnet"]; g == nil && len(byModel) > 0 {
-		// "claude-*" 是通配声明：作为分组名列出，渠道 a 命中，渠道 b 未声明列表 → 全放行
-	}
 	wild := byModel["claude-*"]
 	if wild == nil || len(wild.Keys) != 2 {
 		t.Fatalf("wildcard group: %+v", wild)
 	}
-	// 单模型查询按归一化匹配渠道
-	single := routeStatusData("deepseek-v4-flash")
-	if len(single.Models) != 1 || len(single.Models[0].Keys) != 2 {
+	// 单模型查询：带前缀的写法按归一化落到同一分组
+	single := routeStatusData("deepseek/deepseek-v4-flash")
+	if len(single.Models) != 1 || single.Models[0].Model != "deepseek-v4-flash" || len(single.Models[0].Keys) != 2 {
 		t.Fatalf("normalized single-model view: %+v", single.Models)
 	}
 }

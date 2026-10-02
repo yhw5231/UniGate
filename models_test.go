@@ -11,7 +11,35 @@ import (
 	"testing"
 )
 
-// ---- parseModelsPayload：价格解析与免费标记 ----
+// ---- parseModelsPayload：价格解析、免费标记与分组形态 ----
+
+// fetchedIDs / fetchedFreeIDs 测试辅助：取条目 ID / 免费条目 ID。
+func fetchedIDs(list []fetchedModel) []string {
+	out := make([]string, 0, len(list))
+	for _, m := range list {
+		out = append(out, m.ID)
+	}
+	return out
+}
+
+func fetchedFreeIDs(list []fetchedModel) []string {
+	var out []string
+	for _, m := range list {
+		if m.Free {
+			out = append(out, m.ID)
+		}
+	}
+	return out
+}
+
+func fetchedGroupOf(list []fetchedModel, id string) string {
+	for _, m := range list {
+		if m.ID == id {
+			return m.Group
+		}
+	}
+	return ""
+}
 
 func TestParseModelsPayloadPricing(t *testing.T) {
 	body := `{"data":[
@@ -22,52 +50,127 @@ func TestParseModelsPayloadPricing(t *testing.T) {
 		{"id":"m-noprice"},
 		{"id":"m-io","pricing":{"input":0,"output":0}}
 	]}`
-	models, free, err := parseModelsPayload([]byte(body))
+	models, err := parseModelsPayload([]byte(body))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	wantModels := []string{"m-free", "m-free-num", "m-paid", "m-half", "m-noprice", "m-io"}
-	if strings.Join(models, ",") != strings.Join(wantModels, ",") {
-		t.Fatalf("models=%v want %v", models, wantModels)
+	if strings.Join(fetchedIDs(models), ",") != strings.Join(wantModels, ",") {
+		t.Fatalf("models=%v want %v", fetchedIDs(models), wantModels)
 	}
 	wantFree := []string{"m-free", "m-free-num", "m-io"}
-	if strings.Join(free, ",") != strings.Join(wantFree, ",") {
-		t.Fatalf("free=%v want %v", free, wantFree)
+	if strings.Join(fetchedFreeIDs(models), ",") != strings.Join(wantFree, ",") {
+		t.Fatalf("free=%v want %v", fetchedFreeIDs(models), wantFree)
+	}
+	// OpenAI 形态没有分组
+	if g := fetchedGroupOf(models, "m-free"); g != "" {
+		t.Fatalf("openai shape should have no group, got %q", g)
+	}
+}
+
+// 分组对象形态（Cline 的 /api/v1/ai/cline/recommended-models）：
+// 字段名就是分组名，free 分组与 :free 后缀都记为免费，分组顺序按响应原文。
+func TestParseModelsPayloadGroupedShape(t *testing.T) {
+	body := `{
+		"recommended":[
+			{"id":"anthropic/claude-sonnet-5.5","name":"claude-sonnet-5.5","description":"","tags":["NEW"]},
+			{"id":"openai/gpt-6-astra","name":"gpt-6-astra","description":"","tags":["NEW"]}
+		],
+		"free":[
+			{"id":"cline-free/deepseek-v4.1-flash","name":"Deepseek-v4.1-Flash","description":"Fast","tags":[]},
+			{"id":"z-ai/glm-5.3:free","name":"glm-5.3"}
+		],
+		"clinePass":[{"id":"cline-pass/deepseek-v4.1-flash","name":"cline-pass/deepseek-v4.1-flash"}],
+		"clineCloud":[{"id":"cline-cloud/glm-5.3"}]
+	}`
+	models, err := parseModelsPayload([]byte(body))
+	if err != nil {
+		t.Fatalf("parse grouped: %v", err)
+	}
+	want := "anthropic/claude-sonnet-5.5,openai/gpt-6-astra,cline-free/deepseek-v4.1-flash,z-ai/glm-5.3:free,cline-pass/deepseek-v4.1-flash,cline-cloud/glm-5.3"
+	if got := strings.Join(fetchedIDs(models), ","); got != want {
+		t.Fatalf("ids=%v want %v", got, want)
+	}
+	if g := fetchedGroupOf(models, "anthropic/claude-sonnet-5.5"); g != "recommended" {
+		t.Fatalf("group of recommended model = %q", g)
+	}
+	if g := fetchedGroupOf(models, "cline-pass/deepseek-v4.1-flash"); g != "clinePass" {
+		t.Fatalf("group of clinePass model = %q", g)
+	}
+	// free 分组整组免费；:free 后缀同样免费；其余不免费
+	wantFree := "cline-free/deepseek-v4.1-flash,z-ai/glm-5.3:free"
+	if got := strings.Join(fetchedFreeIDs(models), ","); got != wantFree {
+		t.Fatalf("free=%v want %v", got, wantFree)
+	}
+	// 分组顺序保持响应原文（map 会丢顺序）
+	groups := fetchedModelGroups(fetchedCandidates(models))
+	var names []string
+	for _, g := range groups {
+		names = append(names, g["name"].(string))
+	}
+	if strings.Join(names, ",") != "recommended,free,clinePass,clineCloud" {
+		t.Fatalf("group order = %v", names)
+	}
+	if groups[1]["free"] != true || groups[0]["free"] != false {
+		t.Fatalf("group free flags = %+v", groups)
+	}
+	if n := groups[1]["total"].(int); n != 2 {
+		t.Fatalf("free group size = %d", n)
+	}
+}
+
+// data 里再嵌一层分组对象也支持（部分网关把分组放在 data 下）。
+func TestParseModelsPayloadNestedGroups(t *testing.T) {
+	body := `{"data":{"free":[{"id":"a/x:free"}],"paid":[{"id":"b/y"}]}}`
+	models, err := parseModelsPayload([]byte(body))
+	if err != nil {
+		t.Fatalf("parse nested: %v", err)
+	}
+	if got := strings.Join(fetchedIDs(models), ","); got != "a/x:free,b/y" {
+		t.Fatalf("ids=%v", got)
+	}
+	if g := fetchedGroupOf(models, "b/y"); g != "paid" {
+		t.Fatalf("group=%q", g)
 	}
 }
 
 func TestParseModelsPayloadInvalid(t *testing.T) {
-	if _, _, err := parseModelsPayload([]byte(`not json`)); err == nil {
+	if _, err := parseModelsPayload([]byte(`not json`)); err == nil {
 		t.Fatal("expected error for invalid json")
 	}
-	models, free, err := parseModelsPayload([]byte(`{"data":[]}`))
-	if err != nil || models != nil || free != nil {
-		t.Fatalf("empty data: %v %v %v", models, free, err)
+	models, err := parseModelsPayload([]byte(`{"data":[]}`))
+	if err != nil || len(models) != 0 {
+		t.Fatalf("empty data: %v %v", models, err)
 	}
 }
 
 // 非标准 /models 响应形态的兼容：裸数组对象、裸字符串数组、name/model 回退
 func TestParseModelsPayloadAlternateShapes(t *testing.T) {
 	// 裸对象数组（无 data 包装）
-	models, _, err := parseModelsPayload([]byte(`[{"id":"a"},{"name":"n1"},{"model":"m1"},{}]`))
+	models, err := parseModelsPayload([]byte(`[{"id":"a"},{"name":"n1"},{"model":"m1"},{}]`))
 	if err != nil {
 		t.Fatalf("bare object array: %v", err)
 	}
-	if strings.Join(models, ",") != "a,n1,m1" {
-		t.Fatalf("bare object array models: %v", models)
+	if strings.Join(fetchedIDs(models), ",") != "a,n1,m1" {
+		t.Fatalf("bare object array models: %v", fetchedIDs(models))
 	}
 	// 裸字符串数组
-	models, _, err = parseModelsPayload([]byte(`["x","y"]`))
-	if err != nil || strings.Join(models, ",") != "x,y" {
-		t.Fatalf("bare string array: %v %v", models, err)
+	models, err = parseModelsPayload([]byte(`["x","y"]`))
+	if err != nil || strings.Join(fetchedIDs(models), ",") != "x,y" {
+		t.Fatalf("bare string array: %v %v", fetchedIDs(models), err)
 	}
 	// id 为数字（部分上游）应跳过而非报错
-	models, _, err = parseModelsPayload([]byte(`{"data":[{"id":123},{"name":"ok"}]}`))
-	if err != nil || strings.Join(models, ",") != "ok" {
-		t.Fatalf("numeric id skipped: %v %v", models, err)
+	models, err = parseModelsPayload([]byte(`{"data":[{"id":123},{"name":"ok"}]}`))
+	if err != nil || strings.Join(fetchedIDs(models), ",") != "ok" {
+		t.Fatalf("numeric id skipped: %v %v", fetchedIDs(models), err)
+	}
+	// models 包装字段（部分网关用 models 而不是 data）
+	models, err = parseModelsPayload([]byte(`{"models":[{"id":"w1"},{"id":"w2"}]}`))
+	if err != nil || strings.Join(fetchedIDs(models), ",") != "w1,w2" {
+		t.Fatalf("models wrapper: %v %v", fetchedIDs(models), err)
 	}
 	// 完全不是模型列表的响应
-	if _, _, err = parseModelsPayload([]byte(`{"error":{"message":"nope"}}`)); err == nil {
+	if _, err = parseModelsPayload([]byte(`{"error":{"message":"nope"}}`)); err == nil {
 		t.Fatal("expected error for non-model response")
 	}
 }

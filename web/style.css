@@ -228,7 +228,7 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 .settings-now { font-size: 12px; margin: 10px 0 0; }
 @media (max-width: 800px) { .settings-grid { grid-template-columns: 1fr; } }
 
-/* 拉取模型候选勾选面板 */
+/* 拉取模型候选勾选面板（旧版两栏清单；新选择器见下方 .model-picker） */
 .fetch-panel {
   margin-top: 8px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--panel2); padding: 8px 10px;
@@ -245,6 +245,49 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 .fetch-list label { display: flex; align-items: center; gap: 6px; padding: 1px 4px; white-space: nowrap; overflow: hidden; }
 .fetch-list label:hover { background: var(--border); color: var(--text); }
 @media (max-width: 800px) { .fetch-list { grid-template-columns: 1fr; } }
+
+/* 渠道模型选择器：一行一个模型（勾选=启用，行内可改「上游模型名」），按分组显示 */
+.model-picker {
+  margin-top: 8px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel2); padding: 8px 10px;
+}
+.mp-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mp-label { font-size: 13px; color: var(--text); }
+.mp-toolbar { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.mp-toolbar input[type="search"] { flex: 1; min-width: 140px; }
+.mp-toolbar #mpCustom { width: 220px; }
+.mp-toolbar .muted { white-space: nowrap; }
+.mp-list { max-height: 300px; overflow: auto; margin-top: 6px; }
+.mp-group { border-top: 1px solid var(--border); }
+.mp-group:first-child { border-top: none; }
+.mp-group-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 2px; font-size: 12px; position: sticky; top: 0;
+  background: var(--panel2); z-index: 1;
+}
+.mp-group-head .mp-caret { cursor: pointer; color: var(--muted); width: 12px; }
+.mp-group-head b { cursor: pointer; }
+.mp-group-head .muted { font-size: 12px; }
+.mp-rows { padding: 0 0 4px; }
+.mp-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 2px 4px; font-size: 12px; border-radius: 4px;
+}
+.mp-row:hover { background: var(--border); }
+.mp-row input[type="checkbox"] { flex: none; }
+.mp-name {
+  flex: 1; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: ui-monospace, Consolas, monospace;
+}
+.mp-name .badge { margin-left: 6px; }
+.mp-target {
+  flex: none; width: 260px; font-size: 12px;
+  font-family: ui-monospace, Consolas, monospace;
+}
+@media (max-width: 800px) {
+  .mp-row { flex-wrap: wrap; }
+  .mp-name, .mp-target { flex: 1 1 100%; width: auto; }
+}
 
 /* 弹窗 */
 .modal {

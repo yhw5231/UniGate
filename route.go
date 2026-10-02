@@ -944,10 +944,19 @@ func routeStatusData(model string) *RouteStatusData {
 		return g
 	}
 
+	// 已禁用渠道不参与路由：它的模型不出现在路由页（模型分组与候选行都跳过），
+	// 与 /v1/models、转发候选的选择保持一致——禁用即整体摘除，而不是显示成「已停用」。
+	active := make([]*Channel, 0, len(snap.Channels))
+	for _, ch := range snap.Channels {
+		if ch.Enabled {
+			active = append(active, ch)
+		}
+	}
+
 	if model != "" {
 		get(exposedModelName(model))
 	} else {
-		for _, ch := range snap.Channels {
+		for _, ch := range active {
 			for _, m := range ch.Models {
 				get(exposedModelName(m))
 			}
@@ -962,7 +971,7 @@ func routeStatusData(model string) *RouteStatusData {
 				get(alias)
 			}
 		}
-		if len(order) == 0 {
+		if len(order) == 0 && len(active) > 0 {
 			get("") // 无任何模型声明：单分组代表「对全部模型放行」的候选
 		}
 	}
@@ -971,15 +980,15 @@ func routeStatusData(model string) *RouteStatusData {
 	// 循环是「模型分组 × 渠道」嵌套，直接调用会退化成 O(模型² × 渠道)。
 	// 匹配器化后整体回到 O(模型 × 渠道)。allowAll = 未声明模型列表（放行全部）。
 	// 映射键（下游名）一并纳入：配了映射即可用该名调用，不必再写进 Models。
-	matchers := make([]*modelMatcher, len(snap.Channels))
-	for i, ch := range snap.Channels {
+	matchers := make([]*modelMatcher, len(active))
+	for i, ch := range active {
 		matchers[i] = newModelMatcher(append(append([]string{}, ch.Models...), ch.modelMapKeys()...))
 	}
 
 	for _, g := range groups {
 		// 冷却键与渠道匹配都用别名解析后的路由模型名
 		routeModel := resolveModelAlias(g.Model)
-		for i, ch := range snap.Channels {
+		for i, ch := range active {
 			if g.Model != "" && !matchers[i].match(g.Model) && !matchers[i].match(routeModel) {
 				continue // 该渠道未声明此模型、也没有对应映射
 			}

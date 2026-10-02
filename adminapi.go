@@ -935,6 +935,8 @@ func inlineChannel(src *Channel) (*Channel, error) {
 // fetchedModelsPayload 拉取结果的统一响应体：
 //   - fetched：上游候选（**上游写法**，每个上游模型一条，同一对外名的多个写法各自
 //     一条，WebUI 逐个勾选）；
+//   - groups：候选按上游给的分组聚合（name/free/models/total，保持上游顺序；
+//     Cline 的 recommended-models 会给出 recommended/free/clinePass/clineCloud）；
 //   - free_models：免费候选（fetched 的子集，仅展示不落盘）；
 //   - enabled / enabled_ids：渠道当前声明的模型（原文 / 对外名）；
 //   - enabled_upstream：候选里当前已生效的上游写法（WebUI 预勾选；渠道未声明模型
@@ -943,8 +945,8 @@ func inlineChannel(src *Channel) (*Channel, error) {
 //
 // 对外名与上游写法的关系是「多对一」：WebUI 用每个候选的 modelIdentity 显示对外名、
 // 用 fetched 里的原文写回模型映射，从而对外只暴露一个名字、上游仍收到各自写法。
-func fetchedModelsPayload(ch *Channel, fetched, free []string, usedKey string) map[string]any {
-	cands := fetchedCandidates(fetched, free)
+func fetchedModelsPayload(ch *Channel, fetched []fetchedModel, usedKey string) map[string]any {
+	cands := fetchedCandidates(fetched)
 	raws := fetchedRawModels(cands)
 	enabledIDs := make([]string, 0, len(ch.Models))
 	for _, m := range ch.Models {
@@ -959,6 +961,7 @@ func fetchedModelsPayload(ch *Channel, fetched, free []string, usedKey string) m
 	return map[string]any{
 		"channel_id":       ch.ID,
 		"fetched":          raws,
+		"groups":           fetchedModelGroups(cands),
 		"free_models":      fetchedFreeModels(cands),
 		"key_used":         usedKey,
 		"enabled":          ch.Models,
@@ -987,12 +990,12 @@ func handleAdminFetchModelsInline(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), fetchModelsTimeout+10*time.Second)
 	defer cancel()
-	fetched, free, usedKey, err := fetchUpstreamModels(ctx, ch)
+	fetched, usedKey, err := fetchUpstreamModels(ctx, ch)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "fetch models failed: "+err.Error(), "upstream_error")
 		return
 	}
-	writeJSON(w, http.StatusOK, fetchedModelsPayload(ch, fetched, free, usedKey))
+	writeJSON(w, http.StatusOK, fetchedModelsPayload(ch, fetched, usedKey))
 }
 
 // handleAdminFetchModels 用渠道的 key 拉取上游模型列表。
@@ -1007,7 +1010,7 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), fetchModelsTimeout+10*time.Second)
 	defer cancel()
-	fetched, free, usedKey, err := fetchUpstreamModels(ctx, ch)
+	fetched, usedKey, err := fetchUpstreamModels(ctx, ch)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "fetch models failed: "+err.Error(), "upstream_error")
 		return
@@ -1016,7 +1019,7 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 	// dry-run（默认）：不写回渠道，仅返回候选 + 当前已启用集合 + 上游已不再
 	// 返回的旧条目（stale，供 WebUI 提示「重建将移除这些模型」）
 	if r.URL.Query().Get("replace") != "1" {
-		writeJSON(w, http.StatusOK, fetchedModelsPayload(ch, fetched, free, usedKey))
+		writeJSON(w, http.StatusOK, fetchedModelsPayload(ch, fetched, usedKey))
 		return
 	}
 
@@ -1024,19 +1027,19 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 	// "cline-free/x:free" 存成 "x"），上游原写法记进 ModelMap 保证转发仍用
 	// 上游认识的写法；同时丢弃已不在列表里的旧映射键（以上游为准）
 	oldModels := ch.Models
-	ch.Models = fetched
+	ch.Models = fetchedRawModels(fetchedCandidates(fetched))
 	ch.normalizeDeclaredModels(true)
 	if err := store.PutChannel(ch); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "save channel: "+err.Error(), "internal")
 		return
 	}
 	log.Printf("admin replaced models for channel %q via key %q: %d models (%d free)",
-		ch.Name, usedKey, len(ch.Models), len(free))
+		ch.Name, usedKey, len(ch.Models), len(fetchedFreeModels(fetchedCandidates(fetched))))
 	// 新增模型尽早探测（替换只动模型列表，key 集合不变；同一套范围/节流/队列）
 	oldCh := *ch
 	oldCh.Models = oldModels
 	probes.ChannelUpdated(&oldCh, ch)
-	out := fetchedModelsPayload(ch, fetched, free, usedKey)
+	out := fetchedModelsPayload(ch, fetched, usedKey)
 	out["models"] = ch.Models
 	writeJSON(w, http.StatusOK, out)
 }

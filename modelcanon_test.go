@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -173,19 +174,22 @@ func TestSameIdentityMultipleUpstreamSpellings(t *testing.T) {
 }
 
 // TestFetchedCandidates 拉取候选：每个上游写法各占一条（同一对外名不合并，
-// 因为上游的不同写法是不同的上游模型，要能分别勾选），字面去重、保序、带免费标记。
+// 因为上游的不同写法是不同的上游模型，要能分别勾选），字面去重、保序、带免费标记与分组。
 func TestFetchedCandidates(t *testing.T) {
-	cands := fetchedCandidates(
-		[]string{"cline-free/DeepSeek-V4.1-Flash:free", "deepseek-v4.1-flash", "gpt-4o", "z-ai/glm-5.3", "gpt-4o"},
-		[]string{"cline-free/DeepSeek-V4.1-Flash:free"},
-	)
+	cands := fetchedCandidates([]fetchedModel{
+		{ID: "cline-free/DeepSeek-V4.1-Flash:free", Free: true, Group: "free"},
+		{ID: "deepseek-v4.1-flash", Group: "clinePass"},
+		{ID: "gpt-4o"},
+		{ID: "z-ai/glm-5.3", Group: "clineCloud"},
+		{ID: "gpt-4o"},
+	})
 	if len(cands) != 4 {
 		t.Fatalf("candidates = %+v", cands)
 	}
-	if cands[0].Raw != "cline-free/DeepSeek-V4.1-Flash:free" || cands[0].Name != "deepseek-v4.1-flash" || !cands[0].Free {
+	if cands[0].Raw != "cline-free/DeepSeek-V4.1-Flash:free" || cands[0].Name != "deepseek-v4.1-flash" || !cands[0].Free || cands[0].Group != "free" {
 		t.Fatalf("first candidate: %+v", cands[0])
 	}
-	if cands[1].Raw != "deepseek-v4.1-flash" || cands[1].Name != "deepseek-v4.1-flash" || cands[1].Free {
+	if cands[1].Raw != "deepseek-v4.1-flash" || cands[1].Name != "deepseek-v4.1-flash" || cands[1].Free || cands[1].Group != "clinePass" {
 		t.Fatalf("second candidate（同一对外名的另一个上游写法）: %+v", cands[1])
 	}
 	if strings.Join(fetchedRawModels(cands), ",") != "cline-free/DeepSeek-V4.1-Flash:free,deepseek-v4.1-flash,gpt-4o,z-ai/glm-5.3" {
@@ -194,12 +198,19 @@ func TestFetchedCandidates(t *testing.T) {
 	if strings.Join(fetchedFreeModels(cands), ",") != "cline-free/DeepSeek-V4.1-Flash:free" {
 		t.Fatalf("free = %v", fetchedFreeModels(cands))
 	}
+	groups := fetchedModelGroups(cands)
+	if len(groups) != 4 { // free / clinePass / "" / clineCloud（首次出现顺序）
+		t.Fatalf("groups = %+v", groups)
+	}
+	if groups[0]["name"] != "free" || groups[2]["name"] != "" || groups[3]["name"] != "clineCloud" {
+		t.Fatalf("group order = %+v", groups)
+	}
 }
 
 // TestEnabledUpstreamModels 预勾选集合：当前真正发往上游的名字（映射目标优先），
 // 未声明模型的渠道全选，通配覆盖的候选也算已启用。
 func TestEnabledUpstreamModels(t *testing.T) {
-	cands := fetchedCandidates([]string{"x", "x:free", "claude-3-5-sonnet", "gpt-4o"}, nil)
+	cands := fetchedCandidates([]fetchedModel{{ID: "x"}, {ID: "x:free"}, {ID: "claude-3-5-sonnet"}, {ID: "gpt-4o"}})
 	// 未声明任何模型（放行全部）→ 全选
 	if got := enabledUpstreamModels(&Channel{}, cands); strings.Join(got, ",") != "x,x:free,claude-3-5-sonnet,gpt-4o" {
 		t.Fatalf("allow-all should check every candidate: %v", got)
@@ -271,6 +282,121 @@ func TestFetchModelsInlineCanonicalPayload(t *testing.T) {
 	// stale 用归一化比较（Old-Prefixed/Model-A 上游未返回）
 	if strings.Join(out.Stale, ",") != "model-a" {
 		t.Fatalf("stale = %v", out.Stale)
+	}
+}
+
+// TestFetchModelsGroupedPayload 分组形态（Cline recommended-models）的内联拉取：
+// groups 按上游分组返回（顺序保持响应原文）、free 分组整组标记免费，
+// fetched 仍是上游写法（WebUI 逐个勾选），免费清单进 free_models。
+func TestFetchModelsGroupedPayload(t *testing.T) {
+	setupGateway(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"recommended":[{"id":"anthropic/claude-sonnet-5.5","name":"claude-sonnet-5.5","tags":["NEW"]}],
+			"free":[{"id":"cline-free/deepseek-v4.1-flash","name":"Deepseek-v4.1-Flash"}],
+			"clinePass":[{"id":"cline-pass/deepseek-v4.1-flash"}],
+			"clineCloud":[{"id":"cline-cloud/glm-5.3"}]}`))
+	}))
+	defer up.Close()
+
+	body := `{"channel":{"base_url":"` + up.URL + `","keys":[{"name":"k","api_key":"sk-f","enabled":true}]}}`
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/fetch-models", body, adminToken(t)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Fetched    []string `json:"fetched"`
+		FreeModels []string `json:"free_models"`
+		Groups     []struct {
+			Name   string   `json:"name"`
+			Free   bool     `json:"free"`
+			Models []string `json:"models"`
+			Total  int      `json:"total"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if strings.Join(out.Fetched, ",") != "anthropic/claude-sonnet-5.5,cline-free/deepseek-v4.1-flash,cline-pass/deepseek-v4.1-flash,cline-cloud/glm-5.3" {
+		t.Fatalf("fetched = %v", out.Fetched)
+	}
+	var names []string
+	for _, g := range out.Groups {
+		names = append(names, g.Name)
+	}
+	if strings.Join(names, ",") != "recommended,free,clinePass,clineCloud" {
+		t.Fatalf("group order = %v", names)
+	}
+	if out.Groups[1].Free != true || out.Groups[0].Free != false || out.Groups[1].Total != 1 {
+		t.Fatalf("free group = %+v", out.Groups[1])
+	}
+	if strings.Join(out.Groups[1].Models, ",") != "cline-free/deepseek-v4.1-flash" {
+		t.Fatalf("free group models = %v", out.Groups[1].Models)
+	}
+	if strings.Join(out.FreeModels, ",") != "cline-free/deepseek-v4.1-flash" {
+		t.Fatalf("free_models = %v", out.FreeModels)
+	}
+	// 未声明模型的渠道 = 全选（预勾选全部候选）
+	if len(out.Groups) != 4 {
+		t.Fatalf("groups = %+v", out.Groups)
+	}
+}
+
+// TestRouteExcludesDisabledChannels 已禁用渠道的模型不出现在路由视图里
+// （分组与候选行都不出现），只有显式查询该模型时才给出（且无候选行）。
+func TestRouteExcludesDisabledChannels(t *testing.T) {
+	setupGateway(t)
+	mustPutChannel(t, &Channel{Name: "on", BaseURL: "http://up-on", Enabled: true,
+		Models: []string{"m1"},
+		Keys:   []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	mustPutChannel(t, &Channel{Name: "off", BaseURL: "http://up-off", Enabled: false,
+		Models: []string{"m2", "m3"},
+		Keys:   []*UpKey{{Name: "k2", APIKey: "sk-2", Enabled: true}}})
+
+	view := routeStatusData("")
+	var names []string
+	for _, g := range view.Models {
+		names = append(names, g.Model)
+	}
+	if strings.Join(names, ",") != "m1" {
+		t.Fatalf("disabled channel models must not appear: %v", names)
+	}
+	if view.Total != 1 {
+		t.Fatalf("total rows = %d, want 1", view.Total)
+	}
+	for _, g := range view.Models {
+		for _, k := range g.Keys {
+			if k.Channel == "off" {
+				t.Fatalf("disabled channel row leaked into route view: %+v", k)
+			}
+		}
+	}
+	// 显式查询该模型：分组存在（用户点名要看），但没有候选行
+	only := routeStatusData("m2")
+	if len(only.Models) != 1 || len(only.Models[0].Keys) != 0 || only.Total != 0 {
+		t.Fatalf("explicit model query = %+v", only.Models)
+	}
+}
+
+// TestFetchModelsGroupedShape 见 models_test.go（解析层）。这里补一个整体约束：
+// 上游只返回分组对象、没有任何 data 字段时也能拉取成功。
+func TestFetchModelsGroupedOnlyShape(t *testing.T) {
+	setupGateway(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"free":[{"id":"a/x:free"}]}`))
+	}))
+	defer up.Close()
+	ch := &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k", APIKey: "sk-1", Enabled: true}}}
+	list, key, err := fetchUpstreamModels(context.Background(), ch)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if key != "k" || len(list) != 1 || list[0].ID != "a/x:free" || !list[0].Free || list[0].Group != "free" {
+		t.Fatalf("fetched = %+v key=%q", list, key)
 	}
 }
 

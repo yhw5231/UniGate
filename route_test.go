@@ -1444,8 +1444,14 @@ func TestRouteStatusData(t *testing.T) {
 		byModel[g.Model] = g
 	}
 	m1 := byModel["m1"]
-	if m1.Available != 2 || m1.Cooling != 0 || m1.Total != 4 {
-		t.Fatalf("m1 group: available=%d cooling=%d total=%d, want 2/0/4 (%+v)", m1.Available, m1.Cooling, m1.Total, m1.Keys)
+	// 渠道 b 已禁用：它的模型与候选行都不出现在路由里（禁用即整体摘除）
+	if m1.Available != 2 || m1.Cooling != 0 || m1.Total != 3 {
+		t.Fatalf("m1 group: available=%d cooling=%d total=%d, want 2/0/3 (%+v)", m1.Available, m1.Cooling, m1.Total, m1.Keys)
+	}
+	for _, k := range m1.Keys {
+		if k.Channel == "b" {
+			t.Fatalf("disabled channel must not appear in route view: %+v", k)
+		}
 	}
 	m2 := byModel["m2"]
 	if m2.Available != 1 || m2.Cooling != 1 || m2.Total != 3 {
@@ -1463,8 +1469,9 @@ func TestRouteStatusData(t *testing.T) {
 	if statusOf(m1, a1) != routeStatusOK || statusOf(m2, a1) != routeStatusCooling {
 		t.Fatalf("a1 status: m1=%q m2=%q", statusOf(m1, a1), statusOf(m2, a1))
 	}
-	if statusOf(m1, a2) != routeStatusDisabled || statusOf(m1, snap.Channels[1].Keys[0].ID) != routeStatusDisabled {
-		t.Fatal("disabled key/channel must be marked disabled")
+	// 已禁用的 key 仍然列出（渠道内的停用 key 是可核对的配置），只是状态为停用
+	if statusOf(m1, a2) != routeStatusDisabled {
+		t.Fatal("disabled key must be marked disabled")
 	}
 	if m2.Keys[0].Channel != "a" || m2.Keys[0].Key != "a1" {
 		t.Fatalf("candidate order must follow config order, got %+v", m2.Keys[0])

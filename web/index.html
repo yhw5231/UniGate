@@ -451,57 +451,33 @@
         <label>模型列表端点（可选，默认 BaseURL + /models） <input id="chModelsURL" placeholder="留空使用默认"></label>
         <div></div>
       </div>
-      <div class="grid2">
-        <label>启用模型列表（每行一个，用于 /v1/models 与路由过滤；留空不设限）
-          <textarea id="chModels" rows="3" placeholder="deepseek-v4.1-flash&#10;gpt-4o-mini&#10;claude-*（通配）&#10;re:^gpt-4.*$（正则）"></textarea>
-        </label>
-        <div>
-          <button id="fetchModelsBtn" class="btn" title="用本渠道的 key 请求上游模型列表（以弹窗里当前填写的内容为准，无需先保存）：候选按上游模型逐个列出（每个写法一条，可分别勾选），已生效的预勾选；勾选/取消即时写入左侧启用列表与模型映射（勾完直接保存即可），点「按勾选重建列表」额外清理上游已不返回的旧模型">⤓ 从上游拉取模型列表</button>
-          <button id="fetchRebuildBtn" class="btn" style="margin-top:6px" title="面板已打开（刚拉取过）时：按当前勾选重建并保存；面板未打开时：拉取上游模型列表，以上游返回的全部模型全量替换并保存（上游已不存在的模型及其映射会被移除）">⤓ 拉取并直接重建</button>
-          <p class="muted" style="font-size:12px;margin:6px 0 0" id="chModelsHint">
-            拉取用的 key / Base URL / 代理都取上方当前填写内容（新建渠道也可以直接拉取，不必先保存）；
-            拉取后从候选清单勾选要启用的上游模型——<b>勾选即写入左侧列表</b>，勾完直接「保存」即可；
-            <b>列表里存的是对外名</b>（小写、去供应商前缀与 <code>:free</code>/<code>-free</code> 后缀，同一模型只暴露一个名字），
-            上游写法自动写进下面的模型映射，发往上游时仍用它自己的名字——
-            <b>同一对外名在上游的多个写法各是一个候选，请求按顺序故障转移、冷却各自独立</b>；
-            「按勾选重建列表」会在写入的同时把未勾选项与上游已不返回的旧模型一并清理
-            （需要保留手工补充项时勾选面板里的「保留上游未返回的旧模型」）。
-          </p>
+      <div class="model-picker">
+        <div class="mp-head">
+          <span class="mp-label">模型（勾选这个上游提供的模型；右侧「上游模型名」填上游认识的写法，留空 = 与对外名相同）</span>
+          <span class="spacer"></span>
+          <button id="mpFetchBtn" class="btn small" title="用本渠道的 key 请求上游模型列表（以弹窗里当前填写的内容为准，无需先保存）：返回的模型按上游分组列出（免费模型进「免费」组），已生效的预勾选；勾选即启用，勾完直接「保存」即可">⤓ 获取模型</button>
+          <button id="mpRebuildBtn" class="btn small" title="重新拉取上游模型列表，忽略当前勾选，以上游返回的全部模型重建模型列表与映射并保存（上游已不存在的模型及其映射会被移除）">⤓ 拉取并直接重建</button>
         </div>
-      </div>
-      <div class="grid2">
-        <label title="模型名映射：下游请求的模型名 → 该上游实际模型名，每行一条「下游名=上游名」，多个上游名用逗号分隔（如 deepseek-v4.1-flash=cn:deepseek-v4.1-flash,global:deepseek-v4.1-flash）。用于同一模型在不同上游的不同叫法，或上游把同一模型分成多个线路/区域变体：转发时按上游模型分别改写请求体的 model 字段，每个上游模型各自成为独立候选、各自冷却（互不牵连）。渠道映射优先于设置页的全局别名。从上游拉取模型时会按勾选的上游写法自动重建：同一对外名勾了多个写法时全部写在这里（如 x=cline-free/x:free,x），请求按顺序尝试、冷却分别计算。">模型名映射（每行「下游模型名=上游模型名」，多个上游名用逗号分隔，拉取模型时按勾选自动重建）
-          <textarea id="chModelMap" rows="3" placeholder="deepseek-v4-flash=deepseek/deepseek-v4-flash&#10;deepseek-v4.1-flash=cn:deepseek-v4.1-flash,global:deepseek-v4.1-flash"></textarea>
-          <span id="chModelMapHint" class="muted" style="font-size:12px"></span>
-        </label>
-        <p class="muted" style="font-size:12px;align-self:end;margin:0 0 10px">
-          映射的键（下游名）即该渠道「声明支持」的模型：无需再写进上面的模型列表，也会出现在 <code>/v1/models</code> 与路由页。
-          列表项支持精确名、通配（<code>claude-*</code> / <code>gpt-4?</code>）与正则（<code>re:^gpt-4.*$</code>）；
-          <b>精确名保存时统一归一化为对外名</b>（小写、去供应商前缀与 <code>:free</code>/<code>-free</code> 等后缀，
-          上游报 <code>cline-free/DeepSeek-V4.1-Flash:free</code> 就存成 <code>deepseek-v4.1-flash</code>），
-          上游写法自动记进上面的映射——路由页与 <code>/v1/models</code> 只出现干净名字，发往上游的仍是上游自己的写法；
-          <b>一个对外名可以对应多个上游写法</b>（各自一个候选、各自冷却），路由页会为每个写法单独列一行并标注实际发往上游的名字。
+        <div class="mp-toolbar">
+          <input id="mpFilter" type="search" placeholder="筛选模型…">
+          <span id="mpStatus" class="muted"></span>
+          <span class="spacer"></span>
+          <input id="mpCustom" placeholder="添加自定义模型名（进「自定义」分组）">
+          <button id="mpCustomAdd" class="btn small" title="把填写的名字作为一个自定义模型加入列表（勾选即启用；上游名可在行内填写，留空表示与对外名相同）">添加</button>
+        </div>
+        <div id="mpList" class="mp-list"></div>
+        <p class="muted" id="mpHint">
+          <b>列表里存的是对外名</b>（小写、去供应商前缀与 <code>:free</code>/<code>-free</code> 后缀，同一模型只暴露一个名字），
+          发往上游用每行的「上游模型名」——上游写法自动写进 <code>model_map</code>；
+          <b>同一对外名可以有多个上游写法</b>（同一模型在上游的不同分组/线路各占一行，各自一个候选：
+          请求按顺序故障转移、冷却各自独立），对外仍然只有一个名字，路由页会逐行标注实际发往的上游名。
+          「添加」进「自定义」分组，行内填上游名即可配出**与上游名无关的渠道别名**（如
+          <code>my-gpt</code> → <code>upstream/model-x</code>）。
+          列表项支持精确名、通配（<code>claude-*</code> / <code>gpt-4?</code>）与正则（<code>re:^gpt-4.*$</code>）。
+          模型列表端点（<code>/models</code>）响应兼容 OpenAI 的 <code>{"data":[...]}</code>、裸数组、
+          以及按分组返回的 JSON（如 Cline 的 <code>recommended-models</code>：<code>recommended</code>/
+          <code>free</code>/<code>clinePass</code>/<code>clineCloud</code>，字段名即分组名）。
         </p>
-      </div>
-      <div id="chModelList" class="chips"></div>
-      <div id="fetchPanel" class="fetch-panel hidden">
-        <div class="fetch-panel-head">
-          <span class="muted" style="font-size:12px">候选模型（<b>每个上游模型一行</b>，勾选值就是发往上游的名字；同一对外名在上游的多个写法分别勾选、分别成为转发候选与独立冷却，默认勾选当前已生效的）——<b>勾选/取消即时写入左侧启用模型列表与模型映射</b>，勾完直接点「保存」即可；点「按勾选重建列表」额外把未勾选项与上游已不返回的旧模型从列表中清理掉）</span>
-          <span class="spacer"></span>
-          <button class="btn small" id="fetchAllBtn" title="全选当前筛选结果">全选</button>
-          <button class="btn small" id="fetchNoneBtn" title="全不选当前筛选结果">全不选</button>
-        </div>
-        <div class="fetch-filter">
-          <input id="fetchSearch" placeholder="搜索过滤模型（支持多个关键词，空格分隔；留空显示全部）">
-          <span class="muted" id="fetchMatch"></span>
-        </div>
-        <div id="fetchList" class="fetch-list"></div>
-        <div class="row" style="margin-top:8px">
-          <span class="muted" style="font-size:12px">共 <span id="fetchCount">0</span> 个 <span id="fetchStale"></span></span>
-          <label class="inline" title="勾选后：本次拉取未返回、但当前列表里已有的模型（含手工补充项）会保留，不做重建清理（勾选过程中这些旧项始终保留）"><input type="checkbox" id="fetchKeepMissing"> 保留上游未返回的旧模型</label>
-          <span class="spacer"></span>
-          <button class="btn small" id="fetchApplyBtn" title="以勾选结果重建启用模型列表与模型映射：未勾选的候选、上游已不返回的旧模型（及其映射）都会被移除；勾选「保留上游未返回的旧模型」时手工补充项保留。只勾选不点它也行——勾选已即时写入列表，直接「保存」即可">按勾选重建列表</button>
-        </div>
       </div>
       <div class="opt-row">
         <label class="inline"><input type="checkbox" id="chEnabled"> 启用渠道</label>

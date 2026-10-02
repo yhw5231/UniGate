@@ -1125,52 +1125,309 @@ function exposedModelName(name) {
   if (!p || !modelPatternIsPlain(p)) return p;
   return modelIdentity(p);
 }
-// mapTargetFor 模型映射里该下游名对应的上游名（精确键优先，其次归一化等价键）；
-// 与自身相同（无需改写）时返回 ""。
-function mapTargetFor(map, model) {
-  if (!map) return "";
-  let targets = map[model];
-  if (!targets) {
-    const id = modelIdentity(model);
-    for (const k of Object.keys(map)) {
-      if (modelIdentity(k) === id) { targets = map[k]; break; }
+// mapTargets 取某个对外名对应的上游写法列表（精确键优先，其次归一化等价键）；
+// 一个对外名可以对应多个上游写法（同一模型在上游的不同分组/线路），各自一个候选。
+function mapTargets(map, model) {
+  if (!map) return [];
+  const id = modelIdentity(model);
+  const out = [];
+  for (const k of Object.keys(map)) {
+    if (k !== model && modelIdentity(k) !== id) continue;
+    const v = map[k];
+    const list = Array.isArray(v) ? v : [v];
+    for (const t of list) {
+      const s = String(t ?? "").trim();
+      if (s && !out.includes(s)) out.push(s);
     }
   }
-  if (!targets || !targets.length) return "";
-  const up = targets.join(", ");
-  return up === model ? "" : up;
+  return out;
 }
 
-// modelMapToText / textToModelMap 渠道名称映射（model_map）与文本框
-//「每行 下游模型名=上游模型名（多个上游用逗号分隔）」之间的转换。
-// 同一个下游名可以对应上游的多个模型（区域/线路变体），可以写成
-// 「x=cn:x,global:x」或分成多行写同一个键（后者按行顺序累加）。
-function modelMapToText(map) {
-  const entries = Object.entries(map || {});
-  return entries.map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(",") : v}`).join("\n");
+// ---- 渠道模型选择器（对标 go-gateway：一行一个模型，勾选=启用，
+// 行内「上游模型名」= 发往上游的写法，留空 = 与对外名相同）----
+//
+// 行模型：{id, name 对外名, target 上游模型名（留空=用 name）, checked, group, free, custom}
+// 与 go-gateway 的差异：同一对外名在上游的多个写法**各占一行**（各自一个候选、
+// 各自独立冷却，见 route.go 的候选展开），所以列表里同一个对外名可能出现多行
+// （上游分组不同）；对外名在保存时去重，仍然只暴露一个名字。
+//
+// 列表分组显示：免费（分组名含 free / :free 后缀 / 价格为 0）、上游给的分组
+// （Cline recommended-models 的 recommended/clinePass/clineCloud…）、自定义（手动
+// 添加的项）、已保存（上游本次未返回、但列表里已有的旧模型）。
+
+const GROUP_FREE = "免费";
+const GROUP_CUSTOM = "自定义";
+const GROUP_SAVED = "已保存";
+const GROUP_DEFAULT = "上游模型";
+
+let modelRows = [];              // [{id, name, target, checked, group, free, custom}]
+let modelRowSeq = 0;
+let fetchedFreeSet = new Set();  // 本次拉取的免费上游写法（上游未给分组时也能标出免费）
+let fetchedStale = [];           // 上游本次未返回、列表里已有的旧模型（对外名）
+const collapsedGroups = new Set();
+
+// groupNameIsFree 上游分组名是否表示「免费」。
+function groupNameIsFree(name) {
+  const n = String(name ?? "").trim().toLowerCase();
+  return n === "free" || n.includes("免费");
 }
 
-function textToModelMap(text) {
-  const out = {};
-  for (const line of String(text || "").split("\n")) {
-    const s = line.trim();
-    if (!s || s.startsWith("#")) continue;
-    const i = s.indexOf("=");
-    if (i <= 0) continue;
-    const key = s.slice(0, i).trim();
-    if (!key) continue;
-    const list = out[key] || (out[key] = []);
-    for (const raw of s.slice(i + 1).split(",")) {
-      const val = raw.trim();
-      // 目标按字面去重：同一模型在上游的多个写法各自是一个候选（各自独立冷却），
-      // 只有「只写了自身」等价于不配置映射（与后端 normalizeModelMap 同规则）
-      if (!val || list.includes(val)) continue;
-      list.push(val);
-    }
-    if (!list.length || (list.length === 1 && list[0] === key)) delete out[key];
+// displayGroupName 上游分组名 → 列表分组名（free → 免费，无分组 → 上游模型）。
+function displayGroupName(name, free) {
+  const n = String(name ?? "").trim();
+  if (n) return groupNameIsFree(n) ? GROUP_FREE : n;
+  return free ? GROUP_FREE : GROUP_DEFAULT;
+}
+
+// rowUpstream 该行发往上游的名字（「上游模型名」留空 = 与对外名相同）。
+function rowUpstream(row) {
+  return (row.target || "").trim() || row.name;
+}
+
+// rowExposed 该行对外暴露的名字（列表与 /v1/models 用的名字）。
+function rowExposed(row) {
+  return String(row.name || "").trim();
+}
+
+// rowKey 行的唯一键：对外名 + 实际上游名（同一对外名的多个写法各占一行）。
+function rowKey(row) {
+  return rowExposed(row) + "\u0000" + rowUpstream(row);
+}
+
+// modelDeclaration 由列表行推导渠道的 models + model_map（与后端 normalizeModelMap
+// 同规则）：勾选行的对外名去重进 models；上游写法进 model_map；只写了自身一个写法时
+// 不写映射（等价于不配置），多个写法并列时保留自身写法（各自仍是候选）。
+function modelDeclaration(rows) {
+  const models = [];
+  const map = {};
+  const seen = new Set();
+  for (const row of rows || []) {
+    if (!row.checked) continue;
+    const id = rowExposed(row);
+    if (!id) continue;
+    if (!seen.has(id)) { seen.add(id); models.push(id); }
+    const up = rowUpstream(row);
+    const list = map[id] || (map[id] = []);
+    if (!list.includes(up)) list.push(up);
   }
-  return Object.keys(out).length ? out : undefined;
+  for (const id of Object.keys(map)) {
+    if (map[id].length === 1 && map[id][0] === id) delete map[id];
+  }
+  return { models, map: Object.keys(map).length ? map : undefined };
 }
+
+// normalizeRowName 对外名归一化：精确名按对外名规则（小写、去前缀/变体后缀），
+// 通配与正则原样保留。
+function normalizeRowName(name) {
+  const s = String(name ?? "").trim();
+  if (!s) return "";
+  return modelPatternIsPlain(s) ? exposedModelName(s) : s;
+}
+
+// addModelRow 追加一行；同一个「对外名 + 上游写法」已存在时只更新标记，不重复加行。
+function addModelRow(row) {
+  const name = normalizeRowName(row.name);
+  if (!name) return null;
+  const target = String(row.target ?? "").trim();
+  const group = row.group || GROUP_DEFAULT;
+  const entry = {
+    id: ++modelRowSeq,
+    name,
+    target,
+    checked: row.checked !== false,
+    group,
+    free: !!row.free,
+    custom: !!row.custom,
+  };
+  const exist = modelRows.find((r) => rowKey(r) === rowKey(entry));
+  if (exist) {
+    if (row.checked) exist.checked = true;
+    if (row.free) exist.free = true;
+    if (row.custom) exist.custom = true;
+    if (row.group && !row.keepGroup) exist.group = group;
+    return exist;
+  }
+  modelRows.push(entry);
+  return entry;
+}
+
+// loadModelRows 打开编辑器时按已保存的 models + model_map 铺开列表：
+// 映射里的每个上游写法各一行（没有映射时用对外名本身），都在「已保存」分组。
+// 映射的键即对外名（可能是与上游名无关的别名），原样保留、不被归一化掉。
+function loadModelRows(ch) {
+  modelRows = [];
+  modelRowSeq = 0;
+  fetchedFreeSet = new Set();
+  fetchedStale = [];
+  collapsedGroups.clear();
+  const map = (ch && ch.model_map) || {};
+  const seen = new Set();
+  for (const m of (ch && ch.models) || []) {
+    const name = normalizeRowName(m);
+    if (!name) continue;
+    seen.add(name);
+    const targets = mapTargets(map, m);
+    if (targets.length) {
+      for (const t of targets) addModelRow({ name, target: t === name ? "" : t, group: GROUP_SAVED });
+      continue;
+    }
+    addModelRow({ name, group: GROUP_SAVED });
+  }
+  // 映射键但不在模型列表里的：映射键本身就是「声明支持」的名字
+  for (const k of Object.keys(map)) {
+    const name = normalizeRowName(k);
+    if (!name || seen.has(name)) continue;
+    for (const t of mapTargets(map, k)) addModelRow({ name, target: t === name ? "" : t, group: GROUP_SAVED });
+  }
+}
+
+// renderModelPicker 重绘列表：按分组显示（免费优先，其次上游分组顺序，再自定义、
+// 已保存），支持筛选与分组折叠；每组有全选/全不选。
+function renderModelPicker() {
+  const list = $("#mpList");
+  if (!list) return;
+  const filter = ($("#mpFilter").value || "").trim().toLowerCase();
+  const groups = new Map();
+  let shown = 0;
+  for (const row of modelRows) {
+    const name = row.group || GROUP_DEFAULT;
+    const hay = `${rowExposed(row)} ${rowUpstream(row)} ${name}`.toLowerCase();
+    if (filter && !hay.includes(filter)) continue;
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(row);
+    shown++;
+  }
+  const rank = (n) => (n === GROUP_FREE ? 0 : n === GROUP_CUSTOM ? 2 : n === GROUP_SAVED ? 3 : 1);
+  const names = [...groups.keys()].sort((a, b) => rank(a) - rank(b));
+  list.innerHTML = names.map((name) => {
+    const rows = groups.get(name);
+    const picked = rows.filter((r) => r.checked).length;
+    const open = !collapsedGroups.has(name);
+    return `<div class="mp-group" data-group="${esc(name)}">
+      <div class="mp-group-head">
+        <span class="mp-caret" data-act="toggle">${open ? "▾" : "▸"}</span>
+        <b data-act="toggle">${esc(name)}</b>
+        <span class="muted">${rows.length} 个 · 已选 ${picked}</span>
+        <span class="spacer"></span>
+        <button class="btn small" data-act="all">全选</button>
+        <button class="btn small" data-act="none">全不选</button>
+      </div>
+      <div class="mp-rows${open ? "" : " hidden"}">${rows.map(modelRowHTML).join("")}</div>
+    </div>`;
+  }).join("") || `<p class="muted" style="font-size:12px;margin:6px 0">${modelRows.length
+    ? "没有符合筛选条件的模型"
+    : "还没有模型：填好 Base URL 与 key 后点「获取模型」，或在右侧添加自定义模型名"}</p>`;
+  updateModelStatus(shown);
+}
+
+// rowBadges 行内徽标：别名（对外名 ≠ 上游名的对外名形态）/ 免费 / 自定义 / 上游未返回。
+function rowBadges(row) {
+  const name = rowExposed(row);
+  const up = rowUpstream(row);
+  const bits = [];
+  if ((row.target || "").trim() && canonicalModel(up) !== name) {
+    bits.push(`<i class="badge src" title="对外名是别名：下游用 ${esc(name)} 调用，上游收到 ${esc(up)}">别名 → ${esc(up)}</i>`);
+  }
+  if (row.free) bits.push('<i class="badge free">免费</i>');
+  if (row.custom) bits.push('<i class="badge group">自定义</i>');
+  if (fetchedStale.includes(name)) bits.push('<i class="badge warn" title="上游本次拉取没有返回这个模型：取消勾选即不再启用；保持勾选则继续按配置使用">上游未返回</i>');
+  return bits.join("");
+}
+
+// modelRowHTML 单行：勾选框 + 对外名 + 「上游模型名」输入框。
+function modelRowHTML(row) {
+  const name = rowExposed(row);
+  return `<label class="mp-row" data-row="${row.id}">
+    <input type="checkbox" class="mp-check"${row.checked ? " checked" : ""}>
+    <span class="mp-name" title="对外名（/v1/models 与路由页用的名字）：${esc(name)}">${esc(name)}${rowBadges(row)}</span>
+    <input class="mp-target" placeholder="上游模型名（留空=与对外名相同）" value="${esc(row.target || "")}">
+  </label>`;
+}
+
+// updateModelStatus 状态栏：已选/总数 + 对外名个数（保存后 /v1/models 暴露的名字数）。
+function updateModelStatus(shown) {
+  const total = modelRows.length;
+  const picked = modelRows.filter((r) => r.checked);
+  const ids = new Set(picked.map(rowExposed).filter(Boolean));
+  const el = $("#mpStatus");
+  if (!el) return;
+  el.textContent = total === 0
+    ? ""
+    : `已选 ${picked.length} / ${shown === undefined ? total : `${shown}（共 ${total}）`} 个 · 对外 ${ids.size} 个名字`;
+  el.title = [...ids].join("\n");
+}
+
+// paintRowBadges 输入「上游模型名」后就地更新该行徽标（不整表重绘，避免失焦）。
+function paintRowBadges(row, nameEl) {
+  if (!nameEl) return;
+  const name = rowExposed(row);
+  nameEl.innerHTML = esc(name) + rowBadges(row);
+  nameEl.title = `对外名（/v1/models 与路由页用的名字）：${name}`;
+}
+
+// rowFromEvent 事件 → 对应的列表行（通过 data-row 找，避免闭包失效）。
+function rowFromEvent(target, sel) {
+  const el = target.closest(sel);
+  if (!el) return null;
+  const holder = el.closest(".mp-row");
+  if (!holder) return null;
+  return modelRows.find((r) => String(r.id) === holder.dataset.row) || null;
+}
+
+$("#mpList").addEventListener("change", (e) => {
+  if (!e.target.classList.contains("mp-check")) return;
+  const row = rowFromEvent(e.target, ".mp-check");
+  if (!row) return;
+  row.checked = e.target.checked;
+  updateModelStatus();
+  const groupEl = e.target.closest(".mp-group");
+  const head = groupEl ? groupEl.querySelector(".mp-group-head .muted") : null;
+  if (head) {
+    const rows = modelRows.filter((r) => (r.group || GROUP_DEFAULT) === groupEl.dataset.group);
+    head.textContent = `${rows.length} 个 · 已选 ${rows.filter((r) => r.checked).length}`;
+  }
+});
+$("#mpList").addEventListener("input", (e) => {
+  if (!e.target.classList.contains("mp-target")) return;
+  const row = rowFromEvent(e.target, ".mp-target");
+  if (!row) return;
+  row.target = e.target.value;
+  paintRowBadges(row, e.target.closest(".mp-row").querySelector(".mp-name"));
+  updateModelStatus();
+});
+$("#mpList").addEventListener("click", (e) => {
+  const group = e.target.closest(".mp-group");
+  if (!group) return;
+  const name = group.dataset.group;
+  const act = e.target.dataset ? e.target.dataset.act : "";
+  if (act === "all" || act === "none") {
+    const want = act === "all";
+    modelRows.forEach((r) => { if ((r.group || GROUP_DEFAULT) === name) r.checked = want; });
+    renderModelPicker();
+    return;
+  }
+  if (act === "toggle") {
+    if (collapsedGroups.has(name)) collapsedGroups.delete(name); else collapsedGroups.add(name);
+    renderModelPicker();
+  }
+});
+$("#mpFilter").addEventListener("input", renderModelPicker);
+
+// 自定义模型：加到「自定义」分组（勾选即启用；上游名可在行内填写）。
+function addCustomModel() {
+  const input = $("#mpCustom");
+  const name = normalizeRowName(input.value);
+  if (!name) return;
+  if (modelRows.some((r) => rowExposed(r) === name)) { toast("列表里已有这个模型", true); return; }
+  addModelRow({ name, group: GROUP_CUSTOM, custom: true, checked: true });
+  input.value = "";
+  renderModelPicker();
+}
+$("#mpCustomAdd").addEventListener("click", addCustomModel);
+$("#mpCustom").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); addCustomModel(); }
+});
+
 
 // ---- Base URL 自适应（与后端 normalizeBaseURL 同规则）----
 // 「OpenAI 兼容前缀」默认自动补全版本段：裸站点 https://api.deepseek.com 补成
@@ -1232,8 +1489,6 @@ function openChannelEditor(ch) {
   syncBaseURLHint(rawBase);
   $("#chModelsURL").value = ch.models_url || "";
   $("#chEndpointType").value = ch.endpoint_type || "chat";
-  $("#chModels").value = (ch.models || []).join("\n");
-  $("#chModelMap").value = modelMapToText(ch.model_map);
   $("#chEnabled").checked = !!ch.enabled;
   $("#chRewrite").checked = !!ch.rewrite_reasoning;
   $("#chCooldownScope").value = ch.cooldown_scope === "key_model" ? "key_model" : "key";
@@ -1245,17 +1500,13 @@ function openChannelEditor(ch) {
   renderChannelProxy(ch.proxy || null);
   renderHeaderRows(ch.headers || {});
   renderKeyBlocks(ch.keys || []);
-  renderModelChips();
-  syncModelMapHint();
   renderCoolingKeys(ch);
-  // 上一个渠道的拉取候选 / 批量导入草稿不跨渠道残留
-  $("#fetchPanel").classList.add("hidden");
-  $("#fetchSearch").value = "";
-  $("#fetchList").innerHTML = "";
-  fetchedCandidates = [];
-  fetchedFreeSet = new Set();
-  fetchedStale = [];
-  fetchedEnabled = new Set();
+  // 模型选择器：按已保存的 models + model_map 铺开（映射里的每个上游写法各一行）
+  loadModelRows(ch);
+  $("#mpFilter").value = "";
+  $("#mpCustom").value = "";
+  renderModelPicker();
+  // 上一个渠道的拉取结果 / 批量导入草稿不跨渠道残留
   $("#bulkImportBox").classList.add("hidden");
   $("#bulkKeysInput").value = "";
   $("#channelErr").textContent = "";
@@ -1363,35 +1614,6 @@ function renderCoolingKeys(ch) {
     } catch (e) { toast(e.message, true); }
   }));
 }
-
-// 可用模型 chips 展示（跟随左侧文本框实时变化）；freeSet 非空时为对应模型标注「免费」，
-// 模型映射里配了上游写法时一并标出（对外是干净名字，发往上游的是它，多上游按顺序）。
-let freeModelSet = new Set();
-function renderModelChips() {
-  const el = $("#chModelList");
-  const models = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  const map = textToModelMap($("#chModelMap").value);
-  el.innerHTML = models.map((m) => {
-    const up = mapTargetFor(map, m);
-    return `<span class="chip"${up ? ` title="${esc("发往上游（按顺序尝试，各自独立冷却）：" + up)}"` : ""}>${esc(m)}`
-      + (up ? `<i class="badge src">→ ${esc(up)}</i>` : "")
-      + (freeModelSet.has(m) ? '<i class="badge free">免费</i>' : "")
-      + `</span>`;
-  }).join("") || '<span class="muted" style="font-size:12px">（暂无模型：可手工填写，或点「从上游拉取模型列表」按当前填写内容拉取）</span>';
-}
-$("#chModels").addEventListener("input", () => { renderModelChips(); freeModelSet = new Set(); });
-
-// syncModelMapHint 模型映射文本框下的提示：自动补进来的条目说明清楚
-//（下游用左边名字调用，上游收到右边名字）。
-function syncModelMapHint() {
-  const el = $("#chModelMapHint");
-  if (!el) return;
-  const n = Object.keys(textToModelMap($("#chModelMap").value) || {}).length;
-  el.textContent = n
-    ? `共 ${n} 条映射：下游用「=」左边的名字调用，上游收到右边的名字（拉取模型时按上游写法自动补全）`
-    : "留空时上游收到的是左侧模型列表里的写法；拉取模型时会自动补上上游的原写法（如 x=cline-free/x:free）";
-}
-$("#chModelMap").addEventListener("input", () => { renderModelChips(); syncModelMapHint(); });
 
 // ---- 弹窗通用交互：Esc 关闭；点击遮罩**不**关闭 ----
 // 模态框统一由 .modal 容器承载，除内容卡片外的区域即遮罩。遮罩点击不关闭是有意
@@ -1556,7 +1778,9 @@ function keyBlock(k, inheritInfo) {
     const k = collectKeyForm(div);
     if (!k.enabled) { toast("请先勾选「启用」再测试该 key", true); return; }
     ch.keys = [k];
-    const model = $("#chModels").value.split("\n")[0].trim() || "";
+    // 用第一个勾选的模型试跑（对外名：后端会按渠道映射改写成上游写法）
+    const firstRow = modelRows.find((r) => r.checked);
+    const model = firstRow ? rowExposed(firstRow) : "";
     try {
       const r = await api("POST", "/admin/api/testkey", { channel: ch, model });
       if (r.ok) toast(`测试成功 ${r.status}（${r.latency_ms}ms，经 ${r.proxy}）`);
@@ -1645,23 +1869,22 @@ $("#bulkImportBtn").addEventListener("click", () => {
   else toast(`已导入 ${imported} 个 key，请点「保存」写入配置`);
 });
 
-// 从上游拉取模型列表（用渠道 key 鉴权）：**以弹窗里当前填写的内容为准**（Base URL、
-// key、代理、模型清单都取表单值，新建渠道未保存也能拉），dry-run 只取候选清单，
-// 弹出勾选面板（候选按对外名列出、预勾选当前已启用的模型），用户勾选后
-// 「按勾选重建」左侧列表与模型映射——未勾选项与上游已不返回的旧模型都会从列表
-// 移除（勾选「保留上游未返回的旧模型」时例外）。
-// 「拉取并直接重建」按钮则以上游返回为准立即全量替换并保存（保存后关闭弹窗）。
-let fetchedCandidates = [];        // 本次拉取的候选：上游写法（勾选值 = 上游模型名）
-let fetchedEnabled = new Set();    // 候选里当前已生效的上游写法（预勾选）
-let fetchedFreeSet = new Set();    // 免费候选（上游写法）
-let fetchedStale = [];             // 上游本次未返回、当前列表里已有的模型
+// ---- 从上游拉取模型列表（用渠道 key 鉴权）----
+// **以弹窗里当前填写的内容为准**（Base URL、key、代理、模型清单都取表单值，新建渠道
+// 未保存也能拉）：返回的候选按上游分组铺进模型选择器（免费模型进「免费」组，
+// Cline 的 recommended-models 会给出 recommended/clinePass/clineCloud 等分组），
+// 已生效的上游写法预勾选；勾选即启用，勾完直接「保存」即可。
+// 「拉取并直接重建」重新拉取并**忽略当前勾选**，以上游返回的全部模型重建并保存。
 
 async function fetchModelsDryRun() {
   const ch = collectChannelForm();
   if (!ch.base_url) throw new Error("请先填写 Base URL");
   const r = await api("POST", "/admin/api/fetch-models", { channel: ch });
+  const fetched = r.fetched || r.models || [];
   return {
-    fetched: r.fetched || r.models || [],
+    fetched,
+    // 后端按上游分组返回；老版本/无分组时退化为单组
+    groups: Array.isArray(r.groups) && r.groups.length ? r.groups : [{ name: "", free: false, models: fetched }],
     free: r.free_models || [],
     stale: r.stale || [],
     enabledUpstream: r.enabled_upstream || [],
@@ -1669,148 +1892,91 @@ async function fetchModelsDryRun() {
   };
 }
 
-// deriveDeclaration 由勾选的上游写法推导「对外模型列表 + 模型映射」：
-//   - 对外名去重后进列表（首次出现序，同一模型只暴露一个名字）；
-//   - 同一对外名的每个上游写法都进映射 → 每个写法各成一个转发候选、各自独立冷却；
-//   - 只有一个写法且与对外名相同时不建映射（无需改写上游请求）。
-function deriveDeclaration(raws) {
-  const order = [];
-  const targets = new Map();
-  for (const raw of raws) {
-    const id = exposedModelName(raw);
-    if (!id) continue;
-    if (!targets.has(id)) { targets.set(id, []); order.push(id); }
-    const arr = targets.get(id);
-    if (!arr.includes(raw)) arr.push(raw);
+// mergeFetchedModels 把拉取结果并进模型选择器。rebuild=true（拉取并直接重建）时忽略
+// 当前内容整体重建、全部勾选；否则保留已有行的勾选与「上游模型名」，只更新分组与免费
+// 标记，新行按 enabled_upstream 预勾选（渠道未声明模型时后端返回全部候选 = 全选）。
+// 返回新增行数。
+function mergeFetchedModels(groups, enabledUpstream, rebuild) {
+  const enabled = new Set(enabledUpstream);
+  if (rebuild) modelRows = [];
+  const byUpstream = new Map(modelRows.map((r) => [rowUpstream(r), r]));
+  let added = 0;
+  for (const g of groups) {
+    const groupName = displayGroupName(g.name, g.free);
+    for (const raw of g.models || []) {
+      const isFree = !!(g.free || fetchedFreeSet.has(raw));
+      const exist = byUpstream.get(raw);
+      if (exist) {
+        exist.group = groupName;
+        exist.free = isFree;
+        continue;
+      }
+      // 对外名归一化，上游原写法进「上游模型名」（与对外名相同时留空）
+      const name = normalizeRowName(raw);
+      if (!name) continue;
+      const row = addModelRow({
+        name,
+        target: raw === name ? "" : raw,
+        group: groupName,
+        free: isFree,
+        checked: rebuild || enabled.has(raw),
+      });
+      if (row) { byUpstream.set(raw, row); added++; }
+    }
   }
-  const map = {};
-  for (const id of order) {
-    const arr = targets.get(id);
-    if (arr.length > 1 || arr[0] !== id) map[id] = arr;
-  }
-  return { models: order, map };
+  return added;
 }
 
-function fetchSetCheckbox(v) { v.checked = true; }
-function fetchClearCheckbox(v) { v.checked = false; }
-
-// applyFetchFilter 候选清单搜索过滤：多个关键词（空格分隔）全部命中才显示；
-// 计数展示「匹配 N / 共 M（已选 K）」。全选/全不选只作用于当前筛选结果。
-function applyFetchFilter() {
-  const terms = $("#fetchSearch").value.toLowerCase().split(/\s+/).filter(Boolean);
-  const labels = $$("#fetchList label");
-  let shown = 0, checked = 0;
-  labels.forEach((l) => {
-    const hit = !terms.length || terms.every((t) => (l.dataset.model || "").toLowerCase().includes(t));
-    l.classList.toggle("hidden", !hit);
-    if (hit) { shown++; if (l.querySelector("input").checked) checked++; }
-  });
-  $("#fetchMatch").textContent = terms.length
-    ? `匹配 ${shown} / 共 ${labels.length}（已选 ${checked}）`
-    : `共 ${labels.length} 个（已选 ${checked}）`;
-}
-$("#fetchSearch").addEventListener("input", applyFetchFilter);
-// 勾选变化即时生效：候选勾选值就是发往上游的写法，勾上/取消直接写进启用模型列表与模型映射，
-// 不依赖下面的按钮（避免「勾选完忘了点重建/直接保存」导致勾选丢失）。
-$("#fetchList").addEventListener("change", () => { applyFetchSelection(true); applyFetchFilter(); });
-function visibleFetchBoxes() {
-  return $$("#fetchList label").filter((l) => !l.classList.contains("hidden")).map((l) => l.querySelector("input"));
-}
-
-$("#fetchModelsBtn").addEventListener("click", async () => {
-  const btn = $("#fetchModelsBtn");
+// 获取模型：拉取上游模型列表并并进选择器（勾选即启用，直接保存即可）。
+$("#mpFetchBtn").addEventListener("click", async () => {
+  const btn = $("#mpFetchBtn");
   btn.disabled = true;
   btn.textContent = "拉取中…";
   $("#channelErr").textContent = "";
   try {
-    const { fetched, free, stale, enabledUpstream, key } = await fetchModelsDryRun();
+    const { fetched, groups, free, stale, enabledUpstream, key } = await fetchModelsDryRun();
     if (!fetched.length) throw new Error("上游返回的模型列表为空");
-    fetchedCandidates = fetched;
     fetchedFreeSet = new Set(free);
     fetchedStale = stale;
-    fetchedEnabled = new Set(enabledUpstream);
-    // 每个上游模型一行（上游写法就是勾选值）：同一对外名在上游的多个写法各自一条，
-    // 可分别勾选、分别成为转发候选与独立冷却；行尾标出对外名/免费/已启用。
-    // 预勾选当前已生效的上游写法（渠道未声明模型 = 对全部放行 → 全选）。
-    const declared = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
-    const allChecked = declared.length === 0;
-    const multi = new Map();
-    fetched.forEach((raw) => { const id = exposedModelName(raw); multi.set(id, (multi.get(id) || 0) + 1); });
-    const list = $("#fetchList");
-    list.innerHTML = fetched.map((raw) => {
-      const id = exposedModelName(raw);
-      const on = fetchedEnabled.has(raw);
-      let bits = "";
-      if (id !== raw) bits += `<i class="badge src">对外 ${esc(id)}</i>`;
-      else if (multi.get(id) > 1) bits += '<i class="badge src">对外同名</i>';
-      if (fetchedFreeSet.has(raw)) bits += '<i class="badge free">免费</i>';
-      if (on) bits += '<i class="badge on">已启用</i>';
-      return `<label data-model="${esc(raw + " " + id)}" title="${esc(`上游模型 ${raw}｜对外名 ${id}（发往上游用的就是这个名字）`)}">`
-        + `<input type="checkbox" value="${esc(raw)}"${allChecked || on ? " checked" : ""}> ${esc(raw)}${bits}</label>`;
-    }).join("");
-    $("#fetchCount").textContent = fetched.length;
-    $("#fetchStale").textContent = stale.length
-      ? `· 上游已不再返回 ${stale.length} 个旧模型（${stale.slice(0, 3).join(", ")}${stale.length > 3 ? " 等" : ""}），重建后将被移除`
-      : "";
-    $("#fetchKeepMissing").checked = false;
-    $("#fetchSearch").value = "";
-    $("#fetchPanel").classList.remove("hidden");
-    applyFetchFilter();
-    toast(allChecked
-      ? `已拉取 ${fetched.length} 个模型（key: ${key}），候选已全选（列表留空=不设限，勾选后才会写进列表）；点「按勾选重建列表」以上游为准重建`
-      : `已拉取 ${fetched.length} 个模型（key: ${key}），已勾选当前生效的 ${fetchedEnabled.size} 个；勾选/取消即时写入左侧启用列表，点「按勾选重建列表」额外清理上游已不返回的旧模型`);
+    const added = mergeFetchedModels(groups, enabledUpstream, false);
+    renderModelPicker();
+    const gnames = [...new Set(groups.map((g) => displayGroupName(g.name, g.free)))].join(" / ");
+    let msg = `已拉取 ${fetched.length} 个模型（key: ${key}）`;
+    if (gnames) msg += `，分组：${gnames}`;
+    if (added) msg += `，新增 ${added} 行`;
+    msg += "；已勾选当前生效的写法，勾选即启用，直接「保存」即可";
+    if (stale.length) {
+      msg += `。上游已不再返回 ${stale.length} 个旧模型（${stale.slice(0, 3).join(", ")}${stale.length > 3 ? " 等" : ""}），`
+        + `在「${GROUP_SAVED}」分组里，取消勾选即不启用`;
+    }
+    toast(msg);
   } catch (e) {
     $("#channelErr").textContent = "拉取失败: " + e.message;
     toast("拉取失败: " + e.message, true);
   } finally {
     btn.disabled = false;
-    btn.textContent = "⤓ 从上游拉取模型列表";
+    btn.textContent = "⤓ 获取模型";
   }
 });
 
-// 拉取并直接重建：面板已打开（刚拉取过、可能已经勾选）时按**当前勾选**重建并保存，
-// 未勾选与上游已不返回的旧模型都会移除；面板没打开时先拉取，再以上游返回的全部模型
-// 全量替换并保存（上游现在返回什么就启用什么）。保存成功即关闭弹窗。
-$("#fetchRebuildBtn").addEventListener("click", async () => {
-  const btn = $("#fetchRebuildBtn");
-  const panelOpen = !$("#fetchPanel").classList.contains("hidden");
-  if (panelOpen) { // 面板里的勾选就是用户的选择：直接按勾选重建并保存
-    const keepMissing = $("#fetchKeepMissing").checked;
-    const r = applyFetchSelection(keepMissing);
-    $("#fetchPanel").classList.add("hidden");
-    if (!r.ids.length && !r.manual.length) {
-      toast("没有勾选任何上游模型：启用列表已清空（留空=不设限），未保存——确认无误请点「保存」", true);
-      return;
-    }
-    btn.disabled = true;
-    btn.textContent = "保存中…";
-    try {
-      await saveChannel();
-      toast(`已按勾选重建并保存：${r.chosen.length} 个上游模型 / ${r.ids.length} 个对外名`);
-    } catch (e) {
-      $("#channelErr").textContent = "保存失败: " + e.message;
-      toast("保存失败: " + e.message, true);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "⤓ 拉取并直接重建";
-    }
-    return;
-  }
-  if (!confirm("以上游返回的模型列表为准重建？当前列表中上游已不存在的模型（及其映射）会被移除。")) return;
+// 拉取并直接重建：重新拉取上游模型列表，**忽略当前勾选**，以上游返回的全部模型重建
+// 列表与映射并立即保存（上游已不存在的模型及其映射会被移除）。保存成功即关闭弹窗。
+$("#mpRebuildBtn").addEventListener("click", async () => {
+  const btn = $("#mpRebuildBtn");
+  if (!confirm("重新拉取上游模型列表，忽略当前勾选，以上游返回的全部模型重建并保存？当前列表中上游已不存在的模型（及其映射）会被移除。")) return;
   btn.disabled = true;
   btn.textContent = "拉取中…";
   $("#channelErr").textContent = "";
   try {
-    const { fetched, free, key } = await fetchModelsDryRun();
+    const { fetched, groups, free, key } = await fetchModelsDryRun();
     if (!fetched.length) throw new Error("上游返回的模型列表为空");
-    const derived = deriveDeclaration(fetched);
-    $("#chModels").value = derived.models.join("\n");
-    $("#chModelMap").value = modelMapToText(derived.map);
-    freeModelSet = new Set([...new Set(free)].map(exposedModelName));
-    renderModelChips();
-    syncModelMapHint();
+    fetchedFreeSet = new Set(free);
+    fetchedStale = [];
+    mergeFetchedModels(groups, [], true); // 全部勾选、丢弃旧行
+    renderModelPicker();
     await saveChannel();
-    toast(`已按上游重建并保存：${fetched.length} 个上游模型 / ${derived.models.length} 个对外名（key: ${key}）`);
+    const decl = modelDeclaration(modelRows);
+    toast(`已按上游重建并保存：${fetched.length} 个上游模型 / ${decl.models.length} 个对外名（key: ${key}）`);
   } catch (e) {
     $("#channelErr").textContent = "拉取重建失败: " + e.message;
     toast("拉取重建失败: " + e.message, true);
@@ -1818,54 +1984,6 @@ $("#fetchRebuildBtn").addEventListener("click", async () => {
     btn.disabled = false;
     btn.textContent = "⤓ 拉取并直接重建";
   }
-});
-
-$("#fetchAllBtn").addEventListener("click", () => { visibleFetchBoxes().forEach(fetchSetCheckbox); applyFetchSelection(true); applyFetchFilter(); });
-$("#fetchNoneBtn").addEventListener("click", () => { visibleFetchBoxes().forEach(fetchClearCheckbox); applyFetchSelection(true); applyFetchFilter(); });
-
-// fetchSelection 面板里当前勾选的上游写法（勾选值就是发往上游的模型名）。
-function fetchSelection() {
-  return $$("#fetchList input[type=checkbox]:checked").map((c) => c.value);
-}
-
-// applyFetchSelection 把勾选结果写进启用模型列表与模型映射，勾选即生效：
-// 勾选的每个上游写法都是一个候选（同一对外名的多个写法各一条，请求按顺序故障转移、
-// 冷却各自独立），对外名去重后进列表；取消勾选即从列表/映射里去掉该写法。
-// keepStale=true（勾选过程中）时，不在候选里的旧项（上游已不返回的旧模型、手工补充项）
-// 原样保留、映射不动；keepStale=false（按勾选重建）时它们按「重建」语义清理掉。
-// 返回本次结果供提示文案使用。
-function applyFetchSelection(keepStale) {
-  const chosen = fetchSelection();
-  const candSet = new Set(fetchedCandidates);
-  const candIDs = new Set(fetchedCandidates.map(exposedModelName));
-  const current = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  const manual = current.filter((m) => !candSet.has(m) && !candIDs.has(exposedModelName(m)));
-  const derived = deriveDeclaration(chosen);
-  const models = [...new Set([...derived.models, ...(keepStale ? manual : [])])];
-  const keep = new Set(models.map(modelIdentity));
-  const oldMap = textToModelMap($("#chModelMap").value) || {};
-  const map = {};
-  for (const k of Object.keys(oldMap)) { // 未勾选/手工项的映射原样保留，其余按勾选重建
-    if (keep.has(modelIdentity(k)) && !derived.map[modelIdentity(k)]) map[k] = oldMap[k];
-  }
-  for (const id of Object.keys(derived.map)) map[id] = derived.map[id];
-  $("#chModels").value = models.join("\n");
-  $("#chModelMap").value = modelMapToText(map);
-  syncModelMapHint();
-  freeModelSet = new Set([...new Set(fetchedFreeSet)].map(exposedModelName).filter((m) => models.includes(m)));
-  renderModelChips();
-  return { chosen, ids: derived.models, manual, dropped: fetchedCandidates.length - chosen.length };
-}
-
-// 按勾选重建列表：以勾选结果重建启用模型列表与模型映射（未勾选的候选、上游已不再返回的
-// 旧模型都会被移除；勾选「保留上游未返回的旧模型」时手工补充项保留）。
-$("#fetchApplyBtn").addEventListener("click", () => {
-  const keepMissing = $("#fetchKeepMissing").checked;
-  const r = applyFetchSelection(keepMissing);
-  $("#fetchPanel").classList.add("hidden");
-  const removed = r.dropped + (keepMissing ? 0 : fetchedStale.length);
-  toast(`已重建列表：勾选 ${r.chosen.length} 个上游模型 / ${r.ids.length} 个对外名`
-    + `${removed ? `，移除 ${removed} 个` : ""}${keepMissing && r.manual.length ? `，保留手工项 ${r.manual.length} 个` : ""}，请点「保存」写入配置`);
 });
 
 // collectKeyForm 从单个 key 块读取配置（不做校验）。
@@ -1908,7 +2026,8 @@ function collectChannelForm() {
     const name = inputs[0].value.trim(), value = inputs[1].value;
     if (name) headers[name] = value;
   });
-  const models = $("#chModels").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  // 模型声明由选择器推导：对外名去重进 models，上游写法进 model_map
+  const decl = modelDeclaration(modelRows);
   const keys = $$("#chKeys .keyblock").map(collectKeyForm);
   const chProxy = collectChannelProxy();
   // 内部渠道固定不在此编辑（独立「渠道固定」页）：保存渠道时原样携带，
@@ -1924,8 +2043,8 @@ function collectChannelForm() {
     base_url: normalizeBaseURL($("#chBaseURL").value),
     models_url: $("#chModelsURL").value.trim(),
     endpoint_type: $("#chEndpointType").value,
-    models,
-    model_map: textToModelMap($("#chModelMap").value),
+    models: decl.models,
+    model_map: decl.map,
     headers,
     rewrite_reasoning: $("#chRewrite").checked,
     cooldown_scope: $("#chCooldownScope").value,

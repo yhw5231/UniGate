@@ -20,6 +20,54 @@ function toast(msg, isError) {
   setTimeout(() => el.remove(), isError ? 5000 : 2500);
 }
 
+// ---- 日间 / 夜间模式 ----
+// <html data-theme="light|dark"> 决定配色（web/style.css 里两套变量）。显式选择存
+// localStorage（unigate_theme），未选择时跟随系统偏好、并随系统切换而变；一旦点过
+// 切换按钮就以用户选择为准。index.html 的 <head> 里有一段同规则的内联脚本先于首屏
+// 渲染应用主题，避免先闪一下暗色。
+const THEME_KEY = "unigate_theme";
+function storedTheme() {
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    return v === "light" || v === "dark" ? v : "";
+  } catch (e) { return ""; }
+}
+function systemTheme() {
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+function currentTheme() {
+  const t = document.documentElement.dataset.theme;
+  return t === "light" || t === "dark" ? t : (storedTheme() || systemTheme());
+}
+// applyTheme 应用主题并同步两个按钮的文案（按钮显示「当前模式」，悬浮提示说明点一下切到哪个）。
+function applyTheme(theme, persist) {
+  const t = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = t;
+  if (persist) { try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 隐私模式下忽略 */ } }
+  const night = t === "dark";
+  const top = $("#themeBtn");
+  if (top) {
+    top.textContent = night ? "🌙 夜间" : "☀ 日间";
+    top.title = `当前${night ? "夜间" : "日间"}模式，点击切换为${night ? "日间" : "夜间"}模式`;
+  }
+  const fab = $("#themeBtnLogin");
+  if (fab) {
+    fab.textContent = night ? "🌙" : "☀";
+    fab.title = `当前${night ? "夜间" : "日间"}模式，点击切换为${night ? "日间" : "夜间"}模式`;
+  }
+}
+function toggleTheme() { applyTheme(currentTheme() === "dark" ? "light" : "dark", true); }
+$("#themeBtn").addEventListener("click", toggleTheme);
+$("#themeBtnLogin").addEventListener("click", toggleTheme);
+applyTheme(currentTheme(), false);
+// 未显式选择时跟随系统：系统在日/夜间之间切换就跟着变（选过就不再跟随）
+if (window.matchMedia) {
+  const mq = window.matchMedia("(prefers-color-scheme: light)");
+  const onSystemTheme = () => { if (!storedTheme()) applyTheme(systemTheme(), false); };
+  if (mq.addEventListener) mq.addEventListener("change", onSystemTheme);
+  else if (mq.addListener) mq.addListener(onSystemTheme);
+}
+
 async function api(method, path, body) {
   const opts = { method, headers: {} };
   if (TOKEN) opts.headers["Authorization"] = "Bearer " + TOKEN;

@@ -5,6 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>UniGate · 通用网关</title>
 <link rel="stylesheet" href="/style.css">
+<script>
+// 主题：在样式渲染前就把 <html data-theme> 定下来（否则日间模式下会先闪一下暗色）。
+// 规则与 app.js 的 applyTheme 一致：localStorage 里的显式选择优先，未选择时跟随系统。
+(function () {
+  try {
+    var t = localStorage.getItem("unigate_theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) {
+    document.documentElement.dataset.theme = "dark";
+  }
+})();
+</script>
 </head>
 <body>
 <!-- 登录视图 -->
@@ -17,6 +32,7 @@
     <div id="loginErr" class="err hidden"></div>
     <button type="submit" class="btn primary block">登录</button>
   </form>
+  <button id="themeBtnLogin" class="theme-fab" title="切换日间/夜间模式">🌙</button>
 </div>
 
 <!-- 主视图 -->
@@ -38,6 +54,7 @@
     <div class="spacer"></div>
     <span class="ver muted" id="topVersion" title="构建版本"></span>
     <span id="whoami" class="muted"></span>
+    <button id="themeBtn" class="btn ghost theme-btn" title="切换日间/夜间模式">🌙 夜间</button>
     <button id="logoutBtn" class="btn ghost">退出</button>
   </header>
 

@@ -166,6 +166,11 @@ docker compose up -d --build
 
 ### WebUI 里配一个渠道的最小流程
 
+界面外观：顶栏右侧「🌙 夜间 / ☀ 日间」按钮切换**日间/夜间模式**（登录页右下角有同样的
+悬浮按钮）。选择存在浏览器 `localStorage`（`unigate_theme`）里、下次打开直接生效；没手动
+选过时跟随系统偏好（`prefers-color-scheme`），系统切换会跟着变，手动选过就以你的选择为准。
+两套配色是同一组 CSS 变量，正文对比度均 ≥ 4.5:1（WCAG AA）。
+
 1. 「渠道」→ 新建：填名称、`BaseURL`（如 `https://api.cline.bot/api/v1`）。
    `BaseURL` 是 **OpenAI 兼容前缀，默认自适应补全版本段**：只填站点根
    （`https://api.deepseek.com`）或自定义前缀（`https://host/openai`）会自动补成

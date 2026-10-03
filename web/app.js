@@ -1696,24 +1696,37 @@ function collectChannelProxy() {
 
 // renderCoolingKeys 编辑弹窗底部：该渠道冷却中的 key / (key, 模型) 一键解除。
 // (key, 模型) 粒度渠道逐模型列出；解除时只清对应条目（整体冷却仍全清）。
+// 条目渲染成**列表行**并限制高度（.cool-list 内部滚动）：冷却条目多时不会把
+// 编辑弹窗撑得很高，说明文字固定在清单标题行。
 function renderCoolingKeys(ch) {
   const wrap = $("#chCoolingKeys");
   const items = [];
   for (const k of ch.keys || []) {
     const d = keyCoolDetail(ch, k.id);
     if (!d) continue;
-    if (d.whole) items.push({ key: k, model: "", left: d.left });
-    else for (const c of d.cooled) items.push({ key: k, model: c.model, left: c.left });
+    if (d.whole) items.push({ key: k, model: "", left: d.left, whole: true });
+    else for (const c of d.cooled) items.push({ key: k, model: c.model, left: c.left, whole: false });
   }
+  const countEl = $("#chCoolingCount");
+  if (countEl) countEl.textContent = items.length ? `共 ${items.length} 条` : "";
   if (!items.length) {
-    wrap.innerHTML = '<span class="muted" style="font-size:12px">（无冷却中的 key）</span>';
+    wrap.innerHTML = '<div class="cool-row"><span class="muted">（无冷却中的 key）</span></div>';
     return;
   }
-  wrap.innerHTML = items.map((it) => {
-    const scope = it.model ? `（${esc(it.model)}）` : "";
-    return `<span class="chip">${esc(it.key.name || it.key.id)}${scope} 剩 ${fmtLeft(it.left)}
-      <button class="btn small" data-clearkey="${esc(it.key.id)}" data-clearmodel="${esc(it.model)}">解除</button></span>`;
-  }).join("");
+  // 整体冷却（影响该 key 的全部模型）排最前，其余按剩余时间升序：先到期、先恢复的在前
+  items.sort((a, b) => (a.whole === b.whole ? a.left - b.left : (a.whole ? -1 : 1)));
+  wrap.innerHTML = items.map((it) => `<div class="cool-row">
+    <span class="badge warn">冷却</span>
+    <span class="cool-key" title="渠道 key">${esc(it.key.name || it.key.id)}</span>
+    ${it.model
+      ? `<span class="cool-model" title="只冷却这一个模型，其余模型不受影响">${esc(it.model)}</span>`
+      : '<span class="cool-left">全部模型</span>'}
+    <span class="spacer"></span>
+    <span class="cool-left">剩 ${fmtLeft(it.left)}</span>
+    <button class="btn small" data-clearkey="${esc(it.key.id)}" data-clearmodel="${esc(it.model)}" title="${it.model
+      ? "只解除该 (key, 模型) 的冷却，立即恢复这个模型的路由"
+      : "解除该 key 的全部冷却（key 级与按模型冷却），立即恢复该 key 的路由"}">解除</button>
+  </div>`).join("");
   wrap.querySelectorAll("[data-clearkey]").forEach((b) => b.addEventListener("click", async () => {
     try {
       const model = b.dataset.clearmodel || "";

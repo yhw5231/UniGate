@@ -188,6 +188,27 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 /* 测试清单中已选中的模型 chip：高亮并标记可移除 */
 .chip-on { border-color: var(--accent); color: var(--accent); background: rgba(79,140,255,.12); }
 
+/* 渠道编辑弹窗底部的冷却清单：条目多时只让清单内部滚动（max-height），
+   不把弹窗撑得很高；说明文字作为清单的标题行固定在顶部 */
+.cool-box {
+  margin-top: 10px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel2); overflow: hidden;
+}
+.cool-cap {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.cool-list { max-height: 132px; overflow: auto; }
+.cool-row {
+  display: flex; align-items: center; gap: 8px; padding: 3px 10px;
+  font-size: 12px; border-top: 1px dashed var(--border);
+}
+.cool-row:first-child { border-top: none; }
+.cool-row .cool-key { font-family: ui-monospace, Consolas, monospace; }
+.cool-row .cool-model { font-family: ui-monospace, Consolas, monospace; color: var(--accent); }
+.cool-row .cool-left { color: var(--muted); }
+.cool-row .spacer { flex: 1; }
+
 /* 渠道测试 */
 .panel {
   background: var(--panel); border: 1px solid var(--border); border-radius: 10px;

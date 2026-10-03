@@ -540,10 +540,14 @@
           <button class="btn small" id="bulkImportBtn">导入</button>
         </div>
       </div>
-      <div class="key-line" style="margin:10px 0 0">
-        <span class="muted" style="font-size:12px">冷却中的 key / (key, 模型) 可在此手动解除（上游已恢复时立即恢复路由，不必等冷却到期）：</span>
+      <div class="cool-box">
+        <div class="cool-cap">
+          <span class="muted" style="font-size:12px">冷却中的 key / (key, 模型) 可在此手动解除（上游已恢复时立即恢复路由，不必等冷却到期）：</span>
+          <span class="spacer"></span>
+          <span id="chCoolingCount" class="muted" style="font-size:12px"></span>
+        </div>
+        <div id="chCoolingKeys" class="cool-list"></div>
       </div>
-      <div id="chCoolingKeys" class="chips" style="margin:4px 0 0"></div>
     </div>
     <div class="modal-foot">
       <span id="channelErr" class="err"></span>

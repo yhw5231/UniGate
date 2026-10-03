@@ -1166,8 +1166,43 @@ func testOnce(ctx context.Context, ch *Channel, k *UpKey, model, msg, user strin
 	res.Status = resp.StatusCode
 	res.OK = resp.StatusCode >= 200 && resp.StatusCode < 300
 	res.Snippet = truncate(string(data), 512)
+	if hint := missingAuthHint(resp.StatusCode, k, ch, data); hint != "" {
+		res.Error = hint
+	}
 	res.promptTokens, res.completionTokens = parseUsageFromBody(data)
 	return res
+}
+
+// missingAuthHint 上游回 401/403 且被测 key 根本没有凭证时，把「上游说缺
+// authorization 头」翻译成可执行的说明：这种 401 不是网关把认证弄丢了，而是
+// 这个 key 本来就没有 API Key（渠道里常见残留的空白占位 key 行），或者凭证
+// 配在别处（渠道自定义头）。其他情况返回空串，不改写上游原文。
+func missingAuthHint(status int, k *UpKey, ch *Channel, body []byte) string {
+	if status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return ""
+	}
+	if k == nil || strings.TrimSpace(k.APIKey) != "" || channelSendsAuthHeader(ch) {
+		return ""
+	}
+	msg := "该 key 未配置 API Key，请求没有 Authorization 头（渠道自定义头里也没有）——上游需要鉴权时请在该 key 上填写 API Key"
+	if s := strings.TrimSpace(string(body)); s != "" {
+		msg += "；上游返回 " + strconv.Itoa(status) + "：" + truncate(s, 200)
+	}
+	return msg
+}
+
+// channelSendsAuthHeader 渠道自定义头里是否配了非空的 Authorization（它会覆盖
+// key 的 Bearer，见 applyCustomHeaders）。
+func channelSendsAuthHeader(ch *Channel) bool {
+	if ch == nil {
+		return false
+	}
+	for name, value := range ch.Headers {
+		if strings.EqualFold(strings.TrimSpace(name), "Authorization") && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // recordTestRequest 把一次渠道测试请求写入请求记录（与网关请求共用请求日志；
@@ -1281,6 +1316,64 @@ func handleAdminTestKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, runTestOnce(ctx, ch, k, model, msg, adminUserFrom(r.Context())))
 }
 
+// placeholderUpKey 判断「占位空 key」：没有名称、没有 API Key、也没有单独的
+// 代理配置。新建渠道时编辑器会自动生成这样一个空 key 行（保证渠道至少有一个
+// key 可填），批量导入 key 时它不会被顶掉，于是排在被测 key 的最前面：按
+// first 语义测它必然没有 Authorization 头，上游回 401「缺 authorization」，
+// 看起来像「渠道没正确携带认证」，实际是这一行本来就没有凭证。
+func placeholderUpKey(k *UpKey) bool {
+	return k != nil && strings.TrimSpace(k.Name) == "" && strings.TrimSpace(k.APIKey) == "" && k.Proxy == nil
+}
+
+// selectTestKeys 按测试范围挑选被测 key：all = 全部启用的 key；pick = key_id
+// 指定的 key（未给 key_id 时调用方已退化为 first）；first（默认）= 第一个启用
+// 的 key。
+//
+// first / all 会跳过占位空 key（见 placeholderUpKey）：它们排在配置最前面时会
+// 成为 first 语义的被测对象，测试必然 401「缺 Authorization」，掩盖真正可用的
+// key。跳过条数由 skipped 返回，供 WebUI 提示。无鉴权渠道可以只用一个空白 key
+// 行表达「该渠道可路由」，因此唯一的启用 key 不跳过；全部启用 key 都是空白占位
+// 时同样不跳过（否则这类渠道会变成「没有可测 key」）。pick 是用户显式指定，
+// 不跳过——照测并给出可执行的说明（见 missingAuthHint）。
+func selectTestKeys(ch *Channel, scope, keyID string) (keys []*UpKey, skipped int) {
+	enabled := make([]*UpKey, 0, len(ch.Keys))
+	for _, k := range ch.Keys {
+		if k != nil && k.Enabled {
+			enabled = append(enabled, k)
+		}
+	}
+	if scope == "pick" {
+		for _, k := range enabled {
+			if k.ID == keyID {
+				return []*UpKey{k}, 0
+			}
+		}
+		return nil, 0
+	}
+	if len(enabled) > 1 {
+		real := make([]*UpKey, 0, len(enabled))
+		for _, k := range enabled {
+			if placeholderUpKey(k) {
+				skipped++
+				continue
+			}
+			real = append(real, k)
+		}
+		if len(real) > 0 {
+			enabled = real
+		} else {
+			skipped = 0 // 全是空白占位：照常测试（无鉴权渠道的极端形态）
+		}
+	}
+	if scope == "all" {
+		return enabled, skipped
+	}
+	if len(enabled) == 0 { // first
+		return nil, skipped
+	}
+	return enabled[:1], skipped
+}
+
 // handleAdminTestModel 渠道级测试：对指定模型集合，按 scope 挑选 key 发起真实
 // 对话请求（复用网关请求链路与自动换 IP 重试），返回逐 (key, 模型) 结果供
 // WebUI 展示。scope=first（默认）只测第一个启用的 key；scope=all 对全部启用
@@ -1306,7 +1399,7 @@ func handleAdminTestModel(w http.ResponseWriter, r *http.Request) {
 	}
 	// key 选择：scope=all 取全部启用的 key；scope=pick 只取指定 key（未给
 	// key_id 时退化为 first）；默认（空 / first / 旧字段 first_only）只取
-	// 第一个启用的 key。
+	// 第一个启用的 key。占位空 key（见 selectTestKeys）不计入被测对象。
 	scope := body.Scope
 	if scope != "all" && scope != "pick" {
 		scope = "first"
@@ -1314,26 +1407,7 @@ func handleAdminTestModel(w http.ResponseWriter, r *http.Request) {
 	if scope == "pick" && body.KeyID == "" {
 		scope = "first"
 	}
-	keys := make([]*UpKey, 0, len(ch.Keys))
-	for _, k := range ch.Keys {
-		if !k.Enabled {
-			continue
-		}
-		switch scope {
-		case "all":
-			keys = append(keys, k)
-		case "pick":
-			if k.ID == body.KeyID {
-				keys = append(keys, k)
-			}
-			continue // pick：继续扫描全表匹配（ID 唯一，正常只会命中一个）
-		default: // first
-			keys = append(keys, k)
-		}
-		if scope == "first" {
-			break // first 模式只取第一个启用的 key
-		}
-	}
+	keys, skippedKeys := selectTestKeys(ch, scope, body.KeyID)
 	if len(keys) == 0 {
 		writeJSONError(w, http.StatusBadRequest, "channel has no enabled key matching key_id", "bad_request")
 		return
@@ -1356,6 +1430,9 @@ func handleAdminTestModel(w http.ResponseWriter, r *http.Request) {
 		"channel":    ch.Name,
 		"models":     models,
 		"results":    results,
+		// 被跳过的空白占位 key 条数：WebUI 据此提示「不是没带认证，而是这些
+		// 空行没有凭证」，避免把占位行当成本次测试的失败项
+		"skipped_keys": skippedKeys,
 	})
 }
 

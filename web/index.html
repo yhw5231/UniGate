@@ -132,11 +132,17 @@
           </label>
         </div>
         <div class="grid2">
-          <label>模型（每行一个，留空 = 渠道已启用的全部模型） <textarea id="testModels" rows="3" placeholder="留空则测试渠道启用的所有模型；也可粘贴指定模型，每行一个"></textarea></label>
+          <div>
+            <label>模型（每行一个，留空 = 渠道已启用的全部模型） <textarea id="testModels" rows="3" placeholder="留空则测试渠道启用的所有模型；也可粘贴指定模型，每行一个"></textarea></label>
+            <div class="row" style="margin:6px 0 0">
+              <button id="testModelsClearBtn" class="btn small" title="清空待测试模型清单；清单为空时运行测试 = 测试该渠道已启用的全部模型">✕ 清空模型清单</button>
+              <span class="muted" id="testModelsCount" style="font-size:12px"></span>
+            </div>
+          </div>
           <div>
             <label>已启用模型（点击加入测试清单）</label>
             <div id="testModelChips" class="chips"></div>
-            <p class="muted" style="font-size:12px;margin:6px 0 0">对所选范围逐个 key 发送真实对话请求：「仅第一个 key」只测第一个启用的 key；「全部 key」对全部启用的 key 逐个完整测试（不因某个 key 通过而跳过其余）；「指定 key」只测所选 key。每个 (key, 模型) 独立一行展示结果。</p>
+            <p class="muted" style="font-size:12px;margin:6px 0 0">对所选范围逐个 key 发送真实对话请求：「仅第一个 key」只测第一个启用的 key（跳过没有名称也没有 API Key 的空白占位行）；「全部 key」对全部启用的 key 逐个完整测试（不因某个 key 通过而跳过其余）；「指定 key」只测所选 key。每个 (key, 模型) 独立一行展示结果。</p>
           </div>
         </div>
         <div class="row" style="margin:4px 0 0">

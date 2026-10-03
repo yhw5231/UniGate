@@ -1,15 +1,21 @@
 // WebUI 源码级回归守卫：
 //  1. 冷却相关的显示只放「冷却条目本身 + 计数」，不允许把渠道的全部模型铺进来；
-//  2. 日间/夜间两套配色变量必须一一对应（漏一个就会在日间模式下露出暗色）。
+//  2. 日间/夜间两套配色变量必须一一对应（漏一个就会在日间模式下露出暗色）；
+//  3. 渠道测试页的待测模型清单必须能一键清空；
+//  4. 完全空白的 key 行不得写进配置、也不得在批量导入后残留在第一位（它没有凭证，
+//     会以「缺 Authorization 头」的 401 掩盖真正可用的 key）。
 //
 // 背景（真实反馈）：渠道卡片的冷却明细曾经直接列出「可用模型：m2、m3、…」——渠道声明
 // 几十个模型、只有 1 个在冷却时，冷却那一行就等于把**全部模型**都显示出来了
-// （「渠道冷却还是显示了所有模型」）。同类问题还有「冷却清单条目多把编辑弹窗撑高」。
+// （「渠道冷却还是显示了所有模型」）。同类问题还有「冷却清单条目多把编辑弹窗撑高」、
+// 「渠道测试全部 401 缺 authorization，看起来像网关没带认证」（实际是自动补的空白
+// key 行排在第一位）。
 //
 // 这些靠人眼 review 容易漏，所以钉在测试里：
 //   - 冷却渲染函数里不得内联铺开模型清单（可用模型只给个数，完整名单放 title）；
 //   - 冷却清单容器必须是限高可滚动的（.cool-list）；
-//   - :root 里的配色变量必须全部在 :root[data-theme="light"] 里重新定义。
+//   - :root 里的配色变量必须全部在 :root[data-theme="light"] 里重新定义；
+//   - 测试页的清空按钮与空白 key 行清理必须保持接线。
 package main
 
 import (
@@ -272,6 +278,86 @@ func TestThemeToggleWiring(t *testing.T) {
 	} {
 		if !strings.Contains(app, want) {
 			t.Errorf("web/app.js 缺少主题切换接线：%s", want)
+		}
+	}
+}
+
+// jsArrowBody 取 app.js 里某个事件处理器（`xxx.addEventListener("click", () => {` 形态）
+// 的函数体：从签名到行首的 `});`。
+func jsArrowBody(t *testing.T, src, signature string) string {
+	t.Helper()
+	i := strings.Index(src, signature)
+	if i < 0 {
+		t.Fatalf("web/app.js 里找不到 %s", signature)
+	}
+	rest := src[i:]
+	if j := strings.Index(rest, "\n});"); j >= 0 {
+		return rest[:j]
+	}
+	return rest
+}
+
+// TestTestModelClearButtonWired 渠道测试页的待测模型清单必须能一键清空（真实反馈：
+// 清单只能一个个点掉，换一批模型很别扭），且清空要同步右侧 chips 的 ✓ 选中态，
+// 并实时显示待测条数（清单为空 = 运行测试时用渠道已启用的全部模型）。
+func TestTestModelClearButtonWired(t *testing.T) {
+	html, err := os.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("读取 web/index.html: %v", err)
+	}
+	for _, want := range []string{`id="testModels"`, `id="testModelsClearBtn"`, `id="testModelsCount"`} {
+		if !strings.Contains(string(html), want) {
+			t.Errorf("web/index.html 缺少 %s", want)
+		}
+	}
+
+	raw, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatalf("读取 web/app.js: %v", err)
+	}
+	src := string(raw)
+	body := jsArrowBody(t, src, `$("#testModelsClearBtn").addEventListener("click"`)
+	if !strings.Contains(body, `$("#testModels")`) || !strings.Contains(body, `ta.value = ""`) {
+		t.Error("清空按钮必须清空 #testModels 文本框")
+	}
+	if !strings.Contains(body, "testModelChips()") {
+		t.Error("清空后必须刷新 chips（否则 ✓ 高亮与内容不一致）")
+	}
+	if !strings.Contains(src, "function testModelsCount(") {
+		t.Error("web/app.js 缺少 testModelsCount（待测模型条数显示）")
+	}
+}
+
+// TestBlankPlaceholderKeyRowsNeverSaved 完全空白的 key 行（无名称、无 API Key、无
+// key 级代理）不得写进配置，也不能在批量导入后残留在第一位。
+//
+// 背景（真实反馈）：新建渠道时编辑器自动补一个空 key 行，批量导入 key 是往后追加，
+// 于是这个空行成了「第一个启用的 key」——它没有凭证，测试（默认只测第一个 key）与
+// 路由都会先撞上它，上游回 401 `Header of type `authorization` was missing`，看起来
+// 像「渠道没正确携带认证」。修复分三处，这里钉住前端两处（后端跳过逻辑见
+// adminapi_test.go 的 TestAdminTestModelSkipsPlaceholderKey）。
+func TestBlankPlaceholderKeyRowsNeverSaved(t *testing.T) {
+	raw, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatalf("读取 web/app.js: %v", err)
+	}
+	src := string(raw)
+
+	if !strings.Contains(jsFuncBody(t, src, "function collectChannelForm("), "dropBlankKeyRows(") {
+		t.Error("collectChannelForm 必须丢弃空白占位 key 行：保存时不能把它写进配置")
+	}
+	if !strings.Contains(jsArrowBody(t, src, `$("#bulkImportBtn").addEventListener("click"`), "removeBlankKeyBlocks()") {
+		t.Error("批量导入 key 后必须清掉编辑器里残留的空白占位行（否则它排在被测/被路由的第一位）")
+	}
+	// 无鉴权渠道可能只用一个空白 key 行表达「该渠道可路由」：全是空白时必须原样保留
+	drop := jsFuncBody(t, src, "function dropBlankKeyRows(")
+	if !strings.Contains(drop, "kept.length ? kept : keys") {
+		t.Error("dropBlankKeyRows 在全是空白行时必须原样返回（无鉴权渠道只有一个空白 key 行）")
+	}
+	blank := jsFuncBody(t, src, "function isBlankKeyForm(")
+	for _, want := range []string{"k.name", "k.api_key", "k.proxy"} {
+		if !strings.Contains(blank, want) {
+			t.Errorf("占位行判定必须同时看名称 / API Key / key 级代理，缺 %s", want)
 		}
 	}
 }

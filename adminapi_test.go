@@ -772,6 +772,166 @@ func TestAdminTestModelResponsesChannel(t *testing.T) {
 	}
 }
 
+// TestAdminTestModelSkipsPlaceholderKey：渠道里残留的空白占位 key 行（无名称、
+// 无 API Key、也没有单独代理）不该成为被测对象——它本来就没有凭证，测它必然
+// 拿到上游 401「Header of type `authorization` was missing」，看起来像「渠道
+// 没正确携带认证」，其实只是这一行是空的（新建渠道自动补的行、批量导入后残留
+// 的行）。跳过条数通过 skipped_keys 告知前端。
+func TestAdminTestModelSkipsPlaceholderKey(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+
+	up := newUpstream(t, http.StatusUnauthorized, `{"error":"Header of type `+"`authorization`"+` was missing"}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Models: []string{"m1"}, Enabled: true,
+		Keys: []*UpKey{
+			{Enabled: true}, // 空白占位行：无名称、无 API Key、代理跟随渠道
+			{Name: "k2", APIKey: "sk-2", Enabled: true},
+		}})
+	chid := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model", `{}`, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Results []struct {
+			OK    bool   `json:"ok"`
+			Key   string `json:"key"`
+			Error string `json:"error"`
+		} `json:"results"`
+		SkippedKeys int `json:"skipped_keys"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 1 || out.Results[0].Key != "k2" {
+		t.Fatalf("first scope should test the credentialed key only: %+v", out.Results)
+	}
+	if out.SkippedKeys != 1 {
+		t.Fatalf("skipped_keys = %d, want 1", out.SkippedKeys)
+	}
+	// 占位行没有被发出去：只有一次上游请求，且带的是 k2 的 Bearer
+	if up.count() != 1 || up.lastAuth() != "Bearer sk-2" {
+		t.Fatalf("upstream calls=%d auth=%q, want 1 call with Bearer sk-2", up.count(), up.lastAuth())
+	}
+	// 有 API Key 的 key 拿 401 时保持上游原文（缺认证的提示只给没凭证的 key）
+	if out.Results[0].Error != "" {
+		t.Fatalf("key with api_key should keep upstream text, got error %q", out.Results[0].Error)
+	}
+
+	// scope=all 同样跳过占位行（它没有凭证，测它只会产生无意义的失败行）
+	rrAll := httptest.NewRecorder()
+	rootHandler(rrAll, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model",
+		`{"scope":"all","models":"m1"}`, tok))
+	var outAll struct {
+		Results []struct {
+			Key string `json:"key"`
+		} `json:"results"`
+		SkippedKeys int `json:"skipped_keys"`
+	}
+	if err := json.Unmarshal(rrAll.Body.Bytes(), &outAll); err != nil {
+		t.Fatal(err)
+	}
+	if len(outAll.Results) != 1 || outAll.Results[0].Key != "k2" || outAll.SkippedKeys != 1 {
+		t.Fatalf("scope=all should skip the placeholder row: %+v skipped=%d", outAll.Results, outAll.SkippedKeys)
+	}
+
+	// scope=pick 是用户显式指定：占位行也照测（不跳过），拿到的是可执行的说明
+	phID := store.Snapshot().Channels[0].Keys[0].ID
+	rrPick := httptest.NewRecorder()
+	rootHandler(rrPick, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model",
+		`{"scope":"pick","key_id":"`+phID+`","models":"m1"}`, tok))
+	if rrPick.Code != http.StatusOK {
+		t.Fatalf("pick placeholder: status=%d body=%s", rrPick.Code, rrPick.Body.String())
+	}
+	var outPick struct {
+		Results []struct {
+			Key   string `json:"key"`
+			Error string `json:"error"`
+		} `json:"results"`
+		SkippedKeys int `json:"skipped_keys"`
+	}
+	if err := json.Unmarshal(rrPick.Body.Bytes(), &outPick); err != nil {
+		t.Fatal(err)
+	}
+	if len(outPick.Results) != 1 || outPick.SkippedKeys != 0 {
+		t.Fatalf("explicitly picked placeholder must be tested: %+v skipped=%d", outPick.Results, outPick.SkippedKeys)
+	}
+	if !strings.Contains(outPick.Results[0].Error, "未配置 API Key") {
+		t.Fatalf("picked placeholder should explain the missing credential, got %q", outPick.Results[0].Error)
+	}
+	if up.lastAuth() != "" {
+		t.Fatalf("placeholder key has no credential, upstream auth must be empty, got %q", up.lastAuth())
+	}
+}
+
+// TestAdminTestModelKeylessHint：无鉴权渠道可以只用一个空白 key 行（唯一的启用
+// key 不跳过），此时上游若要求鉴权，401 的说明必须点明「该 key 未配置 API Key」
+// 并附上上游原文，而不是把「缺 authorization 头」直接丢给用户去猜。
+func TestAdminTestModelKeylessHint(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+
+	up := newUpstream(t, http.StatusUnauthorized, `{"error":"Header of type `+"`authorization`"+` was missing"}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Models: []string{"m1"}, Enabled: true,
+		Keys: []*UpKey{{Enabled: true}}})
+	chid := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model", `{"models":"m1"}`, tok))
+	var out struct {
+		Results []struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		} `json:"results"`
+		SkippedKeys int `json:"skipped_keys"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 1 || out.Results[0].OK {
+		t.Fatalf("keyless key should be tested and fail: %+v", out.Results)
+	}
+	if out.SkippedKeys != 0 {
+		t.Fatalf("the only enabled key must never be skipped, got skipped_keys=%d", out.SkippedKeys)
+	}
+	if !strings.Contains(out.Results[0].Error, "未配置 API Key") ||
+		!strings.Contains(out.Results[0].Error, "authorization") {
+		t.Fatalf("401 hint should explain the missing credential, got %q", out.Results[0].Error)
+	}
+}
+
+// TestAdminTestModelCustomAuthHeaderNoHint：凭证配在渠道自定义头（Authorization）
+// 时不加「未配置 API Key」的提示——上游原文已足够，提示会误导。
+func TestAdminTestModelCustomAuthHeaderNoHint(t *testing.T) {
+	setupGateway(t)
+	tok := adminToken(t)
+
+	up := newUpstream(t, http.StatusUnauthorized, `{"error":"invalid api key"}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Models: []string{"m1"}, Enabled: true,
+		Headers: map[string]string{"Authorization": "Bearer from-header"},
+		Keys:    []*UpKey{{Enabled: true}}})
+	chid := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/test-model", `{"models":"m1"}`, tok))
+	var out struct {
+		Results []struct {
+			Error string `json:"error"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 1 || out.Results[0].Error != "" {
+		t.Fatalf("custom Authorization header should suppress the keyless hint: %+v", out.Results)
+	}
+	if up.lastAuth() != "Bearer from-header" {
+		t.Fatalf("channel header should reach upstream, got %q", up.lastAuth())
+	}
+}
+
 func TestVersionEndpoint(t *testing.T) {
 	// /api/version 公开返回版本号（dev 或 -ldflags 注入值），无需鉴权
 	rr := httptest.NewRecorder()

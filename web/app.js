@@ -2043,8 +2043,12 @@ $("#bulkImportBtn").addEventListener("click", () => {
   }
   $("#bulkKeysInput").value = "";
   $("#bulkImportBox").classList.add("hidden");
-  if (bad.length) toast(`已导入 ${imported} 个 key；${bad.length} 行有问题已跳过：${badMsg}`, true);
-  else toast(`已导入 ${imported} 个 key，请点「保存」写入配置`);
+  // 导入的行自带名称/凭证：把编辑器里自动补的空白占位 key 行清掉，避免它成为
+  // 第一个 key（测试与路由都会先撞上它，发不出 Authorization 头）
+  const dropped = removeBlankKeyBlocks();
+  const droppedMsg = dropped ? `，已清掉 ${dropped} 个空白占位 key 行` : "";
+  if (bad.length) toast(`已导入 ${imported} 个 key${droppedMsg}；${bad.length} 行有问题已跳过：${badMsg}`, true);
+  else toast(`已导入 ${imported} 个 key${droppedMsg}，请点「保存」写入配置`);
 });
 
 // ---- 从上游拉取模型列表（用渠道 key 鉴权）----
@@ -2168,6 +2172,34 @@ $("#mpRebuildBtn").addEventListener("click", async () => {
   }
 });
 
+// isBlankKeyForm 判断「完全空白」的 key 行：无名称、无 API Key、代理跟随渠道
+//（没有单独配置代理）。新建渠道时编辑器会自动补一行这样的占位行，批量导入 key
+// 后它也不会被顶掉——它排在被测/被路由的第一个 key 位置，发出去的请求没有
+// Authorization 头，上游回 401「Header of type `authorization` was missing」，
+// 看起来像「渠道没正确携带认证」，实际是这行本来就没有凭证。
+function isBlankKeyForm(k) {
+  return !k.name && !k.api_key && !k.proxy;
+}
+
+// dropBlankKeyRows 丢弃完全空白的 key 行，但至少保留一行——无鉴权渠道可能只用
+// 一个空白 key 行表达「该渠道可路由」，删光会让渠道没有 key 可用。
+function dropBlankKeyRows(keys) {
+  const kept = keys.filter((k) => !isBlankKeyForm(k));
+  return kept.length ? kept : keys;
+}
+
+// removeBlankKeyBlocks 从编辑弹窗的 key 列表里移除完全空白的行（同样至少留一行），
+// 返回移除条数。批量导入 key 后调用：导入的行有名称/凭证，占位行不再需要。
+function removeBlankKeyBlocks() {
+  const blocks = $$("#chKeys .keyblock");
+  let removed = 0;
+  blocks.forEach((div) => {
+    if (blocks.length - removed <= 1) return;
+    if (isBlankKeyForm(collectKeyForm(div))) { div.remove(); removed++; }
+  });
+  return removed;
+}
+
 // collectKeyForm 从单个 key 块读取配置（不做校验）。
 // proxy=null 表示跟随渠道级代理；{kind:"none"} 表示 key 显式直连（覆盖渠道级）。
 function collectKeyForm(div) {
@@ -2210,7 +2242,8 @@ function collectChannelForm() {
   });
   // 模型声明由选择器推导：对外名去重进 models，上游写法进 model_map
   const decl = modelDeclaration(modelRows);
-  const keys = $$("#chKeys .keyblock").map(collectKeyForm);
+  // 空白占位 key 行不写进配置（保存渠道时自动补的空行 / 批量导入后残留的空行）
+  const keys = dropBlankKeyRows($$("#chKeys .keyblock").map(collectKeyForm));
   const chProxy = collectChannelProxy();
   // 内部渠道固定不在此编辑（独立「渠道固定」页）：保存渠道时原样携带，
   // 避免整体替换渠道时清空已配置的 model_pins
@@ -2590,7 +2623,26 @@ function testModelChips() {
       : [...lines, m].join("\n");                // 首次点击：加入清单
     testModelChips(); // 刷新 ✓/移除态
   }));
+  testModelsCount(chosen.size);
 }
+
+// testModelsCount 展示待测试模型条数；清单为空 = 运行测试时用渠道已启用的全部模型。
+function testModelsCount(n) {
+  const el = $("#testModelsCount");
+  if (!el) return;
+  el.textContent = n > 0
+    ? `待测 ${n} 个模型`
+    : "清单为空 → 运行测试时测试渠道已启用的全部模型";
+}
+
+// 清空待测试模型清单（chips 的 ✓ 同步取消）
+$("#testModelsClearBtn").addEventListener("click", () => {
+  const ta = $("#testModels");
+  if (!ta.value.trim()) { toast("模型清单已经是空的"); return; }
+  ta.value = "";
+  testModelChips();
+  toast("已清空待测试模型清单（清单为空 = 测试渠道已启用的全部模型）");
+});
 
 // 手工编辑测试清单文本框时同步 chips 的选中态（避免高亮与内容不一致）
 $("#testModels").addEventListener("input", testModelChips);
@@ -2613,7 +2665,7 @@ function testRow(res) {
   tr.innerHTML = `
     <td>${esc(res.model)}</td>
     <td class="t-status"></td>
-    <td class="muted">${esc((res.key || "(未命名)"))}</td>
+    <td class="muted">${esc(res.channel ? res.channel + " / " : "")}${esc(res.key || "(未命名)")}</td>
     <td class="t-code"></td>
     <td>${res.latency_ms != null ? res.latency_ms + "ms" : ""}</td>
     <td class="muted">${esc(res.proxy || "")}</td>
@@ -2640,12 +2692,13 @@ function renderTestStatus(statusEl, codeEl, snippetEl, res) {
     : `<span class="err">${esc(res.error || res.snippet || "未知错误")}</span>`;
 }
 
-function testSummaryLine(pass, fail) {
+function testSummaryLine(pass, fail, note) {
   const el = $("#testSummary");
   el.classList.remove("hidden");
-  el.innerHTML = fail === 0
+  const base = fail === 0
     ? `<span class="badge on">全部通过</span><span class="muted">共 ${pass} 项</span>`
     : `<span class="badge off">失败 ${fail}</span><span class="muted">通过 ${pass} / 共 ${pass + fail} 项</span>`;
+  el.innerHTML = base + (note ? `<span class="muted" title="占位空 key 没有凭证，测它必然拿到上游 401「缺 authorization」；请到渠道编辑里删除这些空行">${esc(note)}</span>` : "");
 }
 
 $("#testRunBtn").addEventListener("click", async () => {
@@ -2674,7 +2727,7 @@ $("#testRunBtn").addEventListener("click", async () => {
   $("#testTable tbody").innerHTML = "";
   $("#testSummary").classList.add("hidden");
 
-  let pass = 0, fail = 0;
+  let pass = 0, fail = 0, skipped = 0;
   for (const m of models) {
     if (testAbort) break;
     const placeholder = testRow({ model: m, running: true, key: "…", proxy: "…", latency_ms: null });
@@ -2686,16 +2739,17 @@ $("#testRunBtn").addEventListener("click", async () => {
         key_id: keyId,
       });
       const results = r.results || [];
+      skipped = Math.max(skipped, Number(r.skipped_keys) || 0);
       if (!results.length) {
         placeholder.remove();
-        testRowAndCount({ model: m, ok: false, error: "渠道没有启用的 key", latency_ms: null });
+        testRowAndCount({ model: m, channel: ch.name, ok: false, error: "渠道没有启用的 key", latency_ms: null });
         fail++;
         continue;
       }
       // 替换占位行：失败的 key 逐行展示，最后一行是最终结论
       placeholder.remove();
       for (const res of results) {
-        const row = testRow({ ...res, model: res.model || m, latency_ms: res.latency_ms ?? null });
+        const row = testRow({ ...res, channel: res.channel || ch.name, model: res.model || m, latency_ms: res.latency_ms ?? null });
         $("#testTable tbody").appendChild(row);
       }
       // 模型级结论：任一 key 通过即算该模型可用（全部模式部分 key 失败不影响计数）
@@ -2703,11 +2757,13 @@ $("#testRunBtn").addEventListener("click", async () => {
       if (okN > 0) pass++; else fail++;
     } catch (e) {
       placeholder.remove();
-      testRowAndCount({ model: m, ok: false, error: e.message, latency_ms: null });
+      testRowAndCount({ model: m, channel: ch.name, ok: false, error: e.message, latency_ms: null });
       fail++;
     }
   }
-  testSummaryLine(pass, fail);
+  testSummaryLine(pass, fail, skipped > 0
+    ? `已跳过 ${skipped} 个空白占位 key（无名称且无 API Key，必然缺 Authorization 头）——到渠道编辑里删掉这些空行即可`
+    : "");
   testRunning = false;
   testAbort = false;
   btn.textContent = "▶ 运行测试";

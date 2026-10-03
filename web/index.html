@@ -462,6 +462,8 @@
           <input id="mpFilter" type="search" placeholder="筛选模型…">
           <span id="mpStatus" class="muted"></span>
           <span class="spacer"></span>
+          <button id="mpNoneBtn" class="btn small" title="取消勾选全部模型（注意：一个都不勾 = 不限制模型，该渠道对全部模型放行，保存前会再确认一次）">全不选</button>
+          <button id="mpAllBtn" class="btn small" title="勾选列表里的全部模型（等价于「以上游返回的全部模型为准」，但不重新拉取）">全选</button>
           <input id="mpCustom" placeholder="添加自定义模型名（进「自定义」分组）">
           <button id="mpCustomAdd" class="btn small" title="把填写的名字作为一个自定义模型加入列表（勾选即启用；上游名可在行内填写，留空表示与对外名相同）">添加</button>
         </div>
@@ -469,6 +471,9 @@
         <p class="muted" id="mpHint">
           <b>列表里存的是对外名</b>（小写、去供应商前缀与 <code>:free</code>/<code>-free</code> 后缀，同一模型只暴露一个名字），
           发往上游用每行的「上游模型名」——上游写法自动写进 <code>model_map</code>；
+          <b>勾选即启用</b>：保存的就是勾选状态，状态栏实时显示「已勾选 N 行 · 保存后启用 K 个对外名」，
+          筛选时已勾选的行一定显示（不会出现看不见却被启用的模型）；
+          <b>一个都不勾 = 不限制模型</b>（该渠道对全部模型放行，保存前会确认）。
           <b>同一对外名可以有多个上游写法</b>（同一模型在上游的不同分组/线路各占一行，各自一个候选：
           请求按顺序故障转移、冷却各自独立），对外仍然只有一个名字，路由页会逐行标注实际发往的上游名。
           「添加」进「自定义」分组，行内填上游名即可配出**与上游名无关的渠道别名**（如

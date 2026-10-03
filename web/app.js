@@ -1371,7 +1371,9 @@ function renderModelPicker() {
   for (const row of modelRows) {
     const name = row.group || GROUP_DEFAULT;
     const hay = `${rowExposed(row)} ${rowUpstream(row)} ${name}`.toLowerCase();
-    if (filter && !hay.includes(filter)) continue;
+    // 已勾选的行**始终显示**：保存的是勾选状态，绝不能让「看不见的行」被悄悄启用
+    //（筛选只用来挑模型，不改变「所见即所存」）
+    if (filter && !hay.includes(filter) && !row.checked) continue;
     if (!groups.has(name)) groups.set(name, []);
     groups.get(name).push(row);
     shown++;
@@ -1420,26 +1422,41 @@ function rowBadges(row) {
 }
 
 // modelRowHTML 单行：勾选框 + 对外名 + 「上游模型名」输入框。
+// 只有勾选框与对外名（label[for]）可切换勾选：整行当 label 时，点「上游模型名」
+// 输入框那片区域不会切换勾选，用户以为取消了其实没取消（所见非所存）。
 function modelRowHTML(row) {
   const name = rowExposed(row);
-  return `<label class="mp-row" data-row="${row.id}">
-    <input type="checkbox" class="mp-check"${row.checked ? " checked" : ""}>
-    <span class="mp-name" title="对外名（/v1/models 与路由页用的名字）：${esc(name)}">${esc(name)}${rowBadges(row)}</span>
+  const boxID = `mpc-${row.id}`;
+  return `<div class="mp-row" data-row="${row.id}">
+    <input type="checkbox" class="mp-check" id="${boxID}"${row.checked ? " checked" : ""}>
+    <label class="mp-name" for="${boxID}" title="点名字即勾选/取消；对外名（/v1/models 与路由页用的名字）：${esc(name)}">${esc(name)}${rowBadges(row)}</label>
     <input class="mp-target" placeholder="上游模型名（留空=与对外名相同）" value="${esc(row.target || "")}">
-  </label>`;
+  </div>`;
 }
 
-// updateModelStatus 状态栏：已选/总数 + 对外名个数（保存后 /v1/models 暴露的名字数）。
+// updateModelStatus 状态栏：勾选行数 + 保存后会启用的对外名个数。一个都不勾 =
+// 不限制模型（该渠道对全部模型放行）——这是最容易误解的一种保存结果，明确警示。
 function updateModelStatus(shown) {
   const total = modelRows.length;
   const picked = modelRows.filter((r) => r.checked);
   const ids = new Set(picked.map(rowExposed).filter(Boolean));
   const el = $("#mpStatus");
   if (!el) return;
-  el.textContent = total === 0
-    ? ""
-    : `已选 ${picked.length} / ${shown === undefined ? total : `${shown}（共 ${total}）`} 个 · 对外 ${ids.size} 个名字`;
-  el.title = [...ids].join("\n");
+  el.classList.remove("warn-text");
+  if (total === 0) {
+    el.textContent = "";
+    el.title = "";
+    return;
+  }
+  if (picked.length === 0) {
+    el.textContent = "⚠ 一个都没勾选 = 不限制模型（对全部模型放行）";
+    el.title = "保存后该渠道不再按模型过滤：上游返回的所有模型都会出现在路由页与 /v1/models";
+    el.classList.add("warn-text");
+    return;
+  }
+  const hidden = shown !== undefined && shown < total ? `（筛选只显示 ${shown}/${total} 行，已勾选的行一定显示）` : "";
+  el.textContent = `已勾选 ${picked.length} 行 · 保存后启用 ${ids.size} 个对外名${hidden}`;
+  el.title = `保存后会启用的对外名（${ids.size} 个）：\n` + [...ids].join("\n");
 }
 
 // paintRowBadges 输入「上游模型名」后就地更新该行徽标（不整表重绘，避免失焦）。
@@ -1497,6 +1514,16 @@ $("#mpList").addEventListener("click", (e) => {
   }
 });
 $("#mpFilter").addEventListener("input", renderModelPicker);
+// 工具栏批量操作：先把所有分组清掉再挑两个，比逐组「全不选」省事；
+// 一个都不勾 = 不限制模型（保存前会再确认一次）。
+$("#mpAllBtn").addEventListener("click", () => {
+  modelRows.forEach((r) => { r.checked = true; });
+  renderModelPicker();
+});
+$("#mpNoneBtn").addEventListener("click", () => {
+  modelRows.forEach((r) => { r.checked = false; });
+  renderModelPicker();
+});
 
 // 自定义模型：加到「自定义」分组（勾选即启用；上游名可在行内填写）。
 function addCustomModel() {
@@ -2151,7 +2178,16 @@ function collectChannelForm() {
 
 // saveChannel 保存渠道（新增/编辑共用）：整体替换写入后端，成功后刷新状态并
 // **关闭弹窗**（保存即完成，不再停留在弹窗里）。失败时抛出，由调用方展示错误。
+//
+// 模型列表是「勾选即启用」：一个都不勾 = 不限制模型（该渠道对全部模型放行），
+// 与用户「把模型都关掉」的直觉相反，因此这种情况下先确认再保存（返回 null = 用户取消）。
 async function saveChannel() {
+  if (modelRows.length && !modelRows.some((r) => r.checked)) {
+    const ok = confirm(
+      "没有勾选任何模型：保存后该渠道不再按模型过滤，上游返回的全部模型都会出现在路由页与 /v1/models。\n\n" +
+      "确定保存？（想只启用部分模型：勾选需要的行再保存）");
+    if (!ok) return null;
+  }
   const ch = collectChannelForm();
   const saved = await api("PUT", "/admin/api/channels", ch);
   editChannel = saved;
@@ -2163,8 +2199,16 @@ async function saveChannel() {
 // 保存渠道
 $("#channelSaveBtn").addEventListener("click", async () => {
   try {
-    await saveChannel();
-    toast("已保存");
+    const saved = await saveChannel();
+    if (!saved) return;
+    // 保存结果说清楚：到底启用了几个模型、是哪些（避免「以为只留了两个」）
+    const decl = modelDeclaration(modelRows);
+    if (!decl.models.length) {
+      toast("已保存：未勾选模型 = 不限制（对全部模型放行）");
+    } else {
+      const head = decl.models.slice(0, 3).join("、");
+      toast(`已保存：启用 ${decl.models.length} 个模型（${head}${decl.models.length > 3 ? " …" : ""}）`);
+    }
   } catch (e) {
     $("#channelErr").textContent = e.message;
   }

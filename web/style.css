@@ -298,16 +298,17 @@ tr.tog-open .tr-toggle { color: var(--accent); }
 .mp-row:hover { background: var(--border); }
 .mp-row input[type="checkbox"] { flex: none; }
 /* 对外名占满剩余宽度（模型名普遍较长，窄列会把名字截断）；过长时换行而不是截断，
-   上游模型名一列可压缩 */
+   上游模型名一列可压缩。只有勾选框与名字可切换勾选（点上游名输入框不会误切换） */
 .mp-name {
   flex: 1 1 340px; min-width: 240px; font-family: ui-monospace, Consolas, monospace;
-  white-space: normal; overflow-wrap: anywhere;
+  white-space: normal; overflow-wrap: anywhere; cursor: pointer;
 }
 .mp-name .badge { margin-left: 6px; }
 .mp-target {
   flex: 0 1 320px; width: 320px; min-width: 200px; font-size: 12px;
   font-family: ui-monospace, Consolas, monospace;
 }
+.mp-toolbar .warn-text, .warn-text { color: var(--warn); }
 @media (max-width: 1100px) { .mp-target { flex-basis: 240px; width: 240px; } }
 @media (max-width: 800px) {
   .mp-row { flex-wrap: wrap; }

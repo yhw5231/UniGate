@@ -24,11 +24,14 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
   `upstream/model-x`）；工具栏有**获取模型**、**筛选**、**已选/对外名计数**、以及**手动添加
   自定义模型**（进「自定义」分组）。列表**按分组显示**：`免费` / 上游给的分组（Cline 的
   `recommended` / `clinePass` / `clineCloud` …）/ `自定义` / `已保存`（上游本次未返回的旧模型，
-  标「上游未返回」徽标），每组有**全选 / 全不选**，点组名可折叠。
+  标「上游未返回」徽标），每组有**全选 / 全不选**，点组名可折叠。**免费标识按模型判定**：
+  免费模型行带绿色 `免费` 徽标，整组免费的分组头标 `免费`、只含部分免费的分组头标 `含免费 N`
+  （不会因为组里有免费模型就把整组都标成免费）。
   - **获取模型**：用渠道 key（含其代理）请求上游模型列表，候选按上游分组铺进列表，
     **已生效的上游写法预勾选**（渠道未声明模型 = 对全部放行 → 全选），新增行不勾选；
     勾选/取消即生效，勾完直接点「保存」即可。免费模型（分组名含 `free`、`:free`/`-free`
-    后缀、或输入输出价格均为 0）标「免费」徽标（仅展示，不额外存储）。
+    后缀、或输入输出价格均为 0）标「免费」徽标（仅展示，不额外存储；重新打开编辑器时
+    上游写法自带 `:free`/`-free` 的行仍标免费）。
   - **拉取并直接重建**：重新拉取上游模型列表，**忽略当前勾选**，以上游返回的全部模型
     重建列表与映射并立即保存（上游已下线的残留模型及其映射一并清除）。
   - 模型列表端点（`/models`，可用 `models_url` 覆盖）的响应**兼容多种形态**：OpenAI 的
@@ -42,7 +45,7 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
     不必先保存即可拉模型 / 测试 key / 换 IP；点「保存」成功后编辑弹窗自动关闭。
   - Admin API：`?replace=1` 走上面的「拉取并直接重建」语义（列表存对外名、上游写法写进
     `model_map`，并丢弃已不在列表里的旧映射键）；dry-run 响应返回 `fetched`（上游写法）、
-    `groups`（`{name, free, models, total}`，按上游分组）、`free_models`、
+    `groups`（`{name, free, free_total, models, total}`，按上游分组；`free` = 该组含免费模型、`free_total` = 该组免费模型数）、`free_models`、
     `enabled_upstream`（候选里当前已生效的写法，供预勾选）与 `stale`（上游已不再返回、
     重建将移除的旧模型）。
 - **模型名称处理**（对标 go-gateway 的 pattern / ModelMapping / source_model）：
@@ -699,7 +702,7 @@ Admin API（均需管理员 token）：`PUT /admin/api/channels/{id}/model-pin` 
 | --- | --- |
 | `GET /admin/api/state` | 渠道、下游 key、代理池列表、租约缓存总览 |
 | `PUT /admin/api/channels` | 新增/整体更新渠道（含内嵌 keys） |
-| `POST /admin/api/channels/{id}/fetch-models` | 用渠道 key 拉取上游模型列表，默认 dry-run 返回候选（`fetched` 上游写法 / `groups` 按上游分组 `{name, free, models, total}` / `free_models` / `enabled` / `enabled_ids` / `enabled_upstream` 预勾选 / `stale`）供 WebUI 选择器铺开勾选，不写回渠道；`?replace=1` 全量替换写回（列表存对外名、上游写法写进 `model_map`，并丢弃已不在列表里的旧映射键）；免费清单仅随响应展示，不持久化 |
+| `POST /admin/api/channels/{id}/fetch-models` | 用渠道 key 拉取上游模型列表，默认 dry-run 返回候选（`fetched` 上游写法 / `groups` 按上游分组 `{name, free, free_total, models, total}` / `free_models` / `enabled` / `enabled_ids` / `enabled_upstream` 预勾选 / `stale`）供 WebUI 选择器铺开勾选，不写回渠道；`?replace=1` 全量替换写回（列表存对外名、上游写法写进 `model_map`，并丢弃已不在列表里的旧映射键）；免费清单仅随响应展示，不持久化 |
 | `POST /admin/api/fetch-models` | **按编辑器当前内容**拉取模型列表（`{channel: {...}}` 内联渠道定义，未保存也能用）：只读不落盘，返回同上字段（WebUI 新增/编辑弹窗「获取模型」用，候选按上游写法逐个返回、按上游分组展示，同一对外名的多个写法各一条）；响应兼容 OpenAI `{"data":[…]}`、裸数组、`models` 等包装字段与**按分组返回的 JSON**（Cline `recommended-models` 的 `recommended`/`free`/`clinePass`/`clineCloud`，字段名即分组名） |
 | `DELETE /admin/api/channels/{id}` | 删除渠道（自动释放其池租约） |
 | `PUT /admin/api/pools` | 新增/更新代理池（连接信息：`{name, pool_url, pool_token?, socks_host?}`；被渠道 key 引用的池不可删除） |

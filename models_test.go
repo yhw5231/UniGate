@@ -114,6 +114,15 @@ func TestParseModelsPayloadGroupedShape(t *testing.T) {
 	if groups[1]["free"] != true || groups[0]["free"] != false {
 		t.Fatalf("group free flags = %+v", groups)
 	}
+	// 分组的 free 只表示「含免费模型」：free 组两个都免费 → free_total=2，其余组为 0
+	if n := groups[1]["free_total"].(int); n != 2 {
+		t.Fatalf("free group free_total = %d, want 2", n)
+	}
+	for _, i := range []int{0, 2, 3} {
+		if n := groups[i]["free_total"].(int); n != 0 {
+			t.Fatalf("group %d free_total = %d, want 0", i, n)
+		}
+	}
 	if n := groups[1]["total"].(int); n != 2 {
 		t.Fatalf("free group size = %d", n)
 	}

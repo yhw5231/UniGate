@@ -148,10 +148,13 @@ func fetchedFreeModels(cands []modelCandidate) []string {
 
 // fetchedModelGroups 候选按上游分组聚合（保持分组首次出现的顺序），
 // WebUI 按分组展示候选清单；未分组的候选归到 name 为空的那一组。
+// free = 该组**含**免费模型（不代表整组都免费），free_total = 该组免费模型数，
+// 便于 WebUI 给分组头与逐个模型加免费标识。
 func fetchedModelGroups(cands []modelCandidate) []map[string]any {
 	var order []string
 	byName := map[string][]string{}
 	freeByName := map[string]bool{}
+	freeTotal := map[string]int{}
 	for _, c := range cands {
 		if _, ok := byName[c.Group]; !ok {
 			order = append(order, c.Group)
@@ -159,16 +162,18 @@ func fetchedModelGroups(cands []modelCandidate) []map[string]any {
 		byName[c.Group] = append(byName[c.Group], c.Raw)
 		if c.Free {
 			freeByName[c.Group] = true
+			freeTotal[c.Group]++
 		}
 	}
 	out := make([]map[string]any, 0, len(order))
 	for _, name := range order {
 		models := byName[name]
 		out = append(out, map[string]any{
-			"name":   name,
-			"free":   freeByName[name],
-			"models": models,
-			"total":  len(models),
+			"name":       name,
+			"free":       freeByName[name],
+			"free_total": freeTotal[name],
+			"models":     models,
+			"total":      len(models),
 		})
 	}
 	return out

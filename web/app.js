@@ -1242,6 +1242,13 @@ function groupNameIsFree(name) {
   return n === "free" || n.includes("免费");
 }
 
+// upstreamNameIsFree 上游写法自带免费标记（:free 变体后缀或 -free 结尾，与后端
+// modelNameIsFree 同规则）：重新打开编辑器（没有本次拉取的免费清单）时据此仍能标出免费。
+function upstreamNameIsFree(name) {
+  const n = String(name ?? "").trim().toLowerCase();
+  return n.endsWith(":free") || n.endsWith("-free");
+}
+
 // displayGroupName 上游分组名 → 列表分组名（free → 免费，无分组 → 上游模型）。
 function displayGroupName(name, free) {
   const n = String(name ?? "").trim();
@@ -1300,19 +1307,21 @@ function addModelRow(row) {
   if (!name) return null;
   const target = String(row.target ?? "").trim();
   const group = row.group || GROUP_DEFAULT;
+  // 免费标记：本次拉取的清单 / 调用方标记，或上游写法自带 :free、-free 后缀
+  const free = !!row.free || upstreamNameIsFree(target || name);
   const entry = {
     id: ++modelRowSeq,
     name,
     target,
     checked: row.checked !== false,
     group,
-    free: !!row.free,
+    free,
     custom: !!row.custom,
   };
   const exist = modelRows.find((r) => rowKey(r) === rowKey(entry));
   if (exist) {
     if (row.checked) exist.checked = true;
-    if (row.free) exist.free = true;
+    if (free) exist.free = true;
     if (row.custom) exist.custom = true;
     if (row.group && !row.keepGroup) exist.group = group;
     return exist;
@@ -1372,11 +1381,17 @@ function renderModelPicker() {
   list.innerHTML = names.map((name) => {
     const rows = groups.get(name);
     const picked = rows.filter((r) => r.checked).length;
+    const freeCount = rows.filter((r) => r.free).length;
     const open = !collapsedGroups.has(name);
+    // 免费标识：整组都是免费 → 「免费」；组里只含部分免费 → 「含免费 N」
+    const freeBadge = freeCount
+      ? `<i class="badge free" title="免费模型（上游免费分组 / :free 后缀 / 价格为 0）：本组 ${freeCount} 个">${freeCount === rows.length ? "免费" : `含免费 ${freeCount}`}</i>`
+      : "";
     return `<div class="mp-group" data-group="${esc(name)}">
       <div class="mp-group-head">
         <span class="mp-caret" data-act="toggle">${open ? "▾" : "▸"}</span>
         <b data-act="toggle">${esc(name)}</b>
+        ${freeBadge}
         <span class="muted">${rows.length} 个 · 已选 ${picked}</span>
         <span class="spacer"></span>
         <button class="btn small" data-act="all">全选</button>
@@ -1974,7 +1989,10 @@ function mergeFetchedModels(groups, enabledUpstream, rebuild) {
   for (const g of groups) {
     const groupName = displayGroupName(g.name, g.free);
     for (const raw of g.models || []) {
-      const isFree = !!(g.free || fetchedFreeSet.has(raw));
+      // 免费以「逐个模型」的清单为准（后端 free_models 已按分组名 / :free 后缀 / 价格为 0
+      // 判定）；分组的 free 只表示「该组里含免费模型」，不能套给组内每一行。
+      // 只有拿不到清单（老后端）时才退回用分组标记。
+      const isFree = fetchedFreeSet.has(raw) || (!fetchedFreeSet.size && !!g.free) || upstreamNameIsFree(raw);
       const exist = byUpstream.get(raw);
       if (exist) {
         exist.group = groupName;
@@ -2013,6 +2031,7 @@ $("#mpFetchBtn").addEventListener("click", async () => {
     const gnames = [...new Set(groups.map((g) => displayGroupName(g.name, g.free)))].join(" / ");
     let msg = `已拉取 ${fetched.length} 个模型（key: ${key}）`;
     if (gnames) msg += `，分组：${gnames}`;
+    if (free.length) msg += `，其中免费 ${free.length} 个`;
     if (added) msg += `，新增 ${added} 行`;
     msg += "；已勾选当前生效的写法，勾选即启用，直接「保存」即可";
     if (stale.length) {

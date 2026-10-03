@@ -595,7 +595,7 @@ function renderChannels() {
       </div>`;
     }).join("");
     const modelLine = (ch.models || []).length
-      ? `<div class="key-line"><span class="pname">模型 ${ch.models.length} 个：${esc(ch.models.slice(0, 4).join("、"))}${ch.models.length > 4 ? " …" : ""}</span></div>`
+      ? `<div class="key-line"><span class="pname" title="该渠道声明的模型（${ch.models.length} 个，对外名）：\n${esc(ch.models.join("\n"))}">模型 ${ch.models.length} 个：${esc(ch.models.slice(0, 4).join("、"))}${ch.models.length > 4 ? " …" : ""}</span></div>`
       : "";
     const mapEntries = Object.entries(ch.model_map || {});
     const mapLine = mapEntries.length
@@ -1098,7 +1098,11 @@ function keyCoolDetail(ch, keyID) {
 // keyCoolHTML 渠道卡片上单个 key 的冷却明细：
 //   - key 粒度渠道（或存在整体冷却条目）：沿用单个「冷却中 · 剩 X」徽标；
 //   - (key, 模型) 粒度渠道：逐模型「冷却 m · 剩 X ×」徽标（× 只解除该模型），
-//     并列出该 key 当前未被冷却、可正常路由的模型（可用模型）。
+//     并给出该 key 当前未被冷却、可正常路由的模型**个数**（完整名单在悬浮提示里）。
+//
+// 纪律：冷却相关的显示只放「冷却条目本身 + 计数」，**不要**把渠道的全部模型铺进来
+//（曾经这里直接列出「可用模型：m2、m3、…」，渠道有几十个模型时冷却那一行就等于
+// 把全部模型都显示出来了）。任何一行的长度只应随冷却条数增长，不随模型数增长。
 function keyCoolHTML(ch, keyID, cooling) {
   const d = keyCoolDetail(ch, keyID);
   if (!d) return "";
@@ -1109,7 +1113,8 @@ function keyCoolHTML(ch, keyID, cooling) {
   ).join("");
   let avail = "";
   if (d.hasModelList) {
-    avail = `<span class="pname" title="该 key 当前未被冷却、可正常路由的模型">可用模型 ${d.available.length ? "：" + esc(d.available.join("、")) : "：无（全部冷却中）"}</span>`;
+    const n = d.available.length;
+    avail = `<span class="pname" title="该 key 当前未被冷却、可正常路由的模型（${n} 个）：\n${esc(d.available.join("\n")) || "（无）"}">可用模型 ${n} 个${n ? "" : "（该 key 的全部模型都在冷却中）"}</span>`;
   }
   return chips + avail;
 }

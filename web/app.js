@@ -649,9 +649,12 @@ function renderChannels() {
     const mapLine = mapEntries.length
       ? `<div class="key-line"><span class="pname" title="下游模型名 → 该上游实际模型名（转发时改写请求体 model）；一个下游名可对应多个上游模型，各自成为独立候选并分别冷却">名称映射 ${mapEntries.length} 条：${esc(mapEntries.slice(0, 3).map(([k, v]) => `${k}→${Array.isArray(v) ? v.join("/") : v}`).join("、"))}${mapEntries.length > 3 ? " …" : ""}</span></div>`
       : "";
+    // 已固定模型数只算渠道当前服务的模型：模型被取消勾选后其固定不生效，
+    // 不能继续算进「已固定 N 个模型」（失效项在渠道固定页另行提示）
     const pinnedModels = Object.keys(ch.model_pins || {}).filter((m) => {
       const p = ch.model_pins[m];
-      return p && ((p.upstreams || []).length || (p.exclude || []).length || p.sort);
+      return p && channelServesModel(ch, m) &&
+        ((p.upstreams || []).length || (p.exclude || []).length || p.sort);
     }).length;
     const open = channelOpen.has(ch.id);
     return `<div class="channel-card ${open ? "open" : ""}" data-id="${esc(ch.id)}">
@@ -853,6 +856,12 @@ $("#channelsAuto").addEventListener("change", syncAutoTimers);
 // 每个渠道一块、渠道的每个模型一行：探测（发现该上游内部渠道清单与管线类型）/
 // 验证（逐渠道测试）/ 固定顺序·排除·模式·排序。所有改动经专用端点立即落盘生效，
 // 不与「编辑渠道」弹窗耦合（编辑渠道保存时原样保留 model_pins，不会清空配置）。
+//
+// 只铺开渠道**当前服务**的模型行：渠道模型列表里被取消勾选的模型（不再声明支持）
+// 不会路由到本渠道，其固定配置也不再生效——继续铺成行会让人以为固定还钉在原来
+// 那个内部渠道上。这类残留配置改由渠道块底部的「失效固定」行提示（只报模型名与
+// 条数，不铺开固定顺序），可一键清除（见 pinStalePins / pinp-purge）。
+//
 // pinExtras：手工添加、尚不在渠道模型列表/model_pins 中的模型行（渠道ID → [模型]）。
 let pinExtras = {};
 
@@ -869,13 +878,34 @@ function renderPinPage() {
   wirePinPage();
 }
 
-// pinChannelSectionHTML 单个渠道块：模型行 + 手工添加模型输入。
+// pinStalePins 渠道上「已失效」的固定配置键：模型已不在渠道的模型列表/映射里
+//（渠道不再服务它），固定不会生效，也不该再显示成生效中的固定。
+function pinStalePins(ch) {
+  return Object.keys((ch && ch.model_pins) || {}).filter((m) => !channelServesModel(ch, m));
+}
+
+// pinChannelSectionHTML 单个渠道块：模型行 + 失效固定提示 + 手工添加模型输入。
 function pinChannelSectionHTML(ch) {
-  const models = [...new Set([...(ch.models || []), ...Object.keys(ch.model_pins || {}), ...(pinExtras[ch.id] || [])])];
+  const pins = ch.model_pins || {};
+  const stale = pinStalePins(ch);
+  const staleSet = new Set(stale);
+  const models = [...new Set([
+    ...(ch.models || []),
+    ...Object.keys(pins).filter((m) => !staleSet.has(m)),
+    ...(pinExtras[ch.id] || []),
+  ])];
   const noKey = !(ch.keys || []).some((k) => k.enabled);
   const rows = models.length
     ? models.map((m) => pinPageRowHTML(ch, m)).join("")
     : '<p class="muted" style="font-size:12px;margin:4px 0">该渠道未声明模型：在下方输入模型 ID 后再设置固定。</p>';
+  // 失效固定：只报模型名与一键清除，不铺开固定顺序/已知渠道（那会像是仍然生效）
+  const staleRow = stale.length
+    ? `<div class="pin-row">
+      <span class="badge warn" title="这些模型已不在本渠道的模型列表里：请求不会再路由到本渠道，固定配置不生效。清除即删除这些模型的固定配置（含探测产物）">失效固定 ${stale.length}</span>
+      <span class="muted" style="font-size:11px">渠道模型列表里没有这些模型：${esc(stale.join("、"))}</span>
+      <button class="btn small danger" data-act="pinp-purge" data-ch="${esc(ch.id)}" title="删除这些模型的固定配置（含探测产物）">清除失效固定</button>
+    </div>`
+    : "";
   return `<div class="channel-card" data-ch="${esc(ch.id)}">
     <div class="head">
       <span class="badge ${ch.enabled ? "on" : "off"}">${ch.enabled ? "启用" : "停用"}</span>
@@ -884,6 +914,7 @@ function pinChannelSectionHTML(ch) {
       ${noKey ? '<span class="badge warn" title="渠道没有启用的 key：探测/验证需要真实上游请求，请先在渠道页启用 key">无启用 key</span>' : ""}
     </div>
     ${rows}
+    ${staleRow}
     <div class="pin-row">
       <input placeholder="添加模型 ID…" style="width:240px" data-act="pinp-model-input" data-ch="${esc(ch.id)}">
       <button class="btn small" data-act="pinp-add-model" data-ch="${esc(ch.id)}">添加模型</button>
@@ -1075,12 +1106,38 @@ function wirePinPage() {
     } catch (e) { toast(e.message, true); }
     finally { b.disabled = false; }
   }));
-  // 手工添加模型行（渠道未声明模型列表时）
+  // 失效固定（渠道已取消的模型）：整条删除，避免残留配置一直挂在渠道上
+  wrap.querySelectorAll('[data-act="pinp-purge"]').forEach((b) => b.addEventListener("click", async () => {
+    const chID = b.dataset.ch;
+    const ch = ((STATE && STATE.channels) || []).find((c) => c.id === chID);
+    if (!ch) return;
+    const stale = pinStalePins(ch);
+    if (!stale.length) { renderPinPage(); return; }
+    if (!confirm(`删除这些模型在本渠道的固定配置（含探测产物）？\n\n${stale.join("、")}\n\n` +
+      "模型重新勾选回来时需要重新探测。")) return;
+    // 走渠道整体替换（与渠道页内联编辑同路径）：model_pins 去掉失效项后写回
+    const next = JSON.parse(JSON.stringify(ch));
+    for (const m of stale) delete next.model_pins[m];
+    if (!Object.keys(next.model_pins).length) delete next.model_pins;
+    try {
+      await api("PUT", "/admin/api/channels", next);
+      toast(`已清除 ${stale.length} 个模型的失效固定`);
+      await loadState();
+      renderPinPage();
+    } catch (e) { toast(e.message, true); }
+  }));
+  // 手工添加模型行（渠道未声明模型列表时；已声明列表的渠道只接受列表内的模型）
   wrap.querySelectorAll('[data-act="pinp-add-model"]').forEach((b) => b.addEventListener("click", () => {
     const chID = b.dataset.ch;
+    const ch = ((STATE && STATE.channels) || []).find((c) => c.id === chID);
     const input = wrap.querySelector(`[data-act="pinp-model-input"][data-ch="${CSS.escape(chID)}"]`);
     const model = (input.value || "").trim();
     if (!model) { toast("先输入模型 ID", true); return; }
+    if (ch && !channelServesModel(ch, model)) {
+      toast(`渠道「${ch.name}」未声明模型 ${model}：请求不会路由到本渠道，固定不会生效——` +
+        "先在渠道页勾选该模型（渠道模型列表为空 = 不限制全部模型）", true);
+      return;
+    }
     pinExtras[chID] = [...new Set([...(pinExtras[chID] || []), model])];
     renderPinPage();
   }));
@@ -1248,6 +1305,59 @@ function exposedModelName(name) {
   if (!p || !modelPatternIsPlain(p)) return p;
   return modelIdentity(p);
 }
+// globMatch 通配匹配（* 任意长度含空、? 单字符），对标后端 modelname.go 的 globMatch。
+function globMatch(s, pattern) {
+  let re = "^";
+  for (const ch of String(pattern ?? "")) {
+    if (ch === "*") re += ".*";
+    else if (ch === "?") re += ".";
+    else re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  try { return new RegExp(re + "$").test(s); } catch (e) { return false; }
+}
+
+// modelMatchesPattern 通配/正则模式匹配（"re:..." 为正则体）：先按原样名、再按
+// 归一化名各试一次（上游报 "cline-free/x:free"、模式写 "x*" 时后者命中）。
+function modelMatchesPattern(model, pattern) {
+  const lower = String(model ?? "").trim().toLowerCase();
+  const canon = canonicalModel(model);
+  const p = String(pattern ?? "").trim();
+  const body = p.length > 3 && p.slice(0, 3).toLowerCase() === "re:" ? p.slice(3) : "";
+  if (body) {
+    let re;
+    try { re = new RegExp(body); } catch (e) { return false; }
+    if (re.test(lower)) return true;
+    return canon !== "" && canon !== lower && re.test(canon);
+  }
+  const pat = p.toLowerCase();
+  if (globMatch(lower, pat)) return true;
+  return canon !== "" && canon !== lower && globMatch(canon, pat);
+}
+
+// modelMatches 模型名是否匹配渠道声明的模型条目（与后端 modelname.go 的
+// modelMatches 同规则）：普通名按归一化等价（大小写/供应商前缀/变体后缀），
+// 通配/正则按模式匹配。
+function modelMatches(model, pattern) {
+  const m = String(model ?? "").trim(), p = String(pattern ?? "").trim();
+  if (!m || !p) return false;
+  if (modelPatternIsPlain(p)) {
+    const c = canonicalModel(m);
+    return c !== "" && c === canonicalModel(p);
+  }
+  return modelMatchesPattern(m, p);
+}
+
+// channelServesModel 渠道是否声明服务该模型（与后端 Channel.allowsModel 同规则）：
+// 未声明模型列表（空）= 不限制全部模型；否则按声明列表与模型映射键（下游名）
+// 匹配——两者都算「声明支持」。渠道固定的模型行只铺开这里的真值集合。
+function channelServesModel(ch, model) {
+  const models = (ch && ch.models) || [];
+  if (!models.length) return true; // 无声明，不设限
+  for (const d of models) if (modelMatches(model, d)) return true;
+  for (const k of Object.keys((ch && ch.model_map) || {})) if (modelMatches(model, k)) return true;
+  return false;
+}
+
 // mapTargets 取某个对外名对应的上游写法列表（精确键优先，其次归一化等价键）；
 // 一个对外名可以对应多个上游写法（同一模型在上游的不同分组/线路），各自一个候选。
 function mapTargets(map, model) {

@@ -328,6 +328,105 @@ func TestTestModelClearButtonWired(t *testing.T) {
 	}
 }
 
+// jsRegion 取 marker 之后、endMarker 之前的一段源码，用于断言「某个渲染函数/
+// 片段里必须/不得出现什么」——比整文件 Contains 精确，避免命中别处同名调用。
+func jsRegion(t *testing.T, src, marker, endMarker string) string {
+	t.Helper()
+	i := strings.Index(src, marker)
+	if i < 0 {
+		t.Fatalf("web/app.js 里找不到 %q", marker)
+	}
+	rest := src[i:]
+	if endMarker == "" {
+		return rest
+	}
+	j := strings.Index(rest, endMarker)
+	if j <= 0 {
+		t.Fatalf("web/app.js 里 %q 之后找不到结束标记 %q", marker, endMarker)
+	}
+	return rest[:j]
+}
+
+// TestPinPageHidesPinsForUnservedModels 渠道模型被取消勾选后，该模型的内部渠道
+// 固定不得再显示成「生效中的固定」。
+//
+// 背景（真实反馈）：「模型已经从渠道取消选中了，没有了对应上游，渠道固定还是显示
+// 这个上游渠道」——渠道的模型列表里去掉某个模型后，路由不会再把它分给该渠道，其
+// model_pins 条目随之失效（请求根本走不到这条固定），但渠道固定页仍把它铺成一行，
+// 连固定顺序/已知渠道一起列出来，看起来固定还钉在原来那个内部渠道上。
+//
+// 钉在测试里的三件事：
+//  1. 渠道固定页只铺开渠道**当前服务**的模型行（失效键不得进行集合）；
+//  2. 失效固定单独提示模型名 + 一键清除（不铺开固定顺序），清除走渠道整体替换；
+//  3. 渠道卡片「已固定 N 个模型」只算仍在服务的模型；手工添加模型行也要先判服务。
+//
+// JS 侧的 channelServesModel / modelMatches 与后端 modelname.go 的 allowsModel /
+// modelMatches 同规则（未声明模型列表 = 不限制；普通名按归一化等价；通配/正则按
+// 模式匹配；模型映射键同样算声明支持）。
+func TestPinPageHidesPinsForUnservedModels(t *testing.T) {
+	raw, err := os.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatalf("读取 web/app.js: %v", err)
+	}
+	src := string(raw)
+
+	// JS 侧必须与后端同规则的匹配函数齐备，否则「是否仍在服务」判不出来
+	for _, want := range []string{
+		"function canonicalModel(", "function modelPatternIsPlain(",
+		"function globMatch(", "function modelMatchesPattern(", "function modelMatches(",
+		"function channelServesModel(",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("web/app.js 缺少 %s（与后端 modelname.go 同规则的模型匹配）", want)
+		}
+	}
+	serves := jsFuncBody(t, src, "function channelServesModel(")
+	for _, want := range []string{"ch.models", "model_map"} {
+		if !strings.Contains(serves, want) {
+			t.Errorf("channelServesModel 必须同时看声明列表与模型映射键（后端 allowsModel 语义），缺 %s", want)
+		}
+	}
+
+	// 1. 行集合只取仍在服务的模型：失效键走单独提示，不得铺成固定行
+	section := jsFuncBody(t, src, "function pinChannelSectionHTML(")
+	if !strings.Contains(section, "pinStalePins(ch)") {
+		t.Error("pinChannelSectionHTML 必须用 pinStalePins 剔除失效的固定键（模型已不在渠道模型列表）")
+	}
+	if strings.Contains(section, "...Object.keys(ch.model_pins || {})") ||
+		strings.Contains(section, "...Object.keys(pins),") {
+		t.Error("pinChannelSectionHTML 不得把 model_pins 的全部键铺成模型行：渠道已取消的模型会显示成仍生效的固定")
+	}
+	if !strings.Contains(section, "!staleSet.has(m)") {
+		t.Error("pinChannelSectionHTML 的模型行集合必须排除失效键（staleSet）")
+	}
+
+	// 2. 失效固定：只报模型名 + 一键清除，清除要真删条目（含探测产物）并落盘
+	if !strings.Contains(section, `data-act="pinp-purge"`) {
+		t.Error("pinChannelSectionHTML 缺少失效固定的一键清除按钮（pinp-purge）")
+	}
+	if !strings.Contains(section, "失效固定") {
+		t.Error("pinChannelSectionHTML 应提示失效固定的条数与模型名（否则用户不知道有残留配置）")
+	}
+	purge := jsRegion(t, src, `wrap.querySelectorAll('[data-act="pinp-purge"]')`, `wrap.querySelectorAll('[data-act="pinp-add-model"]')`)
+	for _, want := range []string{"pinStalePins(ch)", "delete next.model_pins[m]", `api("PUT", "/admin/api/channels"`} {
+		if !strings.Contains(purge, want) {
+			t.Errorf("失效固定清除必须走渠道整体替换并删掉条目，缺 %s", want)
+		}
+	}
+
+	// 3. 渠道卡片的「已固定 N 个模型」不能把失效固定算进去
+	badge := jsRegion(t, src, "const pinnedModels = Object.keys(ch.model_pins", ".length;")
+	if !strings.Contains(badge, "channelServesModel(ch, m)") {
+		t.Error("渠道卡片的已固定模型数必须只算渠道仍在服务的模型（失效固定不能算进去）")
+	}
+
+	// 手工添加模型行：渠道已声明模型列表时，不在列表里的模型不得加行（固定不会生效）
+	add := jsRegion(t, src, `wrap.querySelectorAll('[data-act="pinp-add-model"]')`, "\n$(\"#pinPageRefreshBtn\")")
+	if !strings.Contains(add, "channelServesModel(ch, model)") {
+		t.Error("手工添加模型行必须先判断渠道是否服务该模型（否则加出来就是一条失效固定）")
+	}
+}
+
 // TestBlankPlaceholderKeyRowsNeverSaved 完全空白的 key 行（无名称、无 API Key、无
 // key 级代理）不得写进配置，也不能在批量导入后残留在第一位。
 //

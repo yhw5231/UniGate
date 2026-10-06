@@ -61,6 +61,9 @@ type Config struct {
 	// 账号调度默认模式（渠道未显式配置时使用）：failover / round_robin
 	DefaultSchedule string
 
+	// 默认客户端协议头预设（渠道未配置 client_profile 时使用；空 = 不伪装客户端）
+	DefaultClientProfile string
+
 	// 上游传输
 	UpstreamHeaderTimeout time.Duration
 	UpstreamReadIdle      time.Duration // 上游响应读取静默超时（失联兜底；默认 10m，0 关闭）
@@ -181,6 +184,8 @@ func loadConfig() Config {
 		RateLimitCooldown: durationEnv("RATE_LIMIT_COOLDOWN", time.Hour),
 		RotateAfter5xx:    intEnv("ROTATE_AFTER_5XX", 3),
 		DefaultSchedule:   normalizeScheduleDefault(getenv("DEFAULT_SCHEDULE", "")),
+
+		DefaultClientProfile: normalizeClientProfileID(getenv("DEFAULT_CLIENT_PROFILE", "")),
 
 		BreakerEnabled:   boolEnv("BREAKER_ENABLED", true),
 		BreakerThreshold: intEnv("BREAKER_THRESHOLD", 3),
@@ -329,9 +334,11 @@ type RoutePolicy struct {
 	ProbeIdleInterval   time.Duration     // 自动探测的空闲探测间隔（0 = 关闭空闲探测）
 	ProbeStartup        bool              // 启动探测（重启/重新部署后核对账号状态）
 	DefaultSchedule     string            // 默认账号调度：failover / round_robin（渠道未显式配置时使用）
-	ErrLogRetentionDays int               // 错误日志按天保留上限（0 = 只按条数）
-	Breaker             BreakerPolicy     // 连续失败熔断（网络错误/5xx → 指数退避冷却）
-	ModelAliases        map[string]string // 全局模型别名：下游请求名 → 规范模型名
+	// 默认客户端协议头预设 id（渠道未配置 client_profile 时使用；空 = 不伪装客户端）
+	DefaultClientProfile string
+	ErrLogRetentionDays  int               // 错误日志按天保留上限（0 = 只按条数）
+	Breaker              BreakerPolicy     // 连续失败熔断（网络错误/5xx → 指数退避冷却）
+	ModelAliases         map[string]string // 全局模型别名：下游请求名 → 规范模型名
 }
 
 var policy atomic.Pointer[RoutePolicy]
@@ -344,9 +351,10 @@ func defaultPolicy() *RoutePolicy {
 		MaxRouteTries:       cfg.MaxRouteTries,
 		KeepaliveInterval:   cfg.KeepaliveInterval,
 		ProbeIdleInterval:   time.Duration(cfg.ProbeIdleSec) * time.Second,
-		ProbeStartup:        cfg.ProbeStartup,
-		DefaultSchedule:     cfg.DefaultSchedule,
-		ErrLogRetentionDays: cfg.ErrLogRetentionDays,
+		ProbeStartup:         cfg.ProbeStartup,
+		DefaultSchedule:      cfg.DefaultSchedule,
+		DefaultClientProfile: cfg.DefaultClientProfile,
+		ErrLogRetentionDays:  cfg.ErrLogRetentionDays,
 		Breaker: BreakerPolicy{
 			Enabled:      cfg.BreakerEnabled,
 			Threshold:    cfg.BreakerThreshold,
@@ -389,6 +397,9 @@ func applySettings(set GatewaySettings) {
 	}
 	if set.DefaultSchedule != nil {
 		p.DefaultSchedule = normalizeScheduleDefault(*set.DefaultSchedule)
+	}
+	if set.DefaultClientProfile != nil {
+		p.DefaultClientProfile = normalizeClientProfileID(*set.DefaultClientProfile)
 	}
 	if set.ErrLogRetentionDays != nil {
 		if *set.ErrLogRetentionDays < 0 {

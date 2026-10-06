@@ -19,6 +19,7 @@ func adminAPIHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /admin/api/state", handleAdminState)
+	mux.HandleFunc("GET /admin/api/client-profiles", handleAdminClientProfiles)
 	mux.HandleFunc("PUT /admin/api/channels", handleAdminPutChannel)
 	mux.HandleFunc("DELETE /admin/api/channels/{id}", handleAdminDeleteChannel)
 	mux.HandleFunc("PUT /admin/api/pools", handleAdminPutPool)
@@ -115,16 +116,23 @@ func handleAdminState(w http.ResponseWriter, r *http.Request) {
 		chans = append(chans, ci)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"channels":     snap.Channels,
-		"gateway_keys": snap.GWKeys,
-		"proxy_pools":  snap.ProxyPools,
-		"leases":       leaseMgr.ListLeases(),
-		"channel_info": chans,
-		"cooling":      cool.CoolingList(),
-		"settings":     store.Settings(),
-		"policy":       currentPolicy(),
-		"route":        routeStatusData(""),
+		"channels":        snap.Channels,
+		"gateway_keys":    snap.GWKeys,
+		"proxy_pools":     snap.ProxyPools,
+		"leases":          leaseMgr.ListLeases(),
+		"channel_info":    chans,
+		"cooling":         cool.CoolingList(),
+		"settings":        store.Settings(),
+		"policy":          currentPolicy(),
+		"route":           routeStatusData(""),
+		"client_profiles": clientProfileCatalog(),
 	})
+}
+
+// handleAdminClientProfiles 返回内置客户端协议头预设清单（WebUI 下拉与外部
+// 调用方都从这里取；含可信度、出处与中文说明，便于判断哪些是已核实的指纹）。
+func handleAdminClientProfiles(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": clientProfileCatalog()})
 }
 
 // handleAdminPutSettings 更新路由策略设置（全量替换；字段缺省 = 恢复环境
@@ -1191,13 +1199,13 @@ func missingAuthHint(status int, k *UpKey, ch *Channel, body []byte) string {
 	return msg
 }
 
-// channelSendsAuthHeader 渠道自定义头里是否配了非空的 Authorization（它会覆盖
-// key 的 Bearer，见 applyCustomHeaders）。
+// channelSendsAuthHeader 渠道生效头里是否配了非空的 Authorization（它会覆盖
+// key 的 Bearer，见 applyCustomHeaders）。生效头 = 客户端预设基线 + 渠道自定义头。
 func channelSendsAuthHeader(ch *Channel) bool {
 	if ch == nil {
 		return false
 	}
-	for name, value := range ch.Headers {
+	for name, value := range effectiveChannelHeaders(ch) {
 		if strings.EqualFold(strings.TrimSpace(name), "Authorization") && strings.TrimSpace(value) != "" {
 			return true
 		}

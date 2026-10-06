@@ -68,7 +68,7 @@ func fetchModelsWithKey(ctx context.Context, cand *candidate) ([]fetchedModel, e
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "unigate/"+displayVersion())
-	applyCustomHeaders(req, cand.ch.Headers)
+	applyCustomHeaders(req, effectiveChannelHeaders(cand.ch))
 
 	resp, err := client.Do(req)
 	if err != nil {

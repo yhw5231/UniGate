@@ -169,6 +169,7 @@ $$(".subtab").forEach((btn) => btn.addEventListener("click", () => {
 // ---- 状态加载 ----
 async function loadState() {
   STATE = await api("GET", "/admin/api/state");
+  renderClientProfileOptions();
   renderChannels();
   renderGWKeys();
   renderPools();
@@ -196,6 +197,8 @@ function fillSettingsForm() {
   $("#setBreakerMax").value = s.breaker_max_cooldown_sec ?? "";
   $("#setBreakerMult").value = s.breaker_multiplier ?? "";
   $("#setModelAliases").value = Object.entries(s.model_aliases || {}).map(([k, v]) => `${k}=${v}`).join("\n");
+  $("#setDefaultClientProfile").value = s.default_client_profile || "";
+  updateDefaultClientProfileHint();
   // RoutePolicy 无 json tag：生效值按 Go 字段名下发，Duration 序列化为纳秒
   const ns = (v) => Math.round((v || 0) / 1e9);
   const tries = (p.MaxRouteTries || 0) === 0 ? "全部" : p.MaxRouteTries;
@@ -204,11 +207,30 @@ function fillSettingsForm() {
   const sched = p.DefaultSchedule === "round_robin" ? "顺序轮询" : "故障转移";
   const br = p.Breaker || {};
   const alias = Object.keys(s.model_aliases || {}).length;
+  const dcp = defaultClientProfileID();
   $("#policyNow").textContent =
-    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"} · 空闲探测 ${pi > 0 ? pi + "s" : "关闭"} · 启动探测 ${p.ProbeStartup ? "开" : "关"} · 默认账号调度 ${sched}` +
+    `429 冷却 ${ns(p.RateLimitCooldown)}s · 连续 5xx 超过 ${p.RotateAfter5xx ?? 3} 次换出口（0=关闭） · 单请求最多尝试 ${tries} 个 key · 流式心跳 ${ka > 0 ? ka + "s" : "关闭"} · 空闲探测 ${pi > 0 ? pi + "s" : "关闭"} · 启动探测 ${p.ProbeStartup ? "开" : "关"} · 默认账号调度 ${sched} · 默认客户端 ${dcp ? clientProfileName(dcp) : "不使用"}` +
     ` · 熔断 ${br.Enabled ? `开（连续失败 ${br.Threshold} 次，冷却 ${ns(br.BaseCooldown)}~${ns(br.MaxCooldown)}s ×${br.Multiplier}）` : "关"}` +
     (alias ? ` · 模型别名 ${alias} 条` : "");
 }
+
+// updateDefaultClientProfileHint 设置页默认客户端下拉的说明：区分「跟随环境变量」
+// 与「显式指定」，并提示环境变量默认值（若有）。
+function updateDefaultClientProfileHint() {
+  const hint = $("#setDefaultClientProfileHint");
+  if (!hint) return;
+  const v = $("#setDefaultClientProfile").value;
+  const env = ((STATE && STATE.policy) || {}).DefaultClientProfile || "";
+  if (v) {
+    hint.textContent = `渠道未单独配置时使用：${clientProfileName(v)}（渠道自定义请求头仍可逐条覆盖）`;
+  } else if (env) {
+    hint.textContent = `留空：跟随环境变量 DEFAULT_CLIENT_PROFILE = ${clientProfileName(env)}`;
+  } else {
+    hint.textContent = "留空 = 不使用默认预设（仅渠道自己选了的才生效）";
+  }
+}
+
+$("#setDefaultClientProfile").addEventListener("change", updateDefaultClientProfileHint);
 
 $("#settingsSaveBtn").addEventListener("click", async () => {
   const body = {};
@@ -229,6 +251,8 @@ $("#settingsSaveBtn").addEventListener("click", async () => {
     if (ps !== "") body.probe_startup = ps === "1"; // 留空 = 恢复环境变量默认
     const sched = $("#setDefaultSchedule").value;
     if (sched !== "") body.default_schedule = sched; // 留空 = 恢复环境变量默认
+    // 默认客户端协议头预设：留空 = 跟随环境变量默认（DEFAULT_CLIENT_PROFILE）
+    body.default_client_profile = $("#setDefaultClientProfile").value || null;
     // 熔断
     const be = $("#setBreakerEnabled").value;
     if (be !== "") body.breaker_enabled = be === "1";
@@ -585,7 +609,7 @@ function filterChannels(chans) {
   return chans.filter((ch) => {
     if (g && (ch.group || "") !== g) return false;
     if (!q) return true;
-    const hay = [ch.name, ch.group, ch.base_url, (ch.models || []).join(" ")].join(" ").toLowerCase();
+    const hay = [ch.name, ch.group, ch.base_url, (ch.models || []).join(" "), clientProfileName(ch.client_profile)].join(" ").toLowerCase();
     return hay.includes(q);
   });
 }
@@ -677,6 +701,7 @@ function renderChannels() {
         ${ch.failover_mode === "force_channel" ? '<span class="badge info" title="渠道内任一 key 失败立即切到下一个渠道">强制切渠道</span>' : ""}
         ${ch.auto_probe ? '<span class="badge info" title="启动时、key 冷却恢复/连续无调用达空闲探测间隔（默认 2 小时）时自动发加法题验证账号状态">自动探测</span>' : ""}
         ${ch.proxy && ch.proxy.kind ? '<span class="badge info">渠道代理</span>' : ""}
+        ${ch.client_profile ? `<span class="badge info" title="客户端协议头预设：转发时以该客户端的请求头访问上游（自定义请求头可逐条覆盖）">${esc(clientProfileName(ch.client_profile))}</span>` : ""}
         ${pinnedModels ? `<span class="badge info" title="该渠道有模型的内部渠道被固定（请求注入 provider.only/order，不再随机路由）">已固定 ${pinnedModels} 个模型</span>` : ""}
         ${coolingN ? `<span class="badge warn">${coolingN} 个 key 冷却中</span>` : ""}
         <span class="spacer"></span>
@@ -1773,7 +1798,9 @@ function openChannelEditor(ch) {
   $("#chFailoverMode").value = ch.failover_mode === "force_channel" ? "force_channel" : "";
   $("#chAutoProbe").checked = !!ch.auto_probe;
   renderChannelProxy(ch.proxy || null);
+  $("#chClientProfile").value = ch.client_profile || "";
   renderHeaderRows(ch.headers || {});
+  renderClientProfilePreview();
   renderKeyBlocks(ch.keys || []);
   renderCoolingKeys(ch);
   // 模型选择器：按已保存的 models + model_map 铺开（映射里的每个上游写法各一行）
@@ -1916,7 +1943,121 @@ document.addEventListener("keydown", (e) => {
 $$('[data-close="channelModal"]').forEach((b) => b.addEventListener("click", () => $("#channelModal").classList.add("hidden")));
 $$('[data-close="coolClearModal"]').forEach((b) => b.addEventListener("click", () => $("#coolClearModal").classList.add("hidden")));
 
+// ---- 内置客户端协议头预设（clientprofiles.go）----
+// 预设是「基线」：选中后转发时以该客户端的头访问上游；下方自定义请求头逐条覆盖
+// （同名大小写不敏感），值留空 = 删掉预设里的同名头。列表来自 /admin/api/state。
+function clientProfiles() { return (STATE && STATE.client_profiles) || []; }
+
+function clientProfileByID(id) { return clientProfiles().find((p) => p.id === id) || null; }
+
+function clientProfileName(id) {
+  const p = clientProfileByID(id);
+  return p ? p.name : (id || "");
+}
+
+// clientProfileOptionLabel 下拉项文案：可信度如实展示，避免把未核实的指纹
+// 当成已验证数据。
+function clientProfileOptionLabel(p) {
+  const star = p.starred ? "⭐ " : "";
+  if (p.confidence === "unverified") return star + p.name + "（未验证）";
+  if (p.confidence === "partial") return star + p.name + "（部分核实）";
+  return star + p.name;
+}
+
+function renderClientProfileOptions() {
+  const opts = (placeholder) => '<option value="">' + placeholder + '</option>' +
+    clientProfiles().map((p) => `<option value="${esc(p.id)}">${esc(clientProfileOptionLabel(p))}</option>`).join("");
+  const sel = $("#chClientProfile");
+  const cur = sel.value;
+  sel.innerHTML = opts("不使用（仅用下方自定义请求头）");
+  if (cur && clientProfiles().some((p) => p.id === cur)) sel.value = cur;
+  // 设置页「默认使用客户端」：同一份清单，空值 = 不使用默认预设
+  const dsel = $("#setDefaultClientProfile");
+  if (dsel) {
+    const dcur = dsel.value || ((STATE && STATE.settings && STATE.settings.default_client_profile) || "");
+    dsel.innerHTML = opts("不使用（跟随环境变量默认）");
+    if (dcur && clientProfiles().some((p) => p.id === dcur)) dsel.value = dcur;
+  }
+}
+
+// defaultClientProfileID 当前生效的默认预设 id（设置页显式设置 > 环境变量默认）。
+function defaultClientProfileID() {
+  const s = (STATE && STATE.settings) || {};
+  const p = (STATE && STATE.policy) || {};
+  if (s.default_client_profile) return s.default_client_profile;
+  return p.DefaultClientProfile || "";
+}
+
+// dynamicSample 前端预览用：动态头（每请求生成）展示占位形态，不生成真值。
+function dynamicSample(kind) {
+  if (String(kind).toLowerCase().startsWith("same:")) return `同 ${kind.slice(5)}（同一请求取同值）`;
+  switch (kind) {
+    case "uuid": return "<每次请求随机 UUID>";
+    case "uuid32": return "<每次请求随机 UUID（无横线）>";
+    case "ts_ms": return "<每次请求毫秒时间戳>";
+    case "ts_s": return "<每次请求秒时间戳>";
+    case "rand16": return "<每次请求 16 位随机十六进制>";
+    case "rand32": return "<每次请求 32 位随机十六进制>";
+    default: return "<动态生成>";
+  }
+}
+
+// effectiveHeadersForPreview 页面上的「最终会发出去的头」：预设基线 + 当前自定义
+// 头行（空值 = 删除），与后端 effectiveChannelHeaders 语义一致。
+function effectiveHeadersForPreview(profile, rows) {
+  const out = new Map();
+  if (profile) {
+    for (const [k, v] of Object.entries(profile.headers || {})) out.set(k.toLowerCase(), [k, v]);
+    for (const [k, kind] of Object.entries(profile.dynamic || {})) out.set(k.toLowerCase(), [k, dynamicSample(kind)]);
+  }
+  for (const [k, v] of Object.entries(rows || {})) {
+    if (!String(v).trim()) out.delete(k.toLowerCase());
+    else out.set(k.toLowerCase(), [k, v]);
+  }
+  return [...out.values()];
+}
+
+function renderClientProfilePreview() {
+  const hint = $("#chClientProfileHint");
+  const box = $("#chClientProfilePreview");
+  const own = clientProfileByID($("#chClientProfile").value);
+  const inherited = own ? null : clientProfileByID(defaultClientProfileID());
+  const p = own || inherited;
+  const rows = collectHeaderRows();
+  if (!p) {
+    hint.textContent = Object.keys(rows).length ? "仅发送下方自定义请求头" : "";
+    hint.title = "";
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  const conf = p.confidence === "verified" ? "已核实" : p.confidence === "partial" ? "部分核实" : "未验证";
+  const count = effectiveHeadersForPreview(p, rows).length;
+  const from = inherited ? `未选预设 → 使用系统默认「${p.name}」 · ` : "";
+  hint.textContent = count === 0
+    ? `${from}${conf} · 该客户端没有自有请求头指纹（鼠标悬停看说明）`
+    : `${from}${conf} · 实际发送 ${count} 个头（下方自定义头可覆盖）`;
+  hint.title = [inherited ? "预设来自「设置 → 默认客户端协议头」" : "", p.note,
+    (p.evidence || []).length ? "证据：" + p.evidence.join("\n") : ""].filter(Boolean).join("\n");
+  const list = effectiveHeadersForPreview(p, rows)
+    .map(([k, v]) => `<div class="key-line"><span class="pname">${esc(k)}: ${esc(v)}</span></div>`).join("");
+  box.innerHTML = `<p class="muted" style="font-size:12px;margin:4px 0">转发到上游时的请求头（预设基线 + 自定义头覆盖后的结果）：</p>${list}`;
+  box.classList.remove("hidden");
+}
+
+$("#chClientProfile").addEventListener("change", renderClientProfilePreview);
+
 // 自定义请求头
+function collectHeaderRows() {
+  const headers = {};
+  $$("#chHeaders .row").forEach((row) => {
+    const inputs = row.querySelectorAll("input");
+    const name = inputs[0].value.trim(), value = inputs[1].value;
+    if (name) headers[name] = value;
+  });
+  return headers;
+}
+
 function renderHeaderRows(headers) {
   const wrap = $("#chHeaders");
   wrap.innerHTML = "";
@@ -1930,10 +2071,12 @@ function headerRow(name, value) {
   div.innerHTML = `<input placeholder="头名（如 http-referer）" value="${esc(name)}" style="max-width:260px">
     <input placeholder="值（空=不发送）" value="${esc(value)}">
     <button class="btn small danger">删除</button>`;
-  div.querySelector(".danger").addEventListener("click", () => div.remove());
+  div.querySelector(".danger").addEventListener("click", () => { div.remove(); renderClientProfilePreview(); });
   return div;
 }
-$("#addHeaderBtn").addEventListener("click", () => $("#chHeaders").appendChild(headerRow("", "")));
+$("#addHeaderBtn").addEventListener("click", () => { $("#chHeaders").appendChild(headerRow("", "")); renderClientProfilePreview(); });
+// 行内输入实时刷新预览（值清空 = 删掉预设里的同名头）
+$("#chHeaders").addEventListener("input", renderClientProfilePreview);
 
 // key 块
 function renderKeyBlocks(keys) {
@@ -2344,12 +2487,7 @@ function collectKeyForm(div) {
 // model_pins（内部渠道固定）：已保存配置 + 弹窗内分区草稿合并——草稿只在
 // 用户改动过的模型上覆盖，其余模型原样保留（探测产物同样跟随）。
 function collectChannelForm() {
-  const headers = {};
-  $$("#chHeaders .row").forEach((row) => {
-    const inputs = row.querySelectorAll("input");
-    const name = inputs[0].value.trim(), value = inputs[1].value;
-    if (name) headers[name] = value;
-  });
+  const headers = collectHeaderRows();
   // 模型声明由选择器推导：对外名去重进 models，上游写法进 model_map
   const decl = modelDeclaration(modelRows);
   // 空白占位 key 行不写进配置（保存渠道时自动补的空行 / 批量导入后残留的空行）
@@ -2371,6 +2509,7 @@ function collectChannelForm() {
     models: decl.models,
     model_map: decl.map,
     headers,
+    client_profile: $("#chClientProfile").value,
     rewrite_reasoning: $("#chRewrite").checked,
     cooldown_scope: $("#chCooldownScope").value,
     schedule: $("#chSchedule").value,

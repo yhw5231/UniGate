@@ -18,6 +18,12 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
 - **多渠道**：每个渠道一个 OpenAI 兼容上游（`BaseURL` + 多个账号 key）。
   渠道可配置自定义请求头（模拟特定客户端指纹）、静态模型列表、模型列表端点，
   并支持**自定义分组**（WebUI 按分组归类/过滤）。
+- **内置客户端协议头预设**（`client_profile`）：一键模拟 23 个真实 AI 编码客户端的请求头
+  （Claude Code、Codex、Cline、Roo Code、Kilo Code、opencode、GitHub Copilot、Cursor、
+  Qwen Code、Kimi Code、ZCode、Trae、Qoder、Crush、Droid、WorkBuddy、MiMo Code、
+  DeepSeek Harness 等），每个预设都标注可信度与证据出处，支持动态头（UUID / 时间戳 /
+  同值头）与渠道自定义头覆盖；渠道没单独选预设时，还可在「设置」页配一个**全局默认客户端**
+  （`default_client_profile` / 环境变量 `DEFAULT_CLIENT_PROFILE`）。详见「内置客户端协议头预设」一节。
 - **模型列表**（对标 go-gateway 的模型选择器）：渠道编辑页的模型区是**一行一个模型**的
   勾选列表——`[✓] 对外名  [上游模型名]`，**勾选=启用**，行内「上游模型名」留空 = 与对外名
   相同（填上游真正认识的写法即可，含**与上游名无关的渠道别名**，如自定义行 `my-gpt` →
@@ -708,6 +714,7 @@ Admin API（均需管理员 token）：`PUT /admin/api/channels/{id}/model-pin` 
 | `BREAKER_MAX_COOLDOWN` | `15m` | 熔断冷却时长上限（指数退避封顶；也可在 WebUI「设置」页修改） |
 | `BREAKER_MULTIPLIER` | `2` | 每次触发熔断时冷却时长的增长倍数（>= 1；也可在 WebUI「设置」页修改） |
 | `DEFAULT_SCHEDULE` | `failover` | 默认账号调度（渠道未显式配置时使用）：`failover` 故障转移 / `round_robin` 顺序轮询；也可在 WebUI「设置」/「路由」页修改 |
+| `DEFAULT_CLIENT_PROFILE` | 空 | 默认客户端协议头预设（渠道未配置 `client_profile` 时使用，取值见「内置客户端协议头预设」一节，支持别名）：`claude-code` / `codex` / `cline` …；也可在 WebUI「设置 → 默认客户端协议头」修改（WebUI 留空 = 跟随此环境变量） |
 | `UPSTREAM_HEADER_TIMEOUT` | `10m` | 等待上游响应头超时（LLM 非流式可能较慢，勿设过小） |
 | `UPSTREAM_READ_IDLE_TIMEOUT` | `10m` | 上游响应**读取静默超时**：连续该时长未从上游读到任何字节（连接失联：TCP 半开、NAT 静默回收等）即关闭连接中止该候选，避免读取永久阻塞导致 goroutine/连接泄漏累积；须大于最长的上游思考时间，流式期间任何字节都会重置计时；0 = 关闭 |
 | `DOWNSTREAM_WRITE_TIMEOUT` | `60s` | 下游**写出静默超时**（与上游读取静默超时对称）：客户端保持连接但停止读取（TCP 窗口填满）时，单次「写 + flush」阻塞超过该时长即中止该请求，释放 goroutine 与上下游连接对；正常慢速客户端不受影响（只约束单次写的阻塞时长，不限制流的总时长）；0 = 关闭 |
@@ -729,8 +736,10 @@ Admin API（均需管理员 token）：`PUT /admin/api/channels/{id}/model-pin` 
 
 | 端点 | 说明 |
 | --- | --- |
-| `GET /admin/api/state` | 渠道、下游 key、代理池列表、租约缓存总览 |
-| `PUT /admin/api/channels` | 新增/整体更新渠道（含内嵌 keys） |
+| `GET /admin/api/state` | 渠道、下游 key、代理池列表、租约缓存总览，以及内置客户端协议头预设 `client_profiles` |
+| `GET /admin/api/client-profiles` | 内置客户端协议头预设清单：每个客户端的请求头、可信度（`verified`/`partial`/`unverified`）、证据出处与说明 |
+| `PUT /admin/api/settings` | 全量替换路由策略设置（`default_client_profile` 默认客户端、`default_schedule`、熔断参数、模型别名等；请求里未出现的字段回落环境变量默认，`default_client_profile` 为未知预设 id 时返回 400），保存后立即生效 |
+| `PUT /admin/api/channels` | 新增/整体更新渠道（含内嵌 keys；`client_profile` 为内置客户端协议头预设 id，未知值拒绝保存） |
 | `POST /admin/api/channels/{id}/fetch-models` | 用渠道 key 拉取上游模型列表，默认 dry-run 返回候选（`fetched` 上游写法 / `groups` 按上游分组 `{name, free, free_total, models, total}` / `free_models` / `enabled` / `enabled_ids` / `enabled_upstream` 预勾选 / `stale`）供 WebUI 选择器铺开勾选，不写回渠道；`?replace=1` 全量替换写回（列表存对外名、上游写法写进 `model_map`，并丢弃已不在列表里的旧映射键）；免费清单仅随响应展示，不持久化 |
 | `POST /admin/api/fetch-models` | **按编辑器当前内容**拉取模型列表（`{channel: {...}}` 内联渠道定义，未保存也能用）：只读不落盘，返回同上字段（WebUI 新增/编辑弹窗「获取模型」用，候选按上游写法逐个返回、按上游分组展示，同一对外名的多个写法各一条）；响应兼容 OpenAI `{"data":[…]}`、裸数组、`models` 等包装字段与**按分组返回的 JSON**（Cline `recommended-models` 的 `recommended`/`free`/`clinePass`/`clineCloud`，字段名即分组名） |
 | `DELETE /admin/api/channels/{id}` | 删除渠道（自动释放其池租约） |
@@ -760,20 +769,112 @@ Admin API（均需管理员 token）：`PUT /admin/api/channels/{id}/model-pin` 
 
 ## 渠道自定义请求头示例（Cline 渠道）
 
-渠道级 headers（JSON）可模拟任意客户端指纹；Cline 渠道建议：
+渠道级 headers（JSON）可模拟任意客户端指纹；Cline 渠道建议（取值已按 cline/cline 源码核对，见下节内置预设 `cline`）：
 
 ```json
 {
-  "http-referer": "https://cline.bot",
-  "x-title": "Cline",
-  "User-Agent": "Cline/4.1.16",
-  "x-core-version": "4.1.16",
-  "x-platform-version": "1.106.0",
-  "x-client-version": "4.1.16",
-  "x-platform": "vscode",
-  "x-client-type": "cline-vscode"
+  "HTTP-Referer": "https://cline.bot",
+  "X-Title": "Cline",
+  "User-Agent": "Cline/4.1.22",
+  "X-CLIENT-TYPE": "VSCode Extension",
+  "X-CLIENT-VERSION": "4.1.22",
+  "X-PLATFORM": "Visual Studio Code",
+  "X-PLATFORM-VERSION": "1.105.1",
+  "X-CORE-VERSION": "4.1.22",
+  "X-IS-MULTIROOT": "false"
 }
 ```
+
+> 注：早期版本此处写作 `x-client-type: cline-vscode`，源码里 VS Code 扩展实际发的是
+> `VSCode Extension`（`cline-vscode` 只是内部类型联合与示例 app 的取值），已更正。
+
+## 内置客户端协议头预设（client_profile）
+
+渠道新增字段 `client_profile`（字符串，可选）用于一键模拟真实客户端。取值来自内置清单，
+未知 id 直接拒绝保存（`unsupported client_profile ...`）；清单与每个预设的完整请求头、
+证据出处、中文说明可通过 `GET /admin/api/client-profiles` 获取，WebUI 的渠道编辑弹窗
+「客户端协议头预设」下拉里也能直接看实时预览。
+
+支持的客户端（`client_profile` 取值，⭐ 为常用）：
+
+| id | 客户端 | 可信度 | 关键静态指纹 |
+| --- | --- | --- | --- |
+| `claude-code` ⭐ | Claude Code | 已核实 | `User-Agent: claude-cli/2.1.100 (external, cli)`、`x-app: cli`、`anthropic-version: 2023-06-01`、`anthropic-dangerous-direct-browser-access: true`、`x-stainless-*` |
+| `codex` ⭐ | Codex CLI | 已核实 | `originator: codex_cli_rs`、`User-Agent: codex_cli_rs/0.160.1 (Windows 11; x86_64) WindowsTerminal` |
+| `openclaw` | OpenClaw | 部分核实 | `user-agent: claude-cli/2.1.280`、`x-app: cli`、`anthropic-beta: claude-code-20250219,oauth-2025-04-20` |
+| `pi` | pi (Earendil Works) | 已核实 | `User-Agent: pi (win32 10.0.26100; x64)`、`originator: pi` |
+| `opencode` | opencode | 已核实 | `User-Agent: opencode/1.18.34` + 会话头 `x-opencode-session-id` / `x-session-affinity` / `X-Session-Id` |
+| `ohmyopencode` | oh-my-opencode | 部分核实 | 无自有指纹，随宿主 opencode（`User-Agent: opencode/<版本>`） |
+| `kilo-code` | Kilo Code | 已核实 | `HTTP-Referer: https://kilocode.ai`、`X-Title: Kilo Code`、`User-Agent: Kilo-Code/7.8.3` |
+| `roocode` | Roo Code | 已核实 | `HTTP-Referer: https://github.com/RooVetGit/Roo-Cline`、`X-Title: Roo Code`、`User-Agent: RooCode/3.53.0` |
+| `cline` | Cline | 已核实 | `HTTP-Referer: https://cline.bot`、`X-Title: Cline`、`User-Agent: Cline/4.1.22`、`X-CLIENT-TYPE: VSCode Extension`、`X-PLATFORM*`、`X-CORE-VERSION` |
+| `crush` | Crush | 已核实 | `User-Agent: Charm-Crush/0.97.1 (https://charm.land/crush)`、`originator: crush` |
+| `droid` | Factory Droid | 部分核实 | `X-Factory-Client: cli`、`X-Client-Version` |
+| `qwencode` | Qwen Code | 已核实 | `User-Agent: QwenCode/0.25.0 (win32; x64)`、`anthropic-version: 2023-06-01` |
+| `hermes` | Hermes Agent (Nous Research) | 已核实 | `User-Agent: HermesAgent/2026.9.24`、`HTTP-Referer: https://hermes-agent.nousresearch.com`、`X-Title: Hermes Agent`、`originator: hermes-agent` |
+| `zcode` | ZCode (智谱) | 已核实 | `User-Agent: ZCode/3.14.3`、`HTTP-Referer: https://zcode.z.ai`、`X-Title: Z Code@cli`、`X-ZCode-Agent: glm`、`X-Platform`、`X-Os-Category`、`X-Client-Language/Timezone` |
+| `qoder` | Qoder (阿里) | 部分核实 | `user-agent: Go-http-client/2.0`、`cosy-data-policy: AGREE`、`cosy-clienttype: 5`、`cosy-clientip`、`cosy-version: 1.1.64`、`login-version: v2` |
+| `kimi-code` | Kimi Code | 已核实 | `User-Agent: kimi-code-cli/2.1.1` + `X-Msh-Platform/Version/Device-Id/Device-Name/Device-Model/Os-Version` |
+| `craft-agent` | Craft Agent | 未验证 | 无自有指纹（内置 Claude Agent SDK 与 pi 运行时，按运行时选 `claude-code` 或 `pi`） |
+| `trae` | Trae | 部分核实 | `User-Agent: Trae/0.1.52`、`X-App-Id`、`X-Ide-Version*`、`X-Device-*`、`Request-Traffic-Type: prod` |
+| `github-copilot` | GitHub Copilot | 已核实 | `User-Agent: GitHubCopilotChat/0.34.0`、`Editor-Version`、`Editor-Plugin-Version`、`Copilot-Language-Server-Version`、`Copilot-Integration-Id: vscode-chat`、`X-GitHub-Api-Version` |
+| `workbuddy` | WorkBuddy (腾讯) | 部分核实 | `User-Agent: WorkBuddy/5.5.6`、`X-Product: SaaS`、`X-IDE-Type: WorkBuddy`、`X-Agent-Intent: craft`、`X-IDE-*` |
+| `cursor` | Cursor | 未验证 | `User-Agent: connect-es/1.6.1`、`connect-protocol-version: 1`、`x-cursor-client-*`、`x-ghost-mode` |
+| `deepseek-harness` | DeepSeek Harness | 已核实 | `user-agent: deepseek-harness/0.2.0-rc.2 (+https://github.com/deepseek-ai/deepseek-harness)`、`anthropic-version`、`anthropic-beta: files-api-2025-04-14`、`x-deepseek-harness-user-id/session-id` |
+| `mimo-code` | MiMo Code (小米) | 已核实 | `User-Agent: mimocode/0.1.15`、`anthropic-beta: interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14` |
+
+### 生效方式与优先级
+
+1. 转发（含拉取模型、测试 key）前，先按 `client_profile` 展开预设头（静态 + 动态生成）；
+   渠道**没有**配置 `client_profile` 时，用「设置 → 默认客户端协议头」里的全局默认
+   （`default_client_profile`，也可用环境变量 `DEFAULT_CLIENT_PROFILE` 给默认值）；
+2. 再用渠道 `headers` 覆盖：同名头**大小写不敏感**地覆盖预设；
+3. 渠道 `headers` 里值为**空串或全空白**时表示**删除**该预设头；
+4. 最后才写入请求，因此自定义头优先级最高，也是唯一的「微调」入口；
+5. 鉴权头（`Authorization`、`x-api-key`、`x-dsh-auth-token` 等）永远不会出现在预设里——
+   它们由网关按渠道 key 注入，写进预设反而会顶掉鉴权。
+
+优先级一句话：**渠道 `client_profile` > 全局默认客户端 > 不使用**；预设头之上再叠渠道自定义头。
+
+全局默认在「设置 → 路由策略 → 默认客户端协议头」下拉里选（`PUT /admin/api/settings` 的
+`default_client_profile` 字段，留空/`null` = 跟随环境变量 `DEFAULT_CLIENT_PROFILE`，
+显式 `""` = 不使用），保存后立即生效、无需重启；渠道编辑弹窗里没选预设时会提示
+「未选预设 → 使用系统默认「X」」，并把最终会发出的头一并预览出来。
+
+### 动态头生成器
+
+部分头在真实客户端里每次请求都不同，预设用生成器表达式表示（每次转发现算）：
+
+| 表达式 | 含义 |
+| --- | --- |
+| `uuid` | 随机 UUID v4（带横线） |
+| `uuid32` | 随机 32 位十六进制（无横线） |
+| `ts_ms` | 当前毫秒时间戳 |
+| `ts_s` | 当前秒时间戳 |
+| `rand16` / `rand32` | 随机 16 / 32 位小写字母数字串 |
+| `same:<Header-Name>` | 与同一请求内另一个头**取同一个值**（如 `X-Conversation-Request-ID: same:X-Conversation-ID`） |
+
+### 别名
+
+`client_profile` 大小写不敏感，并接受常见别名与空格/下划线写法（如 `Claude Code`、
+`claude_code`、`claudecli`、`openai-codex`、`roo`、`kilo`、`qwen-code`、`kimi`、
+`copilot`、`dsh`、`oh-my-opencode`、`mimo-code`、`z-code` 等），最终都会归一化成上表 id。
+
+### 关于数据可信度
+
+预设里的每个头都来自可追溯的公开来源（官方仓库源码 / 官方 npm 发布包 / 官方文档），
+并逐条标注可信度与证据 URL，**没有编造**：
+
+- **已核实**：有官方一手证据（源码或官方发布包）。
+- **部分核实**：只有部分线路有官方证据（如某客户端只在自家 provider 上发归因头），
+  或仅有三方复刻证据。
+- **未验证**：完全闭源且只有第三方逆向证据（Cursor），或该客户端本身没有自有指纹
+  （Craft Agent、oh-my-opencode）。
+
+客户端版本号会随版本升级漂移（UA、`X-CLIENT-VERSION` 等），预设给出的是取证时的版本；
+真实场景里若上游对版本号有强校验，请用渠道自定义头覆盖成你的目标版本。
+条件头（只在特定 provider、特定模式或特定端点才发的头）一律不写进预设，而是写在该预设的
+中文说明里，需要时用自定义头补。
 
 ## 测试
 

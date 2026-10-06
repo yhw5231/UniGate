@@ -856,7 +856,7 @@ func doUpstreamRequest(ctx context.Context, client *http.Client, cand *candidate
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	applyCustomHeaders(req, cand.ch.Headers)
+	applyCustomHeaders(req, effectiveChannelHeaders(cand.ch))
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

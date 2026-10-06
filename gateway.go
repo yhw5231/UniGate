@@ -203,7 +203,7 @@ func gatewayModels(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
-		jobs = append(jobs, fetchJob{url: u, header: ch.Headers, apiKey: apiKey})
+		jobs = append(jobs, fetchJob{url: u, header: effectiveChannelHeaders(ch), apiKey: apiKey})
 	}
 
 	// 并发拉取各渠道动态模型列表（5s 超时）

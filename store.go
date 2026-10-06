@@ -194,7 +194,8 @@ type Channel struct {
 	ModelsURL     string                       `json:"models_url,omitempty"`     // 模型列表端点；默认 BaseURL + /models
 	Models        []string                     `json:"models,omitempty"`         // 模型列表（用于 /v1/models 聚合与路由过滤；每项可为精确名、通配 "claude-*" 或正则 "re:^gpt-4.*$"）
 	ModelMap      ModelMap                     `json:"model_map,omitempty"`      // 模型名映射：下游模型名 → 该上游实际模型名（可多个，见 modelname.go）
-	Headers       map[string]string            `json:"headers,omitempty"`        // 渠道级自定义请求头
+	Headers       map[string]string            `json:"headers,omitempty"`        // 渠道级自定义请求头（同名覆盖客户端预设，空值 = 删掉预设里的同名头）
+	ClientProfile string                       `json:"client_profile,omitempty"` // 内置客户端协议头预设 id（见 clientprofiles.go），空 = 不伪装客户端
 	Rewrite       bool                         `json:"rewrite_reasoning"`        // reasoning -> reasoning_content 改写（Cline 等需要）
 	CooldownScope string                       `json:"cooldown_scope,omitempty"` // 冷却粒度："" / "key" 按 key 跨模型共享（默认）；"key_model" 按 (key,model)
 	Schedule      string                       `json:"schedule,omitempty"`       // 账号调度："" 跟随全局默认；"failover" 故障转移；"round_robin" 顺序轮询
@@ -625,7 +626,10 @@ type GatewaySettings struct {
 	ProbeIdleSec         *int    `json:"probe_idle_sec,omitempty"`          // 自动探测的空闲探测间隔秒数（默认 7200=2h，0 关闭）
 	ProbeStartup         *bool   `json:"probe_startup,omitempty"`           // 启动探测开关（默认 true；重启/部署后核对账号状态）
 	DefaultSchedule      *string `json:"default_schedule,omitempty"`        // 默认账号调度："" 沿用环境变量；"failover" / "round_robin"
-	ErrLogRetentionDays  *int    `json:"err_log_retention_days,omitempty"`  // 错误日志按天保留上限（默认 7，0 = 只按条数）
+	// 默认客户端协议头预设：渠道自身未配置 client_profile 时使用（"" = 显式不使用，
+	// nil = 未设置，沿用环境变量 DEFAULT_CLIENT_PROFILE）。
+	DefaultClientProfile *string `json:"default_client_profile,omitempty"`
+	ErrLogRetentionDays  *int    `json:"err_log_retention_days,omitempty"` // 错误日志按天保留上限（默认 7，0 = 只按条数）
 
 	// 熔断（连续失败冷却，对标 go-gateway 的 breaker）：网络/代理错误与 5xx
 	// 连续失败达阈值后按指数退避冷却该 key（成功即清零）。429 有独立冷却逻辑。
@@ -670,6 +674,13 @@ func (s *GatewaySettings) normalize() error {
 			return err
 		}
 		s.DefaultSchedule = &v
+	}
+	if s.DefaultClientProfile != nil {
+		v := normalizeClientProfileID(*s.DefaultClientProfile)
+		if v != "" && clientProfileByID(v) == nil {
+			return fmt.Errorf("unsupported default_client_profile %q (see GET /admin/api/client-profiles)", *s.DefaultClientProfile)
+		}
+		s.DefaultClientProfile = &v
 	}
 	aliases, err := normalizeModelAliases(s.ModelAliases)
 	if err != nil {
@@ -995,6 +1006,11 @@ func normalizeChannel(ch *Channel) error {
 	default:
 		return fmt.Errorf("unsupported failover_mode %q (want same_channel / force_channel)", ch.FailoverMode)
 	}
+	profile := normalizeClientProfileID(ch.ClientProfile)
+	if profile != "" && clientProfileByID(profile) == nil {
+		return fmt.Errorf("unsupported client_profile %q (see GET /admin/api/client-profiles)", ch.ClientProfile)
+	}
+	ch.ClientProfile = profile
 	if ch.Proxy != nil && ch.Proxy.Kind == "" {
 		ch.Proxy = nil // 空代理规格 = 未设置渠道级代理
 	}

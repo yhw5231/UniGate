@@ -1304,18 +1304,45 @@ function keyProxyDesc(k, ch) {
 // ---- 模型名归一化（与后端 modelIdentity / canonicalModel 同规则）----
 // 上游报 "cline-free/DeepSeek-V4.1-Flash:free"、客户端写 "DeepSeek-V4.1-Flash" 指的是
 // 同一个模型。归一化 = 小写 → 去最后一个 "/" 之前的供应商前缀 → 去 ":free" 类变体
-// 后缀 → 去结尾 "-free"。列表与路由对外用归一化名，上游仍收到它自己的写法
+// 后缀 → 去冒号分组/线路前缀（"cn:deepseek-v4-flash" → "deepseek-v4-flash"）→ 去结尾
+// "-free"。列表与路由对外用归一化名，上游仍收到它自己的写法
 //（渠道模型映射记录，见后端 normalizeDeclaredModels）。
 const MODEL_VARIANT_TAGS = new Set([
   "free", "nitro", "thinking", "online", "extended", "floor", "beta", "self-moderated",
 ]);
+// 冒号前的分组/线路前缀（cn:deepseek-v4-flash 的 cn、global:x 的 global）
+const MODEL_GROUP_PREFIXES = new Set([
+  "cn", "global", "oversea", "overseas", "domestic", "mainland", "intl", "international",
+  "us", "eu", "sg", "jp", "hk", "tw", "kr", "uk", "au", "ca", "de", "fr", "in", "br",
+]);
+// 冒号后的版本/量化标签词（Ollama 等）：命中时冒号前是模型名，不能当分组前缀
+const MODEL_TAG_WORDS = new Set([
+  "latest", "stable", "nightly", "preview", "instruct", "chat", "base", "text", "vision",
+  "fp16", "fp32", "int8", "int4", "gguf", "cuda", "cpu", "q4", "q5", "q8",
+]);
 function isModelVariantTag(tag) { return tag === "" || MODEL_VARIANT_TAGS.has(tag); }
+// looksLikeModelTag 冒号后像版本/量化标签而非模型名：命中标签词，或含数字但不含 "-"/"."
+function looksLikeModelTag(s) {
+  if (MODEL_TAG_WORDS.has(s)) return true;
+  if (/[-.]/.test(s)) return false;
+  return /[0-9]/.test(s);
+}
+// isModelGroupPrefix 冒号前是否为分组/线路前缀（词表命中直接判；两三字母短码按
+// 区域码推断，但要求冒号后不像版本标签）；"re:" 是正则模式前缀，不是分组前缀
+function isModelGroupPrefix(prefix, rest) {
+  if (!prefix || !rest || prefix === "re") return false;
+  if (MODEL_GROUP_PREFIXES.has(prefix)) return true;
+  if (prefix.length < 2 || prefix.length > 3 || !/^[a-z]+$/.test(prefix)) return false;
+  return !looksLikeModelTag(rest);
+}
 function canonicalModel(name) {
   let s = String(name ?? "").trim().toLowerCase();
   const slash = s.lastIndexOf("/");
   if (slash >= 0) s = s.slice(slash + 1);
   const colon = s.lastIndexOf(":");
   if (colon >= 0 && isModelVariantTag(s.slice(colon + 1))) s = s.slice(0, colon);
+  const head = s.indexOf(":");
+  if (head > 0 && isModelGroupPrefix(s.slice(0, head), s.slice(head + 1))) s = s.slice(head + 1);
   return s.endsWith("-free") ? s.slice(0, -5) : s;
 }
 function modelIdentity(name) { return canonicalModel(name) || String(name ?? "").trim(); }

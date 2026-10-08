@@ -142,7 +142,9 @@ func TestChannelMapOverridesGlobalAlias(t *testing.T) {
 }
 
 // TestModelMapKeyExposedAsModel 映射键（下游名）算「声明支持」：无需写进 Models
-// 即可用该名调用，并出现在 /v1/models 与路由视图分组里。
+// 即可用该名调用，并出现在 /v1/models 与路由视图分组里。映射目标里的上游写法
+//（cn:x / global:x）带分组前缀，归一化后与映射键同名，不再单独作为可调用名暴露
+//（下游仍可用 cn:x 调用：归一化命中同一个模型）。
 func TestModelMapKeyExposedAsModel(t *testing.T) {
 	setupGateway(t)
 	srv, _ := modelMapUpstream(t, nil)
@@ -159,9 +161,12 @@ func TestModelMapKeyExposedAsModel(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("models status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	for _, want := range []string{`"x"`, `"cn:x"`, `"global:x"`} {
-		if !strings.Contains(rr.Body.String(), want) {
-			t.Fatalf("/v1/models missing %s: %s", want, rr.Body.String())
+	if !strings.Contains(rr.Body.String(), `"x"`) {
+		t.Fatalf("/v1/models missing %q: %s", "x", rr.Body.String())
+	}
+	for _, unwanted := range []string{`"cn:x"`, `"global:x"`} {
+		if strings.Contains(rr.Body.String(), unwanted) {
+			t.Fatalf("/v1/models 不应暴露带分组前缀的上游写法 %s: %s", unwanted, rr.Body.String())
 		}
 	}
 }
@@ -205,15 +210,21 @@ func TestRouteViewExpandsMappedUpstreams(t *testing.T) {
 		t.Fatalf("global:x row = %+v, want ok with cool_model global:x", gl)
 	}
 
-	// 上游模型分组（cn:x / global:x）与映射键分组（x）都在
+	// 上游模型分组（cn:x / global:x）归一化后与映射键同名，路由视图只剩一个分组
+	//「x」；各自的候选行仍按上游写法铺开（上面的 Upstream 断言）
 	full := routeStatusData("")
 	got := map[string]bool{}
 	for _, m := range full.Models {
 		got[m.Model] = true
 	}
-	for _, want := range []string{"x", "cn:x", "global:x"} {
+	for _, want := range []string{"x"} {
 		if !got[want] {
 			t.Fatalf("路由视图缺少分组 %q: %+v", want, got)
+		}
+	}
+	for _, unwanted := range []string{"cn:x", "global:x"} {
+		if got[unwanted] {
+			t.Fatalf("路由视图不应把带分组前缀的上游写法铺成分组 %q: %+v", unwanted, got)
 		}
 	}
 }

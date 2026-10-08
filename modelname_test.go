@@ -24,8 +24,8 @@ func TestCanonicalModel(t *testing.T) {
 		{"gpt-4o:thinking", "gpt-4o"},
 		{"gpt-4o-free", "gpt-4o"},
 		{"  gpt-4o  ", "gpt-4o"},
-		{"cn:deepseek-v4", "cn:deepseek-v4"}, // 冒号后非装饰词：保留（分组名）
-		{"gpt-4o:", "gpt-4o"},                // 冒号后为空：视为装饰
+		{"cn:deepseek-v4", "deepseek-v4"}, // 冒号前是分组/线路前缀：剥离
+		{"gpt-4o:", "gpt-4o"},             // 冒号后为空：视为装饰
 		{"", ""},
 	}
 	for _, c := range cases {

@@ -57,18 +57,23 @@ reasoning_content` 改写（现改为**渠道级开关**）、请求日志与用
 - **模型名称处理**（对标 go-gateway 的 pattern / ModelMapping / source_model）：
   - **模型列表支持模式**：每项可为精确名、通配（`claude-*` / `gpt-4?`）或正则（`re:^gpt-4.*$`）；
   - **对外名归一化**：保存渠道（含拉取模型）时，精确名统一归一化为**对外名**——小写、去掉
-    供应商前缀（`cline-free/x` → `x`）与变体后缀（`x:free` / `x-free` → `x`）——原写法自动
+    供应商前缀（`cline-free/x` → `x`）、**分组/线路前缀**（`cn:deepseek-v4-flash` →
+    `deepseek-v4-flash`、`global:x` → `x`）与变体后缀（`x:free` / `x-free` → `x`）——原写法自动
     记进下面的**渠道级名称映射**。于是路由页、`/v1/models`、渠道模型列表只出现干净名字
-    （不会带 `cline-free/`、`:free` 之类前缀后缀），而发往上游的仍是**上游自己的写法**
-    （对标 go-gateway：路由用规范名，渠道记 `source_model`）。通配/正则模式原样保留，
-    不参与归一化；**历史配置加载时自动迁移**（一次性归一化并写回）。
+    （不会带 `cline-free/`、`cn:`、`:free` 之类前缀后缀），而发往上游的仍是**上游自己的写法**
+    （对标 go-gateway：路由用规范名，渠道记 `source_model`）。冒号前缀只在「冒号前是分组/
+    线路标记」时剥离：`mistral:7b`、`phi:latest`、`llama3:latest` 这类版本/量化标签与 `re:`
+    正则前缀原样保留。通配/正则模式原样保留，不参与归一化；**历史配置加载时自动迁移**
+    （一次性归一化并写回）。
   - **同一对外名的多个上游写法 = 多个候选**：上游把同一个模型报了多种写法（如 `x` 与
-    `x:free`、`DeepSeek-V4.1-Flash` 与 `cline-free/DeepSeek-V4.1-Flash:free`）时，这些写法
+    `x:free`、`DeepSeek-V4.1-Flash` 与 `cline-free/DeepSeek-V4.1-Flash:free`、
+    `cn:deepseek-v4-flash` 与 `global:deepseek-v4-flash`）时，这些写法
     **各自是一个转发候选**：请求按顺序故障转移、**冷却各自独立计算**（同一个渠道内也分别
     计算），而对外始终只暴露一个名字（`/v1/models` 与路由页的分组名都去重为一个）。
     路由页会为每个上游写法单独列一行并标注实际发往上游的名字。
   - **归一化匹配**：精确名按归一化后比较——上游报 `cline-free/deepseek-v4.1-flash:free`、
-    下游写 `deepseek-v4.1-flash` 命中同一渠道，并按上游原写法改写请求体的 `model` 字段；
+    下游写 `deepseek-v4.1-flash` 命中同一渠道（`cn:deepseek-v4-flash` 与
+    `deepseek-v4-flash` 同理），并按上游原写法改写请求体的 `model` 字段；
   - **渠道级名称映射**（`model_map`）：`下游模型名=上游模型名`，把同一模型在各上游的不同叫法
     映射到该上游实际使用的名字（JSON 与 multipart 表单请求都改写）。**一个下游模型名可以
     对应上游的多个模型**（多个上游名用逗号分隔，如
@@ -222,8 +227,9 @@ curl http://localhost:10010/v1/chat/completions \
 
 `GET /v1/models` 聚合所有启用渠道的模型列表（静态列表 ∪ 已拉取列表 ∪ models 端点
 实时拉取，去重），并附上设置页配置的**全局模型别名**；下游 key 配置了模型白名单时
-只返回其允许的模型。**暴露的名字统一为对外名**（小写、去供应商前缀与 `:free`/`-free`
-类变体后缀）：同一个模型在上游的多种写法合并成一个对外名，上游原写法只用于发往上游
+只返回其允许的模型。**暴露的名字统一为对外名**（小写、去供应商前缀、分组/线路前缀与
+`:free`/`-free` 类变体后缀，如 `cn:deepseek-v4-flash` → `deepseek-v4-flash`）：同一个模型
+在上游的多种写法合并成一个对外名，上游原写法只用于发往上游
 （见渠道模型映射），不会出现在 `/v1/models` 与路由页分组名里；
 也可在渠道模型列表里直接写通配（`claude-*`）或正则（`re:^gpt-4.*$`）。
 **已停用的渠道不参与**：它的模型不出现在 `/v1/models`（转发与路由页同理）。

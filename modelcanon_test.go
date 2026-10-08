@@ -26,7 +26,8 @@ func TestModelIdentityAndExposedName(t *testing.T) {
 		{"gpt-4o", "gpt-4o"},
 		{"x:free", "x"},
 		{"x-free", "x"},
-		{"cn:deepseek-v4.1-flash", "cn:deepseek-v4.1-flash"}, // 冒号后不是装饰词：整名保留
+		{"cn:deepseek-v4.1-flash", "deepseek-v4.1-flash"}, // 冒号前是分组/线路前缀：剥离
+		{"global:DeepSeek-V4.1-Flash:free", "deepseek-v4.1-flash"},
 		{"  spaced-model  ", "spaced-model"},
 		{"claude-*", "claude-*"},
 	}
@@ -519,5 +520,188 @@ func TestGatewayModelsExposesCanonicalNames(t *testing.T) {
 	}
 	if strings.Contains(body, "cline-free/") {
 		t.Fatalf("/v1/models 不应暴露上游前缀: %s", body)
+	}
+}
+
+// TestModelGroupPrefixNormalization 冒号分组/线路前缀的识别：上游报
+// "cn:deepseek-v4-flash" 时它指的就是模型 deepseek-v4-flash（cn 是线路标记，
+// 不是模型名的一部分）；冒号后的版本/量化标签（mistral:7b、phi:latest）与
+// 正则模式前缀 "re:" 不得被误当成分组前缀。
+func TestModelGroupPrefixNormalization(t *testing.T) {
+	strip := []struct{ in, want string }{
+		{"cn:deepseek-v4-flash", "deepseek-v4-flash"},
+		{"CN:DeepSeek-V4-Flash", "deepseek-v4-flash"},
+		{"global:deepseek-v4.1-flash", "deepseek-v4.1-flash"},
+		{"cn:deepseek-v4-flash:free", "deepseek-v4-flash"},
+		{"cline-free/cn:deepseek-v4-flash:free", "deepseek-v4-flash"},
+		{"cn:o1", "o1"},                 // 明确的分组前缀：冒号后不必带 "-"
+		{"sg:glm-5.3", "glm-5.3"},       // 区域码在词表里
+		{"mx:some-model", "some-model"}, // 未列举的两字母区域码：按区域码推断
+	}
+	for _, c := range strip {
+		if got := modelIdentity(c.in); got != c.want {
+			t.Errorf("modelIdentity(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if got := exposedModelName(c.in); got != c.want {
+			t.Errorf("exposedModelName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	keep := []struct{ in, want string }{
+		{"mistral:7b", "mistral:7b"},       // 冒号后是版本标签：冒号前才是模型名
+		{"llama3:latest", "llama3:latest"}, // 前缀含数字：不是区域码
+		{"phi:latest", "phi:latest"},       // 标签词：不剥离
+		{"qwen2.5:14b", "qwen2.5:14b"},
+		{"re:^gpt-4.*$", "re:^gpt-4.*$"}, // 正则模式前缀
+		{"gpt-4o", "gpt-4o"},
+	}
+	for _, c := range keep {
+		if got := modelIdentity(c.in); got != c.want {
+			t.Errorf("modelIdentity(%q) = %q, want %q（不得误剥离）", c.in, got, c.want)
+		}
+	}
+	// 归一化等价：下游用带线路前缀的写法调用，也命中声明了干净名的渠道
+	if !modelMatches("cn:deepseek-v4-flash", "deepseek-v4-flash") ||
+		!modelMatches("deepseek-v4-flash", "cn:deepseek-v4-flash") {
+		t.Error("带分组前缀的写法与干净名应互相命中")
+	}
+	if modelMatches("mistral:7b", "7b") {
+		t.Error("版本标签不应被当成分组前缀（mistral:7b 不等于 7b）")
+	}
+}
+
+// TestFetchModelsRecognizesGroupPrefix 渠道获取上游模型后，带分组前缀的上游写法
+// 识别为模型名：候选对外名去掉前缀（deepseek-v4-flash）、上游写法原样保留
+//（Raw = cn:deepseek-v4-flash）；保存后对外只留一个名字、cn/global 两条线路各成
+// 一个候选，转发仍用上游自己的写法。
+func TestFetchModelsRecognizesGroupPrefix(t *testing.T) {
+	cands := fetchedCandidates([]fetchedModel{
+		{ID: "cn:deepseek-v4-flash"},
+		{ID: "global:deepseek-v4-flash"},
+		{ID: "gpt-4o"},
+	})
+	if len(cands) != 3 {
+		t.Fatalf("candidates = %+v", cands)
+	}
+	if cands[0].Name != "deepseek-v4-flash" || cands[0].Raw != "cn:deepseek-v4-flash" {
+		t.Fatalf("cn 线路候选: %+v", cands[0])
+	}
+	if cands[1].Name != "deepseek-v4-flash" || cands[1].Raw != "global:deepseek-v4-flash" {
+		t.Fatalf("global 线路候选: %+v", cands[1])
+	}
+	if cands[2].Name != "gpt-4o" {
+		t.Fatalf("普通候选不应受影响: %+v", cands[2])
+	}
+
+	setupGateway(t)
+	var mu sync.Mutex
+	var seen []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var in struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(body, &in)
+		mu.Lock()
+		seen = append(seen, in.Model)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+	}))
+	defer up.Close()
+
+	// WebUI 勾选提交的是上游写法（Raw），保存时归一化
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Models: fetchedRawModels(cands[:2]),
+		Keys:   []*UpKey{{Name: "k", APIKey: "sk-1", Enabled: true}}})
+
+	ch := store.Snapshot().Channels[0]
+	if strings.Join(ch.Models, ",") != "deepseek-v4-flash" {
+		t.Fatalf("对外名应去掉分组前缀: %v", ch.Models)
+	}
+	if got := strings.Join(ch.ModelMap["deepseek-v4-flash"], ","); got != "cn:deepseek-v4-flash,global:deepseek-v4-flash" {
+		t.Fatalf("两条线路应各成一个上游候选: %+v", ch.ModelMap)
+	}
+
+	// 下游用干净名调用：上游收到第一条线路的原写法
+	canonChat(t, "deepseek-v4-flash")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 1 || seen[0] != "cn:deepseek-v4-flash" {
+		t.Fatalf("上游收到的模型名应为上游原写法: %v", seen)
+	}
+}
+
+// TestFetchModelsReplaceWithGroupPrefix 走真实的「渠道获取模型」路径
+//（fetch-models?replace=1 全量替换写回）：上游 /models 报 cn:/global: 两条线路时，
+// 渠道列表只存干净名 deepseek-v4-flash，两条线路各记一条上游写法（转发仍发原写法）。
+func TestFetchModelsReplaceWithGroupPrefix(t *testing.T) {
+	setupGateway(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"cn:deepseek-v4-flash"},{"id":"global:deepseek-v4-flash"}]}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+	}))
+	defer up.Close()
+
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k", APIKey: "sk-1", Enabled: true}}})
+	chid := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chid+"/fetch-models?replace=1", "", adminToken(t)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	ch := store.Snapshot().Channels[0]
+	if strings.Join(ch.Models, ",") != "deepseek-v4-flash" {
+		t.Fatalf("拉取写回的对外名应去掉分组前缀: %v", ch.Models)
+	}
+	if got := strings.Join(ch.ModelMap["deepseek-v4-flash"], ","); got != "cn:deepseek-v4-flash,global:deepseek-v4-flash" {
+		t.Fatalf("两条线路应各记一条上游写法: %+v", ch.ModelMap)
+	}
+}
+
+// TestFetchModelsInlineGroupPrefix 内联拉取（编辑器「获取模型」）：候选是上游写法
+//（供逐个勾选与写回映射），enabled_ids 给出去掉前缀的对外名，已声明该写法的渠道
+// 预勾选命中，且不误报 stale。
+func TestFetchModelsInlineGroupPrefix(t *testing.T) {
+	setupGateway(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"cn:deepseek-v4-flash"},{"id":"global:deepseek-v4-flash"}]}`))
+	}))
+	defer up.Close()
+
+	body := `{"channel":{"base_url":"` + up.URL + `","models":["cn:deepseek-v4-flash"],
+		"keys":[{"name":"k","api_key":"sk-f","enabled":true}]}}`
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/fetch-models", body, adminToken(t)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Fetched         []string `json:"fetched"`
+		EnabledIDs      []string `json:"enabled_ids"`
+		EnabledUpstream []string `json:"enabled_upstream"`
+		Stale           []string `json:"stale"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if strings.Join(out.Fetched, ",") != "cn:deepseek-v4-flash,global:deepseek-v4-flash" {
+		t.Fatalf("候选应是上游写法: %v", out.Fetched)
+	}
+	if strings.Join(out.EnabledIDs, ",") != "deepseek-v4-flash" {
+		t.Fatalf("enabled_ids 应是去掉分组前缀的对外名: %v", out.EnabledIDs)
+	}
+	if strings.Join(out.EnabledUpstream, ",") != "cn:deepseek-v4-flash" {
+		t.Fatalf("已声明的线路应预勾选: %v", out.EnabledUpstream)
+	}
+	if len(out.Stale) != 0 {
+		t.Fatalf("同一条线路不应被判为上游未返回: %v", out.Stale)
 	}
 }

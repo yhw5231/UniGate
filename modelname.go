@@ -1,9 +1,9 @@
 // 模型名称处理（融合 go-gateway 的 pattern / ModelMapping / SourceModel 语义）：
 //
 //   - 归一化（canonicalModel）：统一大小写，去掉供应商前缀（"cline-free/deepseek-v4.1-flash"
-//     → "deepseek-v4.1-flash"）与变体/装饰后缀（":free" / "-free"），用于判定
-//     「同一模型的不同写法」——上游 /models 报的是 "cline-free/x:free"，下游客户端
-//     写的可能只是 "x"，两者应命中同一渠道；
+//     → "deepseek-v4.1-flash"）、分组/线路前缀（"cn:deepseek-v4-flash" → "deepseek-v4-flash"）
+//     与变体/装饰后缀（":free" / "-free"），用于判定「同一模型的不同写法」——上游 /models
+//     报的是 "cline-free/x:free"，下游客户端写的可能只是 "x"，两者应命中同一渠道；
 //   - 模式匹配：渠道模型列表的每一项可以是精确名、通配（"claude-*" / "gpt-4?"）或
 //     正则（"re:^gpt-4.*$"）；
 //   - 全局别名（设置页 model_aliases）：下游请求名 → 规范模型名，作用于路由与上游请求体；
@@ -35,9 +35,31 @@ var modelVariantTags = map[string]bool{
 	"extended": true, "floor": true, "beta": true, "self-moderated": true,
 }
 
+// modelGroupPrefixes 冒号前的「分组/线路」前缀（"cn:deepseek-v4-flash" 里的 cn、
+// "global:x" 里的 global）：上游/渠道用它区分同一模型的不同区域线路，不是模型名的
+// 一部分，归一化时剥离。上游仍收到它自己的原写法——拉取候选把原文记进 Raw，
+// 渠道模型映射（ModelMap）保存后转发照原样（见 fetchedCandidates / upstreamModelsFor）。
+var modelGroupPrefixes = map[string]bool{
+	"cn": true, "global": true, "oversea": true, "overseas": true,
+	"domestic": true, "mainland": true, "intl": true, "international": true,
+	"us": true, "eu": true, "sg": true, "jp": true, "hk": true, "tw": true,
+	"kr": true, "uk": true, "au": true, "ca": true, "de": true, "fr": true,
+	"in": true, "br": true,
+}
+
+// modelTagWords 冒号后常见的「版本/量化」标签词（Ollama 等）：命中时冒号前是模型名
+// 本身（"phi:latest"、"llama3:latest"），不能当成分组前缀剥离。
+var modelTagWords = map[string]bool{
+	"latest": true, "stable": true, "nightly": true, "preview": true,
+	"instruct": true, "chat": true, "base": true, "text": true, "vision": true,
+	"fp16": true, "fp32": true, "int8": true, "int4": true, "gguf": true,
+	"cuda": true, "cpu": true, "q4": true, "q5": true, "q8": true,
+}
+
 // canonicalModel 归一化模型名：小写去空白 → 去掉最后一个 "/" 之前的供应商前缀
-// → 去掉 ":free" 类装饰后缀 → 去掉结尾 "-free"。
-// 注意 "cn:deepseek-v4" 这类冒号分组名只在冒号后是装饰词时才截断。
+// → 去掉 ":free" 类装饰后缀 → 去掉冒号分组/线路前缀（"cn:x" → "x"）→ 去掉结尾 "-free"。
+// 前缀与后缀的区别是「冒号后是什么」：装饰词（free/nitro…）是后缀，模型名主体
+// （deepseek-v4-flash）时冒号前才是分组前缀；"mistral:7b" 这类版本标签原样保留。
 func canonicalModel(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	if i := strings.LastIndex(name, "/"); i >= 0 {
@@ -46,12 +68,58 @@ func canonicalModel(name string) string {
 	if i := strings.LastIndex(name, ":"); i >= 0 && isModelVariantTag(name[i+1:]) {
 		name = name[:i]
 	}
+	if i := strings.Index(name, ":"); i > 0 && isModelGroupPrefix(name[:i], name[i+1:]) {
+		name = name[i+1:]
+	}
 	return strings.TrimSuffix(name, "-free")
 }
 
 // isModelVariantTag 冒号后的部分是否为装饰词（空串也算，如 "model:"）。
 func isModelVariantTag(tag string) bool {
 	return tag == "" || modelVariantTags[tag]
+}
+
+// isModelGroupPrefix 冒号前的部分是否为「分组/线路」前缀（且冒号后确实是模型名）：
+//   - 词表命中（cn / global / us …）：明确的分组标记，直接判为前缀；
+//   - 两三个纯字母的短码（br / mx / za …）：按区域码推断，但要求冒号后不像版本/
+//     量化标签（7b、latest、q4_k_m），否则会把 "mistral:7b" 截成 "7b"；
+//   - "re:" 是正则模式前缀，不是分组前缀。
+func isModelGroupPrefix(prefix, rest string) bool {
+	if prefix == "" || rest == "" || prefix == "re" {
+		return false
+	}
+	if modelGroupPrefixes[prefix] {
+		return true
+	}
+	if len(prefix) < 2 || len(prefix) > 3 || !isAlphaWord(prefix) {
+		return false
+	}
+	return !looksLikeModelTag(rest)
+}
+
+// isAlphaWord 是否全为小写字母（调用方保证已小写）。
+func isAlphaWord(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 'a' || s[i] > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikeModelTag 冒号后的部分是否像「版本/量化标签」而不是模型名：命中标签词，
+// 或含数字但不含 "-"/"."（7b、8b、13b、q4_k_m、gpt4o）——模型名主体一般带 "-" 或 "."。
+func looksLikeModelTag(s string) bool {
+	if modelTagWords[s] {
+		return true
+	}
+	if strings.ContainsAny(s, "-.") {
+		return false
+	}
+	return strings.ContainsAny(s, "0123456789")
 }
 
 // modelIdentity 模型对外暴露的名字（对标 go-gateway 的 modelIdentity）：归一化名

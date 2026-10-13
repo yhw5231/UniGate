@@ -30,7 +30,7 @@ type Config struct {
 	AdminUser     string
 	AdminPass     string
 	ExtraUsers    map[string]string
-	TokenTTL      time.Duration
+	TokenTTL      time.Duration // 登录 token 有效期；<= 0 = 永不过期（默认 0）
 
 	// 登录防爆破：连续失败达到阈值后锁定（指数退避，内存态重启清零）
 	LoginFailLockout int           // 连续失败锁定阈值（默认 5，0 = 关闭）
@@ -171,7 +171,8 @@ func loadConfig() Config {
 		AdminUser:     adminUser,
 		AdminPass:     adminPass,
 		ExtraUsers:    extra,
-		TokenTTL:      durationEnv("TOKEN_TTL", 24*time.Hour),
+		// 默认 0 = 登录状态永不过期；设 TOKEN_TTL=24h 之类可重新启用有效期
+		TokenTTL: durationEnv("TOKEN_TTL", 0),
 
 		LoginFailLockout: intEnv("LOGIN_FAIL_LOCKOUT", 5),
 		LoginFailWindow:  durationEnv("LOGIN_FAIL_WINDOW", 5*time.Minute),

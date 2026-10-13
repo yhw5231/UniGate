@@ -707,7 +707,7 @@ Admin API（均需管理员 token）：`PUT /admin/api/channels/{id}/model-pin` 
 | `LOGIN_FAIL_LOCKOUT` | `5` | 连续登录失败达到该次数后按「用户名」与「来源 IP」分别锁定（指数退避，封顶 1h）。0 = 关闭防爆破 |
 | `LOGIN_FAIL_WINDOW` | `5m` | 登录失败计数窗口，同时是锁定基础时长（超过阈值后每多失败一次翻倍） |
 | `EXTRA_USERS` | 空 | 额外 WebUI 登录用户，`user:pass,user2:pass2`（仅登录 WebUI，无 Admin API 权限） |
-| `TOKEN_TTL` | `24h` | 登录 token 有效期 |
+| `TOKEN_TTL` | `0` | 登录 token 有效期；`0`（默认）或负值 = 永不过期，登录一次长期有效。设为 `24h` 之类可恢复有效期（过期后前端收到 401 自动回到登录页） |
 | `TOKEN_SECRET` | 空 | 登录 token 签名密钥（缺省自动持久化到 data/token-secret） |
 | `GW_KEY_AUTH` | `true` | 下游是否必须携带通用 key |
 | `TRUST_PROXY_HEADERS` | `true` | 反代部署取真实客户端 IP：优先 `X-Real-IP`，其次 `X-Forwarded-For` 最左合法段（脏值跳过，回退 TCP 对端地址）。影响请求记录的「出口/客户端 IP」列与登录防爆破的按 IP 计数。网关不经反代直接暴露给不可信客户端时改为 `false`，防伪造头污染日志/绕过按 IP 限流 |

@@ -2,6 +2,9 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -89,6 +92,99 @@ func TestVerifyTokenExpired(t *testing.T) {
 	if _, err := verifyToken(token); err == nil {
 		t.Error("expired token should fail")
 	}
+}
+
+// tokenExpiry 解析 token payload 里的 exp（测试辅助）。
+func tokenExpiry(t *testing.T, token string) int64 {
+	t.Helper()
+	i := strings.IndexByte(token, '.')
+	if i < 0 {
+		t.Fatalf("malformed token %q", token)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token[:i])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var claims tokenClaims
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		t.Fatalf("unmarshal claims: %v", err)
+	}
+	return claims.Exp
+}
+
+// TestTokenNoExpiryByDefault：默认配置下登录状态永不过期——TOKEN_TTL 缺省为 0，
+// 签发的 token payload 不带过期时间（exp=0），验证端也不再做过期判断。
+func TestTokenNoExpiryByDefault(t *testing.T) {
+	t.Setenv("TOKEN_TTL", "") // 空 = 走默认值
+	resetCfgForTest()
+	defer resetCfgForTest()
+
+	if cfg.TokenTTL != 0 {
+		t.Fatalf("default TokenTTL = %s, want 0（永不过期）", cfg.TokenTTL)
+	}
+	token, err := issueToken("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp := tokenExpiry(t, token); exp != 0 {
+		t.Fatalf("exp = %d, want 0（无有效期）", exp)
+	}
+	user, err := verifyToken(token)
+	if err != nil || user != "admin" {
+		t.Fatalf("no-expiry token rejected: user=%q err=%v", user, err)
+	}
+}
+
+// TestTokenNegativeTTLNeverExpires：TOKEN_TTL 为负值时同样按永不过期处理。
+func TestTokenNegativeTTLNeverExpires(t *testing.T) {
+	t.Setenv("TOKEN_TTL", "-1s")
+	resetCfgForTest()
+	defer resetCfgForTest()
+
+	token, err := issueToken("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp := tokenExpiry(t, token); exp != 0 {
+		t.Fatalf("exp = %d, want 0（无有效期）", exp)
+	}
+	if _, err := verifyToken(token); err != nil {
+		t.Fatalf("token should be valid: %v", err)
+	}
+}
+
+// TestTokenTTLStillEnforcedWhenSet：显式设置 TOKEN_TTL 后有效期照旧生效，
+// 且旧版本签发的（exp>0）token 不会被这次默认值变更连带放行。
+func TestTokenTTLStillEnforcedWhenSet(t *testing.T) {
+	t.Setenv("TOKEN_TTL", "1h")
+	resetCfgForTest()
+	defer resetCfgForTest()
+
+	token, err := issueToken("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp := tokenExpiry(t, token); exp <= time.Now().Unix() {
+		t.Fatalf("exp = %d, want in the future", exp)
+	}
+	// 旧 token（exp 已过去）仍应被拒
+	past := tokenClaims{User: "admin", Exp: time.Now().Add(-time.Minute).Unix()}
+	if _, err := verifyToken(signClaims(t, past)); err == nil {
+		t.Error("already-expired token should still fail")
+	}
+}
+
+// signClaims 用当前密钥为给定 claims 手工签名（测试辅助）。
+func signClaims(t *testing.T, claims tokenClaims) string {
+	t.Helper()
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	enc := base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, []byte(secret()))
+	mac.Write([]byte(enc))
+	return enc + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func TestHandleLogin(t *testing.T) {

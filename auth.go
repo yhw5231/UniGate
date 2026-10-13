@@ -1,5 +1,6 @@
 // 登录验证：POST /login 换取 token，受保护端点需带 Authorization: Bearer <token>。
 // token 为 HMAC-SHA256 签名（payload 带用户名与过期时间），无状态可验证。
+// 过期时间仅在 TOKEN_TTL > 0 时写入；默认（0）登录状态永不过期。
 package main
 
 import (
@@ -18,7 +19,7 @@ import (
 
 type tokenClaims struct {
 	User string `json:"u"`
-	Exp  int64  `json:"exp"` // unix 秒
+	Exp  int64  `json:"exp"` // unix 秒；0 = 无有效期（永不过期）
 }
 
 // accountsMu 保护 AdminUser/AdminPass（ExtraUsers 只读不写）：
@@ -54,8 +55,12 @@ func subtleEqual(a, b string) bool {
 }
 
 // issueToken 签发 HMAC 签名 token。
+// cfg.TokenTTL <= 0（默认）时不写过期时间（exp = 0），签发的 token 永不过期。
 func issueToken(username string) (string, error) {
-	claims := tokenClaims{User: username, Exp: time.Now().Add(cfg.TokenTTL).Unix()}
+	claims := tokenClaims{User: username}
+	if cfg.TokenTTL > 0 {
+		claims.Exp = time.Now().Add(cfg.TokenTTL).Unix()
+	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
 		return "", err
@@ -89,7 +94,8 @@ func verifyToken(token string) (string, error) {
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return "", errors.New("invalid payload json")
 	}
-	if time.Now().Unix() > claims.Exp {
+	// exp = 0 表示签发时未启用有效期：不做过期校验（永不过期）
+	if claims.Exp > 0 && time.Now().Unix() > claims.Exp {
 		return "", errors.New("token expired")
 	}
 	return claims.User, nil
@@ -153,6 +159,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"token":      token,
 		"token_type": "Bearer",
+		// 0 = 无有效期（永不过期）
 		"expires_in": int64(cfg.TokenTTL.Seconds()),
 		"user":       body.Username,
 	}

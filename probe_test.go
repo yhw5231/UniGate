@@ -164,6 +164,42 @@ func TestProbeQuestionAndAnswer(t *testing.T) {
 	}
 }
 
+// TestProbeAnswerEnvelope 答案提取的响应形态兼容：Cline Pass 网关的
+// {data:{...}} 信封、JSON 字符串标量、以及「JSON 但取不到答案」时必须跳过
+// 校验（不得把 reasoning/usage/id 里的数字当答案）。
+func TestProbeAnswerEnvelope(t *testing.T) {
+	// {data:{choices:...}} 信封：应取出 content，而不是整段 JSON
+	got, ok := extractProbeAnswer(`{"data":{"choices":[{"finish_reason":"stop","index":0,` +
+		`"message":{"content":"95193","reasoning":"70082 + 13450 + 11669 = 95201"}}],` +
+		`"usage":{"prompt_tokens":41,"completion_tokens":87}}}`)
+	if !ok || strings.TrimSpace(got) != "95193" {
+		t.Fatalf("envelope extract: %q ok=%v", got, ok)
+	}
+	if n := probeNumbersIn(got); len(n) != 1 || n[0] != 95193 {
+		t.Fatalf("envelope numbers: %v", n)
+	}
+	// 信封内的 responses 形态
+	if got, ok := extractProbeAnswer(`{"data":{"output_text":"246522"}}`); !ok || got != "246522" {
+		t.Fatalf("envelope responses extract: %q ok=%v", got, ok)
+	}
+	// JSON 字符串标量
+	if got, ok := extractProbeAnswer(`"246913"`); !ok || got != "246913" {
+		t.Fatalf("json string scalar: %q ok=%v", got, ok)
+	}
+	// JSON 但无答案文本：ok=false，跳过校验（否则 41/87 之类的数字会参与匹配）
+	if got, ok := extractProbeAnswer(`{"error":{"message":"boom","code":41}}`); ok {
+		t.Fatalf("json without answer should not be treated as answer: %q", got)
+	}
+	// 非 JSON 纯文本仍走兜底
+	if got, ok := extractProbeAnswer("The answer is 246913."); !ok || got != "The answer is 246913." {
+		t.Fatalf("plain text extract: %q ok=%v", got, ok)
+	}
+	// 空响应体
+	if _, ok := extractProbeAnswer("   "); ok {
+		t.Fatal("empty body should not be an answer")
+	}
+}
+
 // TestProbeExecuteSendsAddition 探测真实发出请求：上游应收到含「随机 5 位数
 // 加法」的对话请求，答案校验通过时只记成功日志、不进错误日志。
 func TestProbeExecuteSendsAddition(t *testing.T) {
@@ -365,6 +401,34 @@ func TestProbeWrongAnswerLogged(t *testing.T) {
 	errs := errLog.Snapshot()
 	if len(errs) == 0 || !strings.Contains(errs[0].ErrMsg, "answer mismatch") {
 		t.Fatalf("wrong answer should be logged, got %+v", errs)
+	}
+}
+
+// TestProbeWrongAnswerEnvelopeLogged 上游用 {data:{...}} 信封返回错误答案时，
+// 错误日志应记录模型给出的答案文本，而不是整段 JSON 响应体。
+func TestProbeWrongAnswerEnvelopeLogged(t *testing.T) {
+	setupProbeTest(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"choices":[{"index":0,"message":{"content":"1",` +
+			`"reasoning":"thinking"},"finish_reason":"stop"}],"usage":{"prompt_tokens":41}}}`))
+	}))
+	defer up.Close()
+
+	ch := testProbeChannel(true)
+	ch.BaseURL = up.URL
+	if err := store.PutChannel(ch); err != nil {
+		t.Fatal(err)
+	}
+	probes.execute(probeTask{Kind: probeKindIdle, Ch: ch, Key: ch.Keys[0], Model: "m1"})
+	errs := errLog.Snapshot()
+	if len(errs) == 0 || !strings.Contains(errs[0].ErrMsg, "answer mismatch") {
+		t.Fatalf("wrong answer should be logged, got %+v", errs)
+	}
+	if !strings.Contains(errs[0].ErrMsg, `got "1"`) {
+		t.Fatalf("err msg should carry the model answer, got %q", errs[0].ErrMsg)
+	}
+	if strings.Contains(errs[0].ErrMsg, "choices") || strings.Contains(errs[0].ErrMsg, "reasoning") {
+		t.Fatalf("err msg should not contain the raw response body, got %q", errs[0].ErrMsg)
 	}
 }
 

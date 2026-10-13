@@ -964,13 +964,45 @@ func recordProbeRequest(t probeTask, res probeHTTPResult, errMsg string) {
 var probeNumberRe = regexp.MustCompile(`-?\d+`)
 
 // extractProbeAnswer 从上游响应体提取回复文本：chat 响应取 choices[0].message
-// .content；responses 响应取 output_text 或 output[].content[].text；都不是
-// 标准 JSON 时把整个响应体当纯文本答案（交给数字提取兜底）。
+// .content；responses 响应取 output_text 或 output[].content[].text。Cline Pass
+// 网关会把 OpenAI 形态的响应包在 {data:{...}} 信封里，信封自动展开一层（对标
+// parseGatewayRouting 的处理）。响应体不是 JSON 时把整个响应体当纯文本答案
+// （交给数字提取兜底）；是 JSON 却取不到答案文本时返回 ok=false 跳过校验，
+// 避免把 reasoning/usage/id 里的数字误当成答案。
 func extractProbeAnswer(body string) (string, bool) {
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return "", false
 	}
+	var raw json.RawMessage
+	if json.Unmarshal([]byte(body), &raw) != nil {
+		return body, true // 非 JSON：整段当纯文本答案
+	}
+	// JSON 字符串标量（上游直接把答案当字符串返回）
+	if len(raw) > 0 && raw[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil && strings.TrimSpace(s) != "" {
+			return s, true
+		}
+	}
+	if ans, ok := probeAnswerInJSON(raw); ok {
+		return ans, true
+	}
+	var env struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(raw, &env) == nil && len(env.Data) > 0 {
+		if ans, ok := probeAnswerInJSON(env.Data); ok {
+			return ans, true
+		}
+	}
+	return "", false
+}
+
+// probeAnswerInJSON 从一段 JSON 响应里取回复文本：chat 形态取
+// choices[0].message.content，responses 形态取 output_text 或
+// output[].content[].text。
+func probeAnswerInJSON(raw []byte) (string, bool) {
 	var chat struct {
 		Choices []struct {
 			Message struct {
@@ -978,7 +1010,7 @@ func extractProbeAnswer(body string) (string, bool) {
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if err := json.Unmarshal([]byte(body), &chat); err == nil &&
+	if err := json.Unmarshal(raw, &chat); err == nil &&
 		len(chat.Choices) > 0 && strings.TrimSpace(chat.Choices[0].Message.Content) != "" {
 		return chat.Choices[0].Message.Content, true
 	}
@@ -991,7 +1023,7 @@ func extractProbeAnswer(body string) (string, bool) {
 			} `json:"content"`
 		} `json:"output"`
 	}
-	if err := json.Unmarshal([]byte(body), &respn); err == nil {
+	if err := json.Unmarshal(raw, &respn); err == nil {
 		if s := strings.TrimSpace(respn.OutputText); s != "" {
 			return s, true
 		}
@@ -1003,7 +1035,7 @@ func extractProbeAnswer(body string) (string, bool) {
 			}
 		}
 	}
-	return body, true
+	return "", false
 }
 
 // probeNumbersIn 取回复文本中的全部整数（容忍千分位逗号与前后缀说明文字；

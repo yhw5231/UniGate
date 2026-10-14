@@ -26,7 +26,11 @@ const fetchModelsTimeout = 20 * time.Second
 // fetchUpstreamModels 用渠道的启用 key 依次拉取上游模型列表（Bearer 鉴权，
 // key 配置了代理则走代理）。返回模型条目（含分组与免费标记）与用到的 key 名。
 // 全部尝试失败时返回最后一个错误。
-func fetchUpstreamModels(ctx context.Context, ch *Channel) (models []fetchedModel, usedKey string, err error) {
+//
+// user 非空 = 管理员在 WebUI 触发（拉取/重建模型列表）：每次发往上游的请求都
+// 写入请求记录（user = 管理员，接口列 = 上游 /models 地址，失败进错误日志）；
+// 空 = 内部调用不记录。
+func fetchUpstreamModels(ctx context.Context, ch *Channel, user string) (models []fetchedModel, usedKey string, err error) {
 	var lastErr error
 	attempts := 0
 	for _, k := range ch.Keys {
@@ -35,7 +39,7 @@ func fetchUpstreamModels(ctx context.Context, ch *Channel) (models []fetchedMode
 		}
 		attempts++
 		cand := candidate{ch: ch, k: k}
-		list, ferr := fetchModelsWithKey(ctx, &cand)
+		list, ferr := fetchModelsWithKey(ctx, &cand, user)
 		if ferr != nil {
 			lastErr = fmt.Errorf("key %q: %w", k.Name, ferr)
 			continue
@@ -53,15 +57,24 @@ func fetchUpstreamModels(ctx context.Context, ch *Channel) (models []fetchedMode
 }
 
 // fetchModelsWithKey 用单个 key 拉取模型列表（应用 key 代理与渠道自定义头）。
-func fetchModelsWithKey(ctx context.Context, cand *candidate) ([]fetchedModel, error) {
+// user 非空时把这次上游请求写入请求记录（成功与失败都记，见
+// recordAdminUpstreamRequest）；模型列表响应体可达数 MB，记录里只留状态码、
+// 字节数与错误摘要，不落响应体。
+func fetchModelsWithKey(ctx context.Context, cand *candidate, user string) ([]fetchedModel, error) {
+	start := time.Now()
+	target := cand.modelsTarget()
+	fail := func(status int, bytesOut int64, err error) ([]fetchedModel, error) {
+		recordAdminUpstreamRequest(start, http.MethodGet, user, cand.ch.Name, cand.k.Name, "", target, status, bytesOut, nil, err.Error())
+		return nil, err
+	}
 	route, err := resolveProxy(cand)
 	if err != nil {
-		return nil, fmt.Errorf("resolve proxy: %w", err)
+		return fail(0, 0, fmt.Errorf("resolve proxy: %w", err))
 	}
 	client := newUpstreamClient(route)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cand.modelsTarget(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return nil, err
+		return fail(0, 0, err)
 	}
 	if cand.k.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+cand.k.APIKey)
@@ -72,16 +85,18 @@ func fetchModelsWithKey(ctx context.Context, cand *candidate) ([]fetchedModel, e
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request %s: %w", cand.modelsTarget(), err)
+		return fail(0, 0, fmt.Errorf("request %s: %w", target, err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, err
+		return fail(resp.StatusCode, int64(len(body)), err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s -> upstream %d: %s", cand.modelsTarget(), resp.StatusCode, truncate(string(body), 200))
+		return fail(resp.StatusCode, int64(len(body)),
+			fmt.Errorf("%s -> upstream %d: %s", target, resp.StatusCode, truncate(string(body), 200)))
 	}
+	recordAdminUpstreamRequest(start, http.MethodGet, user, cand.ch.Name, cand.k.Name, "", target, resp.StatusCode, int64(len(body)), nil, "")
 	return parseModelsPayload(body)
 }
 

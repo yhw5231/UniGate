@@ -1,7 +1,8 @@
 // 路由引擎：把下游 OpenAI 兼容请求按渠道顺序 + key 顺序转发到上游，
 // 失败时自动故障转移到下一个 key/渠道。
 //
-// 候选顺序：渠道在配置中的顺序即优先级；同一渠道内按 key 顺序。
+// 候选顺序：渠道按优先级（priority，默认 0，数值越大越靠前；同优先级保持配置
+// 顺序）→ 同一渠道内按 key 顺序。
 // 每次请求最多尝试 cfg.MaxRouteTries 个候选；命中冷却的候选直接跳过。
 // 冷却键粒度为渠道级开关 cooldown_scope："key"（默认，含旧配置空值）按 key 跨模型
 // 共享冷却；"key_model" 按 (keyID, model) 独立冷却。
@@ -141,7 +142,7 @@ func (ch *Channel) failoverSameChannel() bool {
 // 每个候选另行解析发往上游的模型名（渠道 ModelMap 映射 / 声明列表原文，
 // 见 modelname.go）。渠道级映射优先于全局别名：渠道对下游原名配了映射时按
 // 渠道映射发往上游；一个下游名映射到多个上游模型时，每个上游模型各成一个候选。
-// 渠道顺序：先按渠道优先级（priority，默认 0，越小越靠前）排序，同一优先级内
+// 渠道顺序：先按渠道优先级（priority，默认 0，越大越靠前）排序，同一优先级内
 // 若存在设置了权重（weight>0）的渠道，按权重比例做平滑加权轮询决定每请求的
 // 渠道先后；否则保持配置顺序。渠道内 key 顺序由调度模式决定
 //（渠道 schedule，未配置跟随全局默认）：
@@ -165,8 +166,8 @@ func buildCandidates(rawModel, model string, rawBody []byte) []candidate {
 	if len(avail) == 0 {
 		return nil
 	}
-	// 先按优先级升序稳定排序（同优先级保持配置顺序），再按权重重排
-	sort.SliceStable(avail, func(a, b int) bool { return avail[a].ch.Priority < avail[b].ch.Priority })
+	// 先按优先级降序稳定排序（同优先级保持配置顺序），再按权重重排
+	sort.SliceStable(avail, func(a, b int) bool { return avail[a].ch.Priority > avail[b].ch.Priority })
 	ordered := orderByPriorityWeight(avail)
 
 	var out []candidate
@@ -205,8 +206,8 @@ var wrrState struct {
 }
 
 // orderByPriorityWeight 按 (优先级, 权重) 确定渠道顺序：优先级分组已由调用方
-// 排序完成，这里对每个同优先级组内存在权重（>0）渠道的组做平滑加权轮询重排，
-// 其余组保持原顺序（纯故障转移）。
+// 排序完成（降序：优先级大的组在前），这里对每个同优先级组内存在权重（>0）
+// 渠道的组做平滑加权轮询重排，其余组保持原顺序（纯故障转移）。
 func orderByPriorityWeight(entries []chEntry) []chEntry {
 	out := make([]chEntry, 0, len(entries))
 	for i := 0; i < len(entries); {
@@ -887,7 +888,7 @@ type RouteKeyStatus struct {
 	ChannelID       string `json:"channel_id"`
 	Channel         string `json:"channel"`
 	ChannelOn       bool   `json:"channel_enabled"`
-	ChannelPriority int    `json:"channel_priority"`           // 渠道优先级（越小越靠前）
+	ChannelPriority int    `json:"channel_priority"`           // 渠道优先级（越大越靠前）
 	ChannelWeight   int    `json:"channel_weight,omitempty"`   // 渠道权重（同优先级内加权轮询）
 	ChannelGroup    string `json:"channel_group,omitempty"`    // 渠道分组（WebUI 归类用）
 	KeyID           string `json:"key_id"`
@@ -920,7 +921,7 @@ type RouteStatusData struct {
 }
 
 // routeStatusData 构建路由页视图：候选顺序与网关实际转发顺序一致
-//（渠道配置序 + key 配置序）。model 非空时只返回该模型的分组。
+//（渠道优先级降序 + 同优先级保持配置序 + key 配置序）。model 非空时只返回该模型的分组。
 //
 // 模型枚举：取各渠道声明模型列表与渠道模型映射键（下游模型名）的并集（首次出现序）
 // 加上全局别名（标注指向的规范模型），渠道未声明模型列表时对全部模型放行，其 key
@@ -959,6 +960,11 @@ func routeStatusData(model string) *RouteStatusData {
 			active = append(active, ch)
 		}
 	}
+	// 候选顺序必须与 buildCandidates 一致：渠道按优先级降序（同优先级保持配置序），
+	// 否则路由页展示的「下一个请求会用谁」与实际转发顺序相反。
+	// 同优先级内配了权重的组由平滑加权轮询决定每请求先手（随请求变化），页面固定
+	// 展示配置序；priority 相同且无权重时页面顺序即真实顺序。
+	sort.SliceStable(active, func(a, b int) bool { return active[a].Priority > active[b].Priority })
 
 	if model != "" {
 		get(exposedModelName(model))

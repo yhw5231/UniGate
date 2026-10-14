@@ -392,7 +392,7 @@ func TestFetchModelsGroupedOnlyShape(t *testing.T) {
 	defer up.Close()
 	ch := &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
 		Keys: []*UpKey{{Name: "k", APIKey: "sk-1", Enabled: true}}}
-	list, key, err := fetchUpstreamModels(context.Background(), ch)
+	list, key, err := fetchUpstreamModels(context.Background(), ch, "")
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}

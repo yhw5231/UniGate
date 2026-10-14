@@ -422,7 +422,8 @@ function renderRoute() {
 }
 
 // routeModelHTML 单个模型分组的候选树：模型 → 渠道（优先级/权限/调度）→ 映射出的
-// 真实上游模型名 → key。叶子顺序 = 网关实际转发顺序（渠道配置序 + key 配置序），
+// 真实上游模型名 → key。叶子顺序 = 网关实际转发顺序（渠道优先级降序 + 同优先级
+// 配置序 + key 配置序；同优先级内配了权重的组先手每请求轮换，这里固定展示配置序），
 // 可直接当作「下一个请求会用谁」的预览。模型头与渠道头都可点击展开/收起
 //（默认收起，只头部展示可用/冷却概况）。
 function routeModelHTML(g, showOff) {
@@ -477,7 +478,7 @@ function routeModelHTML(g, showOff) {
         <span class="chev">${chOpen ? "▾" : "▸"}</span>
         <span class="rc-name">${esc(ch.name || "(未命名渠道)")}</span>
         ${ch.group ? `<span class="badge src">${esc(ch.group)}</span>` : ""}
-        <span class="badge info" title="渠道优先级：数值越小越先被路由（同优先级保持配置顺序）">优先级 ${ch.priority}</span>
+        <span class="badge info" title="渠道优先级：数值越大越先被路由（同优先级保持配置顺序）">优先级 ${ch.priority}</span>
         ${ch.weight > 0 ? `<span class="badge info" title="渠道权重：同优先级内按权重比例轮流分配请求">权重 ${ch.weight}</span>` : ""}
         <span class="badge ${ch.enabled ? "on" : "off"}" title="${ch.enabled ? "渠道已启用：参与路由" : "渠道已停用：整体不参与路由"}">${ch.enabled ? "启用" : "停用"}</span>
         <span class="badge info" title="账号调度模式：failover = 按 key 顺序用满才换；round_robin = 轮流分配">${ch.schedule === "round_robin" ? "顺序轮询" : "故障转移"}</span>
@@ -692,7 +693,7 @@ function renderChannels() {
         ${ch.rewrite_reasoning ? '<span class="badge info">reasoning改写</span>' : ""}
         ${ch.cooldown_scope === "key_model" ? '<span class="badge info">按(Key,模型)冷却</span>' : ""}
         ${ch.schedule === "round_robin" ? '<span class="badge info" title="每次请求从下一个 key 开始轮流分配">顺序轮询</span>' : ""}
-        <label class="ch-num" title="渠道优先级：数值越小越先被路由（默认 0）；同优先级保持配置顺序。改动即保存">优先级
+        <label class="ch-num" title="渠道优先级：数值越大越先被路由（默认 0 = 最低）；同优先级保持配置顺序。改动即保存">优先级
           <input class="ch-pri" type="number" min="0" step="1" value="${esc(ch.priority || 0)}">
         </label>
         <label class="ch-num" title="渠道权重：>0 时同一优先级内的渠道按权重比例轮流优先（平滑加权轮询，请求多时按比例均摊）；0 = 不参与加权，按顺序故障转移。改动即保存">权重

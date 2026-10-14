@@ -415,6 +415,7 @@ func handleAdminPutModelUpstreamPin(w http.ResponseWriter, r *http.Request) {
 // body {model, key_id?}。发两条小请求——正常请求读 routing（管线类型/实际
 // 服务渠道），only 钉到 __probe__ 的请求从上游报错里收割全部可用渠道；
 // 结果写回渠道的 ModelPins 探测产物（固定配置原样保留）。
+// 发往上游的正常请求写入请求记录（用户列 = 发起的管理员）；收割请求不留痕。
 func handleAdminProbeUpstreams(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Model string `json:"model"`
@@ -434,7 +435,7 @@ func handleAdminProbeUpstreams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := strings.TrimSpace(body.Model)
-	pin, err := probeChannelModel(ch, k, model)
+	pin, err := probeChannelModel(ch, k, model, adminUserFrom(r.Context()))
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "probe failed: "+err.Error(), "upstream_error")
 		return
@@ -506,8 +507,9 @@ func handleAdminValidateUpstreams(w http.ResponseWriter, r *http.Request) {
 	}
 	results := make([]map[string]any, 0, len(targets))
 	summary := map[string]int{}
+	user := adminUserFrom(r.Context())
 	for _, u := range targets {
-		res := validateUpstream(ch, k, model, pipeline, u)
+		res := validateUpstream(ch, k, model, pipeline, u, user)
 		results = append(results, res)
 		summary[res["status"].(string)]++
 	}
@@ -520,7 +522,9 @@ func handleAdminValidateUpstreams(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateUpstream 用 only=[u] 的小请求测试单个内部渠道并分类结果。
-func validateUpstream(ch *Channel, k *UpKey, model, pipeline, upstream string) map[string]any {
+// user 非空 = 管理员在渠道固定页点「验证」：每个内部渠道一次真实请求，全部
+// 写入请求记录（失败也是真实结论，进错误日志便于回看）。
+func validateUpstream(ch *Channel, k *UpKey, model, pipeline, upstream, user string) map[string]any {
 	reqBody := injectUpstreamPin(probeRequestBody(model, "hi", probeHarvestTokens), pipeline, upstream, nil, "", nil)
 	if reqBody == nil {
 		reqBody = probeRequestBody(model, "hi", probeHarvestTokens)
@@ -529,7 +533,7 @@ func validateUpstream(ch *Channel, k *UpKey, model, pipeline, upstream string) m
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.TestTimeout)
 	defer cancel()
 	start := time.Now()
-	ans, err := sendProbeChat(ctx, &cand, reqBody)
+	ans, err := sendProbeChat(ctx, user, model, &cand, reqBody)
 	ms := time.Since(start).Milliseconds()
 	res := map[string]any{"upstream": upstream, "ms": ms}
 	if err != nil {
@@ -998,7 +1002,7 @@ func handleAdminFetchModelsInline(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), fetchModelsTimeout+10*time.Second)
 	defer cancel()
-	fetched, usedKey, err := fetchUpstreamModels(ctx, ch)
+	fetched, usedKey, err := fetchUpstreamModels(ctx, ch, adminUserFrom(r.Context()))
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "fetch models failed: "+err.Error(), "upstream_error")
 		return
@@ -1018,7 +1022,7 @@ func handleAdminFetchModels(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), fetchModelsTimeout+10*time.Second)
 	defer cancel()
-	fetched, usedKey, err := fetchUpstreamModels(ctx, ch)
+	fetched, usedKey, err := fetchUpstreamModels(ctx, ch, adminUserFrom(r.Context()))
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "fetch models failed: "+err.Error(), "upstream_error")
 		return
@@ -1240,6 +1244,49 @@ func recordTestRequest(start time.Time, target, user, channel, key, model string
 		rec.ErrMsg = truncate(res.Error, errMsgMax)
 	} else if rec.Status >= 400 {
 		rec.ErrMsg = truncate(res.Snippet, 200)
+	}
+	recordRequest(rec)
+}
+
+// recordAdminUpstreamRequest 把管理员直接触发的上游请求写入请求记录：渠道固定页
+// 的「探测 / 验证」与「拉取模型」都走这里（渠道测试见 recordTestRequest）。语义与
+// 渠道测试一致：user = 发起的管理员，path = 上游地址，成功失败都留痕，不计入用量
+// 统计（只写请求/错误日志，不写 usage_events）。
+//
+// user 为空 = 非管理员触发的内部请求，不记录（如探测内部用于收割渠道清单的
+// 故意失败请求，见 harvestKnownProviders）。status = 0 表示没拿到上游响应
+//（代理解析/网络错误），原因由 errMsg 给出；status>=400 且无 errMsg 时用 body
+// 片段兜底。body 仅用于解析 Tokens 与错误摘要，不会整段入库。
+func recordAdminUpstreamRequest(start time.Time, method, user, channel, key, model, target string, status int, bytesOut int64, body []byte, errMsg string) {
+	if user == "" || reqLog == nil {
+		return
+	}
+	promptTok, completionTok := parseUsageFromBody(body)
+	label := key
+	if label != "" && channel != "" {
+		label += "@" + channel
+	}
+	rec := RequestRecord{
+		ID:               strconv.FormatInt(time.Now().UnixNano(), 36),
+		Time:             start,
+		Duration:         time.Since(start),
+		DurationMs:       time.Since(start).Milliseconds(),
+		Method:           method,
+		Path:             target,
+		Status:           status,
+		BytesOut:         bytesOut,
+		PromptTokens:     promptTok,
+		CompletionTokens: completionTok,
+		User:             user,
+		Channel:          channel,
+		Model:            model,
+		Key:              label,
+	}
+	switch {
+	case errMsg != "":
+		rec.ErrMsg = truncate(errMsg, errMsgMax)
+	case status >= 400:
+		rec.ErrMsg = truncate(string(body), 200)
 	}
 	recordRequest(rec)
 }

@@ -535,7 +535,7 @@
         </label>
       </div>
       <div class="opt-row">
-        <label class="inline" title="渠道优先级：数值越小越先被路由（默认 0）；同优先级保持配置顺序。也可在渠道页卡片头直接修改">优先级
+        <label class="inline" title="渠道优先级：数值越大越先被路由（默认 0 = 最低）；同优先级保持配置顺序。也可在渠道页卡片头直接修改">优先级
           <input id="chPriority" type="number" min="0" step="1" value="0">
         </label>
         <label class="inline" title="渠道权重：>0 时同一优先级内的渠道按权重比例轮流优先（平滑加权轮询，请求多时按比例均摊）；0 = 不参与加权，按顺序故障转移。也可在渠道页卡片头直接修改">权重

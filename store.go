@@ -200,7 +200,7 @@ type Channel struct {
 	CooldownScope string                       `json:"cooldown_scope,omitempty"` // 冷却粒度："" / "key" 按 key 跨模型共享（默认）；"key_model" 按 (key,model)
 	Schedule      string                       `json:"schedule,omitempty"`       // 账号调度："" 跟随全局默认；"failover" 故障转移；"round_robin" 顺序轮询
 	AutoProbe     bool                         `json:"auto_probe,omitempty"`     // 自动探测：启动时、key 冷却恢复时、正常状态连续无调用达空闲探测间隔（默认 2h）时，自动发加法题验证账号状态（probe.go）
-	Priority      int                          `json:"priority,omitempty"`       // 渠道优先级：数值越小越先被路由（默认 0）；同优先级保持配置顺序
+	Priority      int                          `json:"priority,omitempty"`       // 渠道优先级：数值越大越先被路由（默认 0，即最低优先级）；同优先级保持配置顺序
 	Weight        int                          `json:"weight,omitempty"`         // 渠道权重：>0 时同一优先级组内按权重比例轮流分配请求（0 = 不参与加权）
 	FailoverMode  string                       `json:"failover_mode,omitempty"`  // 失败转移："" / "same_channel" 同渠道内逐个 key 失败转移（默认）；"force_channel" key 失败立即切到下一渠道
 	Proxy         *ProxySpec                   `json:"proxy,omitempty"`          // 渠道级代理（如代理池）：未单独配置代理的 key 全部继承，每个 key 独立租约/出口 IP

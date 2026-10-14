@@ -20,14 +20,14 @@ func mustPutChannels(t *testing.T, chans ...*Channel) {
 	}
 }
 
-// TestChannelPriorityOrdersCandidates：priority 越小越先路由；同优先级保持配置序。
+// TestChannelPriorityOrdersCandidates：priority 越大越先路由；同优先级保持配置序。
 func TestChannelPriorityOrdersCandidates(t *testing.T) {
 	setupGateway(t)
 	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
 	mustPutChannels(t,
-		&Channel{Name: "low", BaseURL: up.srv.URL, Enabled: true, Priority: 10,
+		&Channel{Name: "low", BaseURL: up.srv.URL, Enabled: true, Priority: 1,
 			Keys: []*UpKey{{Name: "klow", APIKey: "sk-low", Enabled: true}}},
-		&Channel{Name: "high", BaseURL: up.srv.URL, Enabled: true, Priority: 1,
+		&Channel{Name: "high", BaseURL: up.srv.URL, Enabled: true, Priority: 10,
 			Keys: []*UpKey{{Name: "khigh", APIKey: "sk-high", Enabled: true}}},
 	)
 	cands := buildCandidates("m1", "m1", nil)
@@ -36,6 +36,41 @@ func TestChannelPriorityOrdersCandidates(t *testing.T) {
 	}
 	if cands[0].k.Name != "khigh" || cands[1].k.Name != "klow" {
 		t.Fatalf("order = [%s %s], want [khigh klow]", cands[0].k.Name, cands[1].k.Name)
+	}
+}
+
+// TestRouteStatusFollowsPriority：路由页候选顺序必须与网关实际转发顺序一致
+//（渠道按优先级降序；同优先级保持配置序），否则页面会把「下一个请求会用谁」显示反。
+func TestRouteStatusFollowsPriority(t *testing.T) {
+	setupGateway(t)
+	up := newUpstream(t, http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`)
+	// 配置顺序与优先级顺序相反：low 在前、high 在后
+	mustPutChannels(t,
+		&Channel{Name: "low", BaseURL: up.srv.URL, Enabled: true, Priority: 1, Models: []string{"m1"},
+			Keys: []*UpKey{{Name: "klow", APIKey: "sk-low", Enabled: true}}},
+		&Channel{Name: "high", BaseURL: up.srv.URL, Enabled: true, Priority: 10, Models: []string{"m1"},
+			Keys: []*UpKey{{Name: "khigh", APIKey: "sk-high", Enabled: true}}},
+	)
+	var forward []string
+	for _, c := range buildCandidates("m1", "m1", nil) {
+		forward = append(forward, c.ch.Name)
+	}
+	var page []string
+	for _, g := range routeStatusData("m1").Models {
+		for _, k := range g.Keys {
+			page = append(page, k.Channel)
+		}
+	}
+	if len(forward) != 2 || len(page) != 2 {
+		t.Fatalf("forward=%v page=%v, want 2 candidates each", forward, page)
+	}
+	for i := range forward {
+		if forward[i] != page[i] {
+			t.Fatalf("第 %d 位不一致：实际转发=%v 路由页=%v（路由页顺序必须与优先级一致）", i+1, forward, page)
+		}
+	}
+	if forward[0] != "high" {
+		t.Fatalf("priority 10 必须先于 priority 1，got %v", forward)
 	}
 }
 

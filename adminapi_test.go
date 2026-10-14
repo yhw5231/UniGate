@@ -326,6 +326,61 @@ func TestAdminTestKeyWritesRequestLog(t *testing.T) {
 	}
 }
 
+// TestAdminFetchModelsWritesRequestLog 拉取上游模型列表（含失败）要进请求记录：
+// user = 发起的管理员，方法/接口列 = 上游 /models 地址；失败记录同时进错误日志。
+func TestAdminFetchModelsWritesRequestLog(t *testing.T) {
+	setupGateway(t)
+	initStats()
+	tok := adminToken(t)
+	up := newUpstream(t, http.StatusOK, `{"data":[{"id":"m1"},{"id":"m2"}]}`)
+	mustPutChannel(t, &Channel{Name: "c", BaseURL: up.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	chID := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chID+"/fetch-models", "", tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	recs := reqLog.Snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("reqLog has %d records, want 1: %+v", len(recs), recs)
+	}
+	if rec := recs[0]; rec.Method != http.MethodGet || rec.User != "admin" || rec.Channel != "c" ||
+		rec.Key != "k1@c" || rec.Status != http.StatusOK || !strings.HasSuffix(rec.Path, "/models") {
+		t.Fatalf("fetch record = %+v", rec)
+	}
+	if errs := errLog.Snapshot(); len(errs) != 0 {
+		t.Fatalf("成功拉取不应进错误日志：%+v", errs)
+	}
+
+	// 失败拉取（上游 500）：同样留痕，且进错误日志
+	up500 := newUpstream(t, http.StatusInternalServerError, `{"error":"boom"}`)
+	mustPutChannel(t, &Channel{Name: "c2", BaseURL: up500.URL, Enabled: true,
+		Keys: []*UpKey{{Name: "k2", APIKey: "sk-2", Enabled: true}}})
+	var ch2 *Channel
+	for _, c := range store.Snapshot().Channels {
+		if c.Name == "c2" {
+			ch2 = c
+		}
+	}
+	if ch2 == nil {
+		t.Fatal("channel c2 not found")
+	}
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodPost, "/admin/api/channels/"+ch2.ID+"/fetch-models", "", tok))
+	if rr2.Code != http.StatusBadGateway {
+		t.Fatalf("failed fetch status=%d, want 502; body=%s", rr2.Code, rr2.Body.String())
+	}
+	recs = reqLog.Snapshot()
+	if len(recs) != 2 || recs[0].Status != http.StatusInternalServerError || recs[0].ErrMsg == "" {
+		t.Fatalf("failed fetch record = %+v", recs)
+	}
+	if errs := errLog.Snapshot(); len(errs) != 1 {
+		t.Fatalf("失败拉取应进错误日志，got %d 条", len(errs))
+	}
+}
+
 func TestAdminTestKeyRequestFormat(t *testing.T) {
 	// 测试请求必须是最小标准 OpenAI chat 请求：不带 max_tokens（新版模型已移除该参数），
 	// 带 Accept: application/json 与明确 UA（避免 Go 默认 UA 被上游拒绝）。

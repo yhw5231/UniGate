@@ -1407,7 +1407,8 @@ func TestRoundRobinFollowsGlobalDefault(t *testing.T) {
 }
 
 // TestRouteStatusData 路由视图：按模型聚合候选 key，标注 可用/冷却中/停用，
-// 未声明模型列表的渠道对每个模型放行；候选顺序与配置顺序一致。
+// 未声明模型列表的渠道对每个模型放行；候选顺序与转发顺序一致（渠道优先级降序，
+// 同优先级保持配置序，见 route_rules_test.go 的 TestRouteStatusFollowsPriority）。
 func TestRouteStatusData(t *testing.T) {
 	setupGateway(t)
 	mustPutChannel(t, &Channel{Name: "a", BaseURL: "http://up-a", Enabled: true, CooldownScope: cooldownScopeKeyModel,
@@ -1485,7 +1486,7 @@ func TestRouteStatusData(t *testing.T) {
 		t.Fatalf("route row must carry channel info: %+v", first)
 	}
 	if m2.Keys[0].Channel != "a" || m2.Keys[0].Key != "a1" {
-		t.Fatalf("candidate order must follow config order, got %+v", m2.Keys[0])
+		t.Fatalf("candidate order must follow channel priority, got %+v", m2.Keys[0])
 	}
 
 	// 指定模型过滤：只返回该模型分组

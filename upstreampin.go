@@ -345,7 +345,10 @@ var plannerSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 // probeChannelModel 探测渠道上某模型的内部渠道：识别管线、收割可用渠道
 // 清单、记录实际服务的渠道。返回更新后的固定配置（含探测产物，固定配置
 // 原样保留），由调用方写回渠道。
-func probeChannelModel(ch *Channel, k *UpKey, model string) (*ModelUpstreamPin, error) {
+//
+// user 为发起探测的管理员用户名：探测发往上游的正常小请求会写入请求记录
+//（收割请求不留痕，见 harvestKnownProviders），空值 = 不记录。
+func probeChannelModel(ch *Channel, k *UpKey, model, user string) (*ModelUpstreamPin, error) {
 	pin := ch.upstreamPinFor(model)
 	if pin == nil {
 		pin = &ModelUpstreamPin{}
@@ -362,12 +365,12 @@ func probeChannelModel(ch *Channel, k *UpKey, model string) (*ModelUpstreamPin, 
 	// 先带 max_tokens 上限控制探测开销；推理模型可能把配额全部烧在思考上，
 	// 网关返回 "empty response content" 类错误体（对标 classifyUpstreamError
 	// 把它记为 ok）——去掉上限重试一次再定论。
-	ans, err := sendProbeChat(ctx, &cand, probeRequestBody(model, "Reply with the word OK", probeAskTokens))
+	ans, err := sendProbeChat(ctx, user, model, &cand, probeRequestBody(model, "Reply with the word OK", probeAskTokens))
 	if err != nil {
 		return nil, err
 	}
 	if _, failed := probeErrorMessage(ans); failed {
-		ans, err = sendProbeChat(ctx, &cand, probeRequestBody(model, "Reply with the word OK", 0))
+		ans, err = sendProbeChat(ctx, user, model, &cand, probeRequestBody(model, "Reply with the word OK", 0))
 		if err != nil {
 			return nil, err
 		}
@@ -448,6 +451,10 @@ func probeErrorMessage(body []byte) (string, bool) {
 // 一次；管线未知按 planner → direct 各发一次干净请求（对标 harvest() 的
 // 单写法形态；两种写法混进同一请求会改变上游的路由判定/报错形态，反而
 // 收不到清单）。全部请求都失败才返回错误；只是没点到清单则返回 nil。
+//
+// 这些请求**故意**钉到不存在的内部渠道、必然被上游拒绝，属于探测的内部手段，
+// 因此不进请求日志（user 传空）：否则每次探测都会在错误日志里留下若干条
+// 「渠道不存在」的假故障。
 func harvestKnownProviders(ctx context.Context, cand *candidate, model, pipeline string) ([]string, error) {
 	pipelines := []string{pipeline}
 	if pipeline == "" {
@@ -457,7 +464,7 @@ func harvestKnownProviders(ctx context.Context, cand *candidate, model, pipeline
 	var firstErr error
 	for _, p := range pipelines {
 		body := injectUpstreamPin(probeRequestBody(model, "hi", probeHarvestTokens), p, "__probe__", nil, "", nil)
-		ans, err := sendProbeChat(ctx, cand, body)
+		ans, err := sendProbeChat(ctx, "", model, cand, body)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -546,22 +553,32 @@ func probeRequestBody(model, msg string, maxTokens int) []byte {
 
 // sendProbeChat 用指定候选发一条非流式请求（渠道头、key、代理与真实转发
 // 一致），返回响应体（上限 16KB）。状态码不作为错误处理——探测要读错误体。
-func sendProbeChat(ctx context.Context, cand *candidate, body []byte) ([]byte, error) {
+//
+// user 非空 = 管理员触发（渠道固定页「探测 / 验证」），该请求写入请求记录
+//（用户列 = 管理员，接口列 = 上游地址，见 recordAdminUpstreamRequest）；空 =
+// 内部请求不记录（收割渠道清单的故意失败请求）。
+func sendProbeChat(ctx context.Context, user, model string, cand *candidate, body []byte) ([]byte, error) {
+	start := time.Now()
+	target := cand.chatTarget()
 	route, err := resolveProxy(cand)
 	if err != nil {
+		recordAdminUpstreamRequest(start, http.MethodPost, user, cand.ch.Name, cand.k.Name, model, target, 0, 0, nil, "proxy resolve: "+err.Error())
 		return nil, err
 	}
 	client := newUpstreamClient(route)
-	resp, err := doUpstreamRequest(ctx, client, cand, cand.chatTarget(), body, "", true, false, nil)
+	resp, err := doUpstreamRequest(ctx, client, cand, target, body, "", true, false, nil)
 	if err != nil {
+		recordAdminUpstreamRequest(start, http.MethodPost, user, cand.ch.Name, cand.k.Name, model, target, 0, 0, nil, err.Error())
 		return nil, err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 	if err != nil {
+		recordAdminUpstreamRequest(start, http.MethodPost, user, cand.ch.Name, cand.k.Name, model, target, resp.StatusCode, int64(len(data)), data, err.Error())
 		return nil, err
 	}
 	leaseMgr.RecordUse(cand.k.effectiveProxy(cand.ch), cand.k.ID)
+	recordAdminUpstreamRequest(start, http.MethodPost, user, cand.ch.Name, cand.k.Name, model, target, resp.StatusCode, int64(len(data)), data, "")
 	return data, nil
 }
 

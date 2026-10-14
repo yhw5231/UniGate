@@ -800,3 +800,53 @@ func TestClassifyUpstreamResponse(t *testing.T) {
 		}
 	}
 }
+
+// TestProbeAndValidateWriteRequestLog 渠道固定页「探测 / 验证」发往上游的真实请求
+// 要进请求记录（user = 发起的管理员，接口列 = 上游地址）；探测内部用于收割渠道
+// 清单的故意失败请求（only=__probe__）不记录——否则每次探测都会在错误日志里留下
+// 几条「渠道不存在」的假故障。
+func TestProbeAndValidateWriteRequestLog(t *testing.T) {
+	setupGateway(t)
+	initStats()
+	tok := adminToken(t)
+	up := newScriptedUpstream(t, func(i int, body string) (int, string) {
+		if strings.Contains(body, "__probe__") {
+			return http.StatusBadRequest, `{"error":"No allowed providers available. Available providers are: alibaba, baseten."}`
+		}
+		return http.StatusOK, `{"provider_metadata":{"gateway":{"routing":{"finalProvider":"alibaba","canonicalSlug":"z-ai/glm-5.3"}}},"choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}]}`
+	})
+	mustPutChannel(t, &Channel{Name: "cp", BaseURL: up.URL, Enabled: true, Models: []string{"glm-5.3"},
+		Keys: []*UpKey{{Name: "k1", APIKey: "sk-1", Enabled: true}}})
+	chID := store.Snapshot().Channels[0].ID
+
+	rr := httptest.NewRecorder()
+	rootHandler(rr, adminReq(http.MethodPost, "/admin/api/channels/"+chID+"/probe-upstreams", `{"model":"glm-5.3"}`, tok))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("probe status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if up.calls() != 2 {
+		t.Fatalf("upstream calls = %d, want 2（正常请求 + 收割请求）", up.calls())
+	}
+	recs := reqLog.Snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("探测应只记录正常请求（收割请求不留痕），got %d 条：%+v", len(recs), recs)
+	}
+	if rec := recs[0]; rec.User != "admin" || rec.Channel != "cp" || rec.Model != "glm-5.3" ||
+		rec.Status != http.StatusOK || rec.Key != "k1@cp" || !strings.HasSuffix(rec.Path, "/chat/completions") {
+		t.Fatalf("probe record = %+v", rec)
+	}
+	if errs := errLog.Snapshot(); len(errs) != 0 {
+		t.Fatalf("收割请求的 400 不应进错误日志：%+v", errs)
+	}
+
+	// 验证：每个内部渠道一次真实请求，全部进请求记录
+	rr2 := httptest.NewRecorder()
+	rootHandler(rr2, adminReq(http.MethodPost, "/admin/api/channels/"+chID+"/validate-upstreams",
+		`{"model":"glm-5.3","upstreams":["alibaba","baseten"]}`, tok))
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("validate status=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+	if got := len(reqLog.Snapshot()); got != 3 {
+		t.Fatalf("验证 2 个内部渠道后应共 3 条记录（1 探测 + 2 验证），got %d", got)
+	}
+}
